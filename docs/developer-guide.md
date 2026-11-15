@@ -34,8 +34,10 @@ cargo test --all
 cargo build --target wasm32v1-none --release --all
 ```
 
-CI job names are `Format`, `Clippy`, `Test` and `Build (wasm32v1-none)` — these are
-the required status checks in branch protection.
+CI also runs a cargo-deny dependency policy check (`deny.toml`) and a ClamAV
+malware scan over the checkout and the built Wasm artifacts. CI job names are
+`Format`, `Clippy`, `Test`, `Build (wasm32v1-none)`, `Dependency Policy` and
+`Malware Scan` — these are the required status checks in branch protection.
 
 ## Project layout
 

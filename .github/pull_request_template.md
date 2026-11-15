@@ -54,6 +54,7 @@ cargo build --target wasm32v1-none --release --all
 - [ ] Escrowed funds always have an exit path for the consumer.
 - [ ] Tests cover the happy path, the failure/refund paths **and** the emitted event.
 - [ ] The real-SAC test and the re-entrant-token test still pass.
+- [ ] No unexplained binaries or archives are added, and the Malware Scan check passes.
 
 ## Reviewer notes
 

@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -59,3 +62,89 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Soroban contracts
         run: cargo build --target wasm32v1-none --release --all
+
+  deny:
+    name: Dependency Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Checks the committed Cargo.lock against deny.toml: RustSec advisories,
+      # license allow-list, wildcard/git dependencies and unknown registries.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  malware-scan:
+    name: Malware Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The checkout only needs to be read; do not leave the job token in
+      # .git/config for the scanners to read.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install ClamAV
+        run: |
+          sudo apt-get update
+          # `clamav` provides clamscan; `clamav-freshclam` provides freshclam.
+          sudo apt-get install -y --no-install-recommends clamav clamav-freshclam
+          # The packaged service may already be updating the signature
+          # database and would hold the freshclam lock.
+          sudo systemctl stop clamav-freshclam.service 2>/dev/null || true
+          sudo pkill -f freshclam 2>/dev/null || true
+
+      - name: Update virus signatures
+        run: |
+          for attempt in 1 2 3; do
+            if sudo freshclam --quiet --log=/tmp/freshclam.log; then
+              exit 0
+            fi
+            echo "freshclam attempt ${attempt} failed; retrying in 10s" >&2
+            sleep 10
+          done
+          echo "::error::Could not download ClamAV signatures; refusing to run a stale scan"
+          exit 1
+
+      - name: Scan repository
+        run: |
+          set -o pipefail
+          clamscan --version
+          clamscan \
+            --recursive \
+            --infected \
+            --exclude-dir='^\.git$' \
+            --exclude-dir='^target$' \
+            --exclude-dir='^site$' \
+            --exclude-dir='^node_modules$' \
+            --max-filesize=100M \
+            --max-scansize=500M \
+            . | tee clamav-report.txt
+
+      # Scan the exact Wasm artifacts this repo would deploy, not just source.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Soroban contracts
+        run: cargo build --target wasm32v1-none --release --all
+
+      - name: Scan built Wasm artifacts
+        run: |
+          set -o pipefail
+          shopt -s nullglob
+          wasm=(target/wasm32v1-none/release/*.wasm)
+          if [ "${#wasm[@]}" -eq 0 ]; then
+            echo "::error::No Wasm artifacts were produced"
+            exit 1
+          fi
+          clamscan --infected "${wasm[@]}" | tee -a clamav-report.txt
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clamav-report
+          path: clamav-report.txt
+          if-no-files-found: ignore

@@ -24,7 +24,26 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Everything must be green **before** you open a PR — CI runs exactly the
-commands above, plus `cargo build --target wasm32v1-none --release --all`.
+commands above, plus `cargo build --target wasm32v1-none --release --all` and a
+ClamAV malware scan of the checkout and the built Wasm artifacts. The scan job
+("Malware Scan") is a required check, so do not commit binaries or archives
+that you cannot explain; CI will fail the PR if a signature matches.
+
+## Local security checks
+
+CI's dependency policy and malware scan can be reproduced locally:
+
+```bash
+cargo install cargo-deny --locked   # one-time
+cargo deny check
+
+sudo freshclam                      # one-time ClamAV signature update
+./scripts/scan-malware.sh
+```
+
+`scan-malware.sh` scans the working tree and any built Wasm. Pass a path to scan
+a downloaded artifact, and see `--help` for the other flags. The policy lives in
+[`deny.toml`](./deny.toml).
 
 ## Repository layout
 
