@@ -7,14 +7,20 @@
 # (wave-trivial/100pts, wave-medium/150pts, wave-high/200pts), and states
 # acceptance criteria a reviewer can check.
 #
-# The backlog reflects the v0.2.0 contract: events, upgrades, checks-effects-
-# interactions and TTL-safe lease durations have already shipped, so they are
-# not filed here.
+# The seven hand-written issues below reflect the v0.2.0 contract: events,
+# upgrades, checks-effects-interactions and TTL-safe lease durations have
+# already shipped, so they are not filed here.
+#
+# The 130 additional issues live in scripts/wave-backlog/*.psv. Each line is
+# pipe-separated (tier|title|where|summary|criteria|pointers), with `;` between
+# criteria or pointer items. They are rendered into the same body shape as the
+# templates below, so `--dry-run` shows exactly what would be opened.
 #
 # Usage
-#   ./scripts/create-issues.sh              # create every issue
-#   ./scripts/create-issues.sh --dry-run    # print what would be created
-#   ./scripts/create-issues.sh --only high  # only one tier
+#   ./scripts/create-issues.sh                 # create every issue
+#   ./scripts/create-issues.sh --dry-run       # print what would be created
+#   ./scripts/create-issues.sh --only high     # only one tier
+#   ./scripts/create-issues.sh --backlog-only  # only scripts/wave-backlog/*.psv
 #
 # Requires the GitHub CLI, authenticated with `gh auth login`.
 
@@ -23,11 +29,13 @@ set -euo pipefail
 REPO="${KEYLEASE_REPO:-KeyLease-Security/keylease-core}"
 DRY_RUN=0
 ONLY=""
+BACKLOG_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY_RUN=1 ;;
-    --only)    ONLY="${2:-}"; shift ;;
+    --dry-run)      DRY_RUN=1 ;;
+    --only)         ONLY="${2:-}"; shift ;;
+    --backlog-only) BACKLOG_ONLY=1 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -38,11 +46,17 @@ command -v gh >/dev/null 2>&1 || { echo "error: gh CLI not found" >&2; exit 1; }
 created=0
 skipped=0
 
-# create_issue <tier> <title> <labels> ; body on stdin
+# create_issue <tier> <title> <labels> [source] ; body on stdin
 create_issue() {
-  local tier="$1" title="$2" labels="$3"
+  local tier="$1" title="$2" labels="$3" source="${4:-inline}"
   local body
   body="$(cat)"
+
+  # The seven hand-written issues predate the structured backlog. Let callers
+  # open only the PSV backlog without re-checking (or re-creating) them.
+  if [ "$BACKLOG_ONLY" = "1" ] && [ "$source" != "backlog" ]; then
+    return 0
+  fi
 
   if [ -n "$ONLY" ] && [ "$ONLY" != "$tier" ]; then
     return 0
@@ -419,6 +433,89 @@ easier to reason about.
 - [ ] Tests
 - [ ] Documentation update
 EOF
+
+# ===========================================================================
+# Structured backlog — 130 issues
+#
+# Source of truth: scripts/wave-backlog/{trivial,medium,high}.psv
+# ===========================================================================
+
+# backlog_issue <tier> <title> <where> <summary> <criteria> <pointers>
+#
+# Criteria and pointers are `;`-separated. The shared fmt/clippy/test checks
+# (and the Wasm build for medium/high) are appended here so every issue carries
+# the repository's definition of done.
+backlog_issue() {
+  local tier="$1" title="$2" where="$3" summary="$4" criteria="$5" pointers="$6"
+  local labels points design_note="" wasm_check=""
+
+  case "$tier" in
+    trivial)
+      labels="wave-trivial,good first issue,100pts"
+      points=100
+      ;;
+    medium)
+      labels="wave-medium,150pts"
+      points=150
+      wasm_check='- [ ] `cargo build --target wasm32v1-none --release --all` succeeds'
+      ;;
+    high)
+      labels="wave-high,200pts,security"
+      points=200
+      design_note='- [ ] Design note approved by a maintainer before implementation begins'
+      wasm_check='- [ ] `cargo build --target wasm32v1-none --release --all` succeeds'
+      ;;
+    *)
+      echo "error: unknown backlog tier '$tier' for: $title" >&2
+      exit 2
+      ;;
+  esac
+
+  # Process substitution (not a pipe) keeps create_issue in this shell, so the
+  # created/skipped counters survive for the final summary.
+  create_issue "$tier" "$title" "$labels" backlog < <(
+    printf '## Summary\n\n%s\n\n' "$summary"
+    printf '## Where\n\n- %s\n\n' "$where"
+    printf '## Acceptance criteria\n\n'
+    [ -n "$design_note" ] && printf '%s\n' "$design_note"
+
+    local item
+    local IFS=';'
+    for item in $criteria; do
+      [ -n "$item" ] && printf -- '- [ ] %s\n' "$item"
+    done
+
+    printf '%s\n' '- [ ] `cargo fmt --all -- --check` passes'
+    printf '%s\n' '- [ ] `cargo clippy --all-targets -- -D warnings` passes'
+    printf '%s\n' '- [ ] `cargo test --all` passes'
+    [ -n "$wasm_check" ] && printf '%s\n' "$wasm_check"
+
+    if [ -n "$pointers" ]; then
+      printf '\n## Pointers\n\n'
+      for item in $pointers; do
+        [ -n "$item" ] && printf -- '- %s\n' "$item"
+      done
+    fi
+
+    printf '\n---\n\n**Points: %s (%s)** · Label: `wave-%s`\n' \
+      "$points" "$tier" "$tier"
+  )
+}
+
+backlog_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wave-backlog"
+if [ -d "$backlog_dir" ]; then
+  for backlog_file in "$backlog_dir/trivial.psv" \
+                      "$backlog_dir/medium.psv" \
+                      "$backlog_dir/high.psv"; do
+    [ -f "$backlog_file" ] || continue
+    while IFS='|' read -r tier title where summary criteria pointers; do
+      case "$tier" in
+        ''|'#'*) continue ;;
+      esac
+      backlog_issue "$tier" "$title" "$where" "$summary" "$criteria" "$pointers"
+    done < "$backlog_file"
+  done
+fi
 
 echo
 if [ "$DRY_RUN" = "1" ]; then

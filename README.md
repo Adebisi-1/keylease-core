@@ -88,7 +88,7 @@ keylease-core/
 │   └── mock_token/        # minimal SEP-41 token for tests & local sandboxes
 ├── scripts/
 │   ├── deploy-testnet.sh  # sequential testnet deploy / upgrade
-│   ├── create-issues.sh   # batch Wave backlog creation from the templates
+│   ├── create-issues.sh   # batch Wave backlog creation (templates + 130-issue PSV)
 │   └── setup-repo.sh      # topics, labels, branch protection
 ├── docs/                  # Stellar-native protocol docs, guides and references
 ├── system-prompts/        # agent briefs for the contract and client repos
