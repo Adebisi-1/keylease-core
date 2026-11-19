@@ -40,4 +40,10 @@ pub enum Error {
     /// Lease duration exceeds `MAX_LEASE_DURATION_SECS`, so its storage entry
     /// could not be kept alive for the whole term.
     DurationTooLong = 16,
+    /// No early-cancellation request exists for the lease.
+    CancellationNotRequested = 17,
+    /// The lease already has a pending early-cancellation request.
+    CancellationAlreadyRequested = 18,
+    /// Early cancellation is only available before the lease expires.
+    LeaseExpired = 19,
 }

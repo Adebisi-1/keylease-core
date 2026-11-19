@@ -109,6 +109,8 @@ keylease-core/
 | `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. Returns `service_id`. Emits `service_registered`. |
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
 | `create_lease(consumer, service_id, requested_calls, duration_secs) -> u64` | `consumer` | Lock `rate × calls` and mint a lease. Emits `lease_created`. |
+| `request_early_cancel(consumer, lease_id)` / `withdraw_early_cancel(consumer, lease_id)` | `consumer` | Ask to end an active lease early, or withdraw the request. |
+| `approve_early_cancel(provider, lease_id, verified_calls)` / `reject_early_cancel(provider, lease_id)` | `provider` | Consent to an early exit (paying served calls and refunding the rest) or decline it. |
 | `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder. Emits `lease_settled`. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
 | `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `version()` | — | Read-only views. |
@@ -127,6 +129,10 @@ extra. Event names are the first topic; ids follow.
 | `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `provider`, `is_active` |
 | `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_cancellation_requested` | `lease_id` | `consumer` |
+| `lease_cancellation_rejected` | `lease_id` | `provider` |
+| `lease_cancellation_withdrawn` | `lease_id` | `consumer` |
+| `lease_cancelled` | `lease_id` | `provider`, `consumer`, `verified_calls`, `payout`, `refund` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
 | `contract_upgraded` | — | `admin`, `new_wasm_hash` |
@@ -147,7 +153,10 @@ Active ──(expires_at reached)──▶ Expired ──(24h grace)──▶ re
 A lease is **settleable** when it has expired **or** `verified_calls ==
 allocated_calls`. It is **revocable** only when expired **and** the 24-hour
 provider grace window has elapsed. Either path ends in `Settled`; a settled
-lease can never be settled or revoked again.
+lease can never be settled or revoked again. Before expiry, the consumer can ask
+the provider to end the lease early (`request_early_cancel`); if the provider
+approves, served calls are paid and unused calls are refunded immediately,
+ending the lease.
 
 ---
 
@@ -282,10 +291,12 @@ re-entrant token.
 cargo test --all
 ```
 
-The 40 tests in `contracts/registry/src/test.rs` cover:
+The 48 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
 - the happy path (lock → full-usage settle before expiry),
+- early cancellation with provider consent, refusal, withdrawal, authorization,
+  conservation at both extremes, and rejection after settlement,
 - partial settlement after expiry with correct refund,
 - expired, unsettled leases being fully reclaimed by the consumer,
 - the 24-hour grace window (boundary, early-settle, and post-settle cases),

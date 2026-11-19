@@ -18,7 +18,7 @@ flowchart TB
     subgraph "Stellar ledger"
         REG[["KeyLeaseRegistry<br/>services · leases · escrow"]]
         TOK[["SEP-41 token<br/>native SAC or custom"]]
-        EV[["Contract events<br/>lease_created · lease_settled · lease_revoked"]]
+        EV[["Contract events<br/>lease_created · lease_cancelled · lease_settled · lease_revoked"]]
     end
 
     DEV -- "create_lease (auth: consumer)" --> REG
@@ -65,7 +65,7 @@ standard Stellar tooling:
 | Consumer | How it reads the protocol |
 | --- | --- |
 | Provider request path | `get_lease` over Soroban RPC (cached for a short TTL), or a local projection built from the event stream. |
-| Accounting / dashboards | `stellar events`, Horizon or an indexer subscribing to `lease_created` / `lease_settled` / `lease_revoked`. |
+| Accounting / dashboards | `stellar events`, Horizon or an indexer subscribing to `lease_created` / `lease_cancelled` / `lease_settled` / `lease_revoked`. |
 | CLI tooling | `stellar contract invoke` for writes and reads (reads need any funded `--source-account`). |
 
 See [Integration](integration.md) for the concrete verification pipeline.
@@ -123,6 +123,7 @@ claims to represent, and the consumer always has an exit.
 | `ServiceCount`, `LeaseCount` | instance | same as instance |
 | `Service(u64)` | persistent | extended on save and on read (≈30 days) |
 | `Lease(u64)` | persistent | extended for the lease's remaining term **plus** the 24h grace window and a one-day read buffer |
+| `CancelRequest(u64)` | persistent | pending early-cancellation request; standard ~30-day TTL, removed on withdraw/reject/approve |
 
 `create_lease` caps `duration_secs` at `MAX_LEASE_DURATION_SECS` (30 days), so
 the TTL extension is bounded and a locked deposit can never outlive its entry.
