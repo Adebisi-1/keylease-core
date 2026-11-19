@@ -510,14 +510,16 @@ pub enum DataKey {
 ```
 
 TTL policy for the two appended keys: neither is user-controlled, and each stays
-readable at least as long as the entity it describes. `ServiceStats(id)` is
-bumped with the same `LEDGER_BUMP_THRESHOLD` / `LEDGER_BUMP_EXTEND` policy as
+readable at least as long as the entity it describes. Only writes extend them —
+reads never do, in line with `get_service` and `get_lease`. `ServiceStats(id)`
+is bumped with the same `LEDGER_BUMP_THRESHOLD` / `LEDGER_BUMP_EXTEND` policy as
 `Service(id)` and is rewritten (and re-extended) on every settlement; an entry
-that sees neither a settlement nor a `service_stats` read for that horizon ages
-out and reads back as `ServiceStats::zero()`.
-`LeaseRevoked(id)` is written when the lease closes and extended with the lease's
-own horizon, so any ledger view that can still read a lease can read its
-revocation marker.
+that sees no settlement for that horizon ages out and reads back as
+`ServiceStats::zero()`.
+`LeaseRevoked(id)` is written when the lease closes and given the same horizon
+the lease entry itself receives in that transaction, so any ledger view that can
+still read a lease can read its revocation marker — and `lease_status` never
+pays rent to keep either one alive.
 
 `#[contracttype]` enums encode as a `SCV_VEC` whose first element is an
 `SCV_SYMBOL` variant name — so `DataKey::Lease(7)` is the wire key
