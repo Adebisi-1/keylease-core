@@ -1,6 +1,6 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{Address as _, Events as _, Ledger as _},
+    testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
     token, Address, BytesN, Env, Event, Vec,
 };
 
@@ -127,6 +127,63 @@ fn test_set_token_is_admin_only() {
 // ---------------------------------------------------------------------------
 // Service registration
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_set_token_first_time_and_change_are_recorded() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let registry_id = env.register(KeyLeaseRegistry, ());
+    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
+    registry.init(&admin);
+
+    // First configuration: stored and announced. Assert the event before any
+    // other contract call, because `env.events()` reflects the last invocation.
+    let first = env.register(MockToken, ());
+    registry.set_token(&admin, &first);
+    assert_single_event(
+        &env,
+        &registry_id,
+        &EscrowTokenSet {
+            admin: admin.clone(),
+            token: first.clone(),
+        },
+    );
+    assert_eq!(registry.get_token(), first);
+
+    // A genuine migration to a different token is still recorded and announced.
+    let second = env.register(MockToken, ());
+    registry.set_token(&admin, &second);
+    assert_single_event(
+        &env,
+        &registry_id,
+        &EscrowTokenSet {
+            admin: admin.clone(),
+            token: second.clone(),
+        },
+    );
+    assert_eq!(registry.get_token(), second);
+}
+
+#[test]
+fn test_set_token_is_a_noop_when_unchanged() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let registry_id = ctx.registry_id();
+    let ttl_before = env.as_contract(&registry_id, || env.storage().instance().get_ttl());
+
+    // `setup` already configured this exact token; repeating it must not write
+    // storage, bump the TTL, or publish a misleading `escrow_token_set` event.
+    ctx.registry.set_token(&ctx.admin, &ctx.token.address);
+
+    // Check the event first: another contract call would replace this buffer.
+    assert_eq!(env.events().all(), Vec::new(&env));
+    let ttl_after = env.as_contract(&registry_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl_after, ttl_before);
+    assert_eq!(ctx.registry.get_token(), ctx.token.address);
+}
 
 #[test]
 fn test_register_service_assigns_incrementing_ids() {
