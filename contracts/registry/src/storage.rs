@@ -1,7 +1,7 @@
 use soroban_sdk::{contracttype, Address, Env};
 
 use crate::errors::Error;
-use crate::types::{Lease, Service};
+use crate::types::{Lease, Service, ServiceStats};
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
 /// Expected Stellar ledger close time, used to translate lease durations into
@@ -29,6 +29,10 @@ pub enum DataKey {
     Service(u64),
     /// `Lease` by id (persistent storage).
     Lease(u64),
+    /// Cumulative settlement totals by service id (persistent storage).
+    ServiceStats(u64),
+    /// Presence marker for a lease reclaimed by its consumer (persistent storage).
+    LeaseRevoked(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -165,4 +169,103 @@ pub fn get_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
         lease_ttl_extend(env, &lease),
     );
     Ok(lease)
+}
+
+// ---------------------------------------------------------------------------
+// Derived per-entity state: settlement stats and revocation markers
+// ---------------------------------------------------------------------------
+//
+// Both keys below describe an entity that already has its own entry, and both
+// are additive: neither changes the layout of `Service` or `Lease`, so entries
+// written by an earlier Wasm keep decoding. Their TTL policy is therefore
+// "stay readable at least as long as the entity they describe":
+//
+// * `ServiceStats` uses the generic persistent policy
+//   (`LEDGER_BUMP_THRESHOLD` / `LEDGER_BUMP_EXTEND`, ~30 days) and is rewritten
+//   by every settlement, so a service that is still being leased cannot age out
+//   mid-life. If an entry does age out — a service idle for thirty days —
+//   `get_service_stats` reads [`ServiceStats::zero`]. The counters are a
+//   convenience over the ledger; `lease_settled` stays the authoritative record.
+// * `LeaseRevoked` is extended with `lease_ttl_extend`, the horizon the lease
+//   entry itself is given in the same transaction, so any lease that is still
+//   readable always has its marker readable.
+//
+// Neither key has a user-controlled lifetime: the marker is written once per
+// lease by `revoke_expired_lease`, and the counters only move inside
+// `settle_lease`, so no caller can grow storage without bound.
+
+pub fn get_service_stats(env: &Env, service_id: u64) -> ServiceStats {
+    let key = DataKey::ServiceStats(service_id);
+    match env.storage().persistent().get(&key) {
+        Some(stats) => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            stats
+        }
+        // A service with no settlement has no entry yet, and reads as zero.
+        None => ServiceStats::zero(),
+    }
+}
+
+/// Add one provider settlement to its service's cumulative totals.
+///
+/// Totals are checked, never saturating: a silently clamped revenue counter is
+/// worse for a reporter than a reverted settlement. The bound is arithmetic,
+/// not economic — with `MAX_RATE_PER_CALL` capping a payout below `2^96`,
+/// overflowing `total_payout` would take ~2^31 max-size settlements, i.e. far
+/// more tokens than exist.
+pub fn record_settlement(
+    env: &Env,
+    service_id: u64,
+    settled_calls: u32,
+    payout: i128,
+) -> Result<(), Error> {
+    let key = DataKey::ServiceStats(service_id);
+    let mut stats: ServiceStats = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(ServiceStats::zero());
+
+    stats.settled_leases = stats.settled_leases.checked_add(1).ok_or(Error::Overflow)?;
+    stats.settled_calls = stats
+        .settled_calls
+        .checked_add(settled_calls as u64)
+        .ok_or(Error::Overflow)?;
+    stats.total_payout = stats
+        .total_payout
+        .checked_add(payout)
+        .ok_or(Error::Overflow)?;
+
+    env.storage().persistent().set(&key, &stats);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    Ok(())
+}
+
+/// Record that `lease` was reclaimed by its consumer instead of settled.
+pub fn mark_lease_revoked(env: &Env, lease: &Lease) {
+    let key = DataKey::LeaseRevoked(lease.lease_id);
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(
+        &key,
+        LEDGER_BUMP_THRESHOLD,
+        lease_ttl_extend(env, lease),
+    );
+}
+
+/// Whether `lease` was reclaimed by its consumer rather than settled by its provider.
+pub fn is_lease_revoked(env: &Env, lease: &Lease) -> bool {
+    let key = DataKey::LeaseRevoked(lease.lease_id);
+    if !env.storage().persistent().has(&key) {
+        return false;
+    }
+    env.storage().persistent().extend_ttl(
+        &key,
+        LEDGER_BUMP_THRESHOLD,
+        lease_ttl_extend(env, lease),
+    );
+    true
 }

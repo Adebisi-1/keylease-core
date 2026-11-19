@@ -40,4 +40,9 @@ pub enum Error {
     /// Lease duration exceeds `MAX_LEASE_DURATION_SECS`, so its storage entry
     /// could not be kept alive for the whole term.
     DurationTooLong = 16,
+    /// Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`.
+    ///
+    /// Raised by `register_service`, before any consumer can be quoted a price
+    /// the deposit math could not represent.
+    RateTooHigh = 17,
 }

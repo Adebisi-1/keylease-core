@@ -36,7 +36,7 @@ A pure Rust Soroban contract. It is the only component that can move value.
 | Module | Role |
 | --- | --- |
 | `lib.rs` | Entry points, `contractmeta!`, upgrade, lifecycle documentation. |
-| `types.rs` | `Service`, `Lease`, `LeaseStatus`. |
+| `types.rs` | `Service`, `Lease`, `ServiceStats`, `LeaseStatus`. |
 | `storage.rs` | `DataKey` layout, instance/persistent split, duration-aware TTL policy. |
 | `events.rs` | Typed `#[contractevent]` payloads for every transition. |
 | `errors.rs` | Stable error codes (part of the ABI). |
@@ -123,6 +123,8 @@ claims to represent, and the consumer always has an exit.
 | `ServiceCount`, `LeaseCount` | instance | same as instance |
 | `Service(u64)` | persistent | extended on save and on read (≈30 days) |
 | `Lease(u64)` | persistent | extended for the lease's remaining term **plus** the 24h grace window and a one-day read buffer |
+| `ServiceStats(u64)` | persistent | extended on settlement and on read (≈30 days); derived data, so aging out loses a convenience counter, not money |
+| `LeaseRevoked(u64)` | persistent | written when a consumer reclaims, extended on the same horizon as its lease so a readable lease always has a readable marker |
 
 `create_lease` caps `duration_secs` at `MAX_LEASE_DURATION_SECS` (30 days), so
 the TTL extension is bounded and a locked deposit can never outlive its entry.

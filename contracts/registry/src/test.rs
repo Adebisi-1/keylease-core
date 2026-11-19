@@ -1,17 +1,18 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{Address as _, Events as _, Ledger as _},
-    token, Address, BytesN, Env, Event, Vec,
+    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    token, Address, BytesN, Env, Event, IntoVal, Vec,
 };
 
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
+    EscrowTokenSet, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled, ServiceRegistered,
     ServiceStatusChanged,
 };
 use crate::{
-    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, LeaseStatus, MAX_LEASE_DURATION_SECS,
+    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, ServiceStats,
+    MAX_LEASE_DURATION_SECS, MAX_RATE_PER_CALL,
 };
 
 /// Per-call rate used across the tests.
@@ -302,6 +303,180 @@ fn test_create_lease_requires_configured_token() {
 }
 
 // ---------------------------------------------------------------------------
+// Delegated lease creation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_delegate_can_create_lease_for_consumer() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+
+    let lease_id =
+        ctx.registry
+            .create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600);
+
+    // `env.events().all()` only covers the *last* invocation, so snapshot the
+    // creation's events before any read call overwrites them.
+    let events = env.events().all();
+
+    // The lease is the consumer's, and the consumer alone was debited.
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert_eq!(lease.consumer, ctx.consumer);
+    assert_eq!(lease.allocated_calls, 10);
+    assert!(!lease.settled);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
+    assert_eq!(ctx.token.balance(&delegate), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+
+    // `lease_created` is unchanged; `lease_delegated` records the courier.
+    let created = LeaseCreated {
+        lease_id,
+        service_id,
+        consumer: ctx.consumer.clone(),
+        allocated_calls: 10,
+        expires_at: 4_600,
+        locked_deposit: RATE * 10,
+    };
+    let delegated = LeaseDelegated {
+        lease_id,
+        delegate: delegate.clone(),
+        consumer: ctx.consumer.clone(),
+    };
+    let expected = Vec::from_array(
+        &env,
+        [
+            (ctx.registry_id(), created.topics(&env), created.data(&env)),
+            (
+                ctx.registry_id(),
+                delegated.topics(&env),
+                delegated.data(&env),
+            ),
+        ],
+    );
+    assert_eq!(events, expected);
+}
+
+#[test]
+fn test_delegate_cannot_create_lease_without_consumer_authorization() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+    let registry_id = ctx.registry_id();
+
+    // `setup` mocked every auth; this hands the host exactly one signature —
+    // the delegate's — so anything requiring the consumer must now fail.
+    env.mock_auths(&[MockAuth {
+        address: &delegate,
+        invoke: &MockAuthInvoke {
+            contract: &registry_id,
+            fn_name: "create_lease_for",
+            args: (&delegate, &ctx.consumer, &service_id, &10u32, &3_600u64).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result =
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600);
+
+    assert!(
+        result.is_err(),
+        "a delegate must not lock a consumer's deposit without the consumer's signature"
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_consumer_alone_cannot_create_a_delegated_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+    let registry_id = ctx.registry_id();
+
+    // The mirror case: the consumer signed, but the named delegate never did,
+    // so the transaction that pays the fee cannot be attributed to it.
+    env.mock_auths(&[MockAuth {
+        address: &ctx.consumer,
+        invoke: &MockAuthInvoke {
+            contract: &registry_id,
+            fn_name: "create_lease_for",
+            args: (&delegate, &ctx.consumer, &service_id, &10u32, &3_600u64).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result =
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600);
+
+    assert!(
+        result.is_err(),
+        "create_lease_for must authenticate the delegate too"
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
+}
+
+#[test]
+fn test_delegated_lease_refund_belongs_to_the_consumer() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+
+    let lease_id = ctx
+        .registry
+        .create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &100);
+
+    // The delegate is not on the lease and cannot reclaim it.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    assert_eq!(
+        ctx.registry.try_revoke_expired_lease(&delegate, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &lease_id);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&delegate), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Revoked);
+}
+
+#[test]
+fn test_delegated_creation_enforces_the_same_preconditions() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let delegate = Address::generate(&env);
+
+    // The delegate path shares the creation checks, it does not bypass them.
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &999, &10, &3_600),
+        Err(Ok(Error::ServiceNotFound))
+    );
+    let service_id = register_default_service(&env, &ctx);
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &0, &3_600),
+        Err(Ok(Error::InvalidCalls))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &0),
+        Err(Ok(Error::InvalidDuration))
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Settlement
 // ---------------------------------------------------------------------------
 
@@ -454,7 +629,10 @@ fn test_expired_unsettled_lease_is_fully_reclaimed() {
 
     let lease = ctx.registry.get_lease(&lease_id);
     assert!(lease.settled);
-    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    // Revocation is its own terminal status, not a generic settlement.
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Revoked);
+    // The provider earned nothing, and `used_calls` reads that back.
+    assert_eq!(lease.used_calls, 0);
     assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
     assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
 }
@@ -545,30 +723,211 @@ fn test_provider_can_settle_within_grace_window() {
 }
 
 // ---------------------------------------------------------------------------
-// Rate math & overflow
+// Service settlement stats
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_rate_math_overflow_reverts_deposit() {
+fn test_service_stats_start_at_zero_and_reject_unknown_service() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // A service nobody has settled yet reads as zero, not as missing.
+    assert_eq!(
+        ctx.registry.service_stats(&service_id),
+        ServiceStats::zero()
+    );
+    assert_eq!(
+        ctx.registry.try_service_stats(&999),
+        Err(Ok(Error::ServiceNotFound))
+    );
+}
+
+#[test]
+fn test_service_stats_accumulate_settled_leases_calls_and_payouts() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Fully consumed on the first lease...
+    let first = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    ctx.registry.settle_lease(&ctx.provider, &first, &10);
+
+    // ...and a partial settlement after expiry on the second, so the counter
+    // must record the calls the provider was paid for, not the allotment.
+    let second = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &second, &4);
+
+    assert_eq!(
+        ctx.registry.service_stats(&service_id),
+        ServiceStats {
+            settled_leases: 2,
+            settled_calls: 14,
+            total_payout: RATE * 14,
+        }
+    );
+    // The aggregate equals what actually reached the provider.
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 14);
+}
+
+#[test]
+fn test_service_stats_record_a_zero_call_settlement() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    // Past expiry, so a zero-call settlement is allowed: the provider refunds
+    // the whole deposit and still counts as having settled the lease.
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &0);
+
+    assert_eq!(
+        ctx.registry.service_stats(&service_id),
+        ServiceStats {
+            settled_leases: 1,
+            settled_calls: 0,
+            total_payout: 0,
+        }
+    );
+}
+
+#[test]
+fn test_revoked_lease_does_not_count_toward_service_stats() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let settled = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    ctx.registry.settle_lease(&ctx.provider, &settled, &10);
+
+    // A second lease the provider never settles: the consumer reclaims it in
+    // full after expiry plus the grace window.
+    let revoked = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &7, &100);
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &revoked);
+
+    assert_eq!(
+        ctx.registry.service_stats(&service_id),
+        ServiceStats {
+            settled_leases: 1,
+            settled_calls: 10,
+            total_payout: RATE * 10,
+        }
+    );
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
+}
+
+#[test]
+fn test_service_stats_are_scoped_per_service() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let first_service = register_default_service(&env, &ctx);
+    let second_service =
+        ctx.registry
+            .register_service(&ctx.provider, &(RATE * 2), &endpoint_hash(&env));
+
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &first_service, &10, &3_600);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
+
+    assert_eq!(ctx.registry.service_stats(&first_service).settled_leases, 1);
+    assert_eq!(
+        ctx.registry.service_stats(&second_service),
+        ServiceStats::zero()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rate bound and deposit arithmetic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rate_above_max_is_rejected_at_registration() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // One over the bound, and the old unbounded extreme, both fail here.
+    assert_eq!(
+        ctx.registry.try_register_service(
+            &ctx.provider,
+            &(MAX_RATE_PER_CALL + 1),
+            &endpoint_hash(&env)
+        ),
+        Err(Ok(Error::RateTooHigh))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_register_service(&ctx.provider, &i128::MAX, &endpoint_hash(&env)),
+        Err(Ok(Error::RateTooHigh))
+    );
+    assert_eq!(ctx.registry.service_count(), 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+}
+
+#[test]
+fn test_max_rate_is_accepted_and_leasable() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
     let ctx = setup(&env);
 
-    // A rate that overflows for any call count > 1.
-    let service_id = ctx
-        .registry
-        .register_service(&ctx.provider, &i128::MAX, &endpoint_hash(&env));
-
-    assert_eq!(
+    let service_id =
         ctx.registry
-            .try_create_lease(&ctx.consumer, &service_id, &2, &3_600),
-        Err(Ok(Error::Overflow))
+            .register_service(&ctx.provider, &MAX_RATE_PER_CALL, &endpoint_hash(&env));
+    assert_eq!(
+        ctx.registry.get_service(&service_id).rate_per_call,
+        MAX_RATE_PER_CALL
     );
 
-    // The consumer's funds were never moved into escrow.
-    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    // The worst case the bound allows: the largest rate and the largest call
+    // count. Before `MAX_RATE_PER_CALL` this composition was the `Overflow`
+    // that `create_lease` could only discover after the consumer had been
+    // quoted the service, so the test that asserted that revert is replaced by
+    // this one: the deposit and the matching payout are both representable.
+    let calls = u32::MAX;
+    let deposit = MAX_RATE_PER_CALL * calls as i128;
+    ctx.token.mint(&ctx.consumer, &deposit);
+
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &calls, &3_600);
+
+    assert_eq!(ctx.registry.get_lease(&lease_id).locked_deposit, deposit);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), deposit);
+
+    // Settling the whole allotment pays the same worst-case figure back out.
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &calls);
+    assert_eq!(ctx.token.balance(&ctx.provider), deposit);
     assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
-    assert_eq!(ctx.registry.lease_count(), 0);
+}
+
+#[test]
+fn test_rate_bound_keeps_deposit_math_inside_i128() {
+    // The bound is chosen as `2^64` precisely so this cannot fail: calls are
+    // `u32`, so the worst deposit is under `2^64 * 2^32 = 2^96`, and `i128`
+    // reaches `2^127 - 1`.
+    let worst_deposit = MAX_RATE_PER_CALL.checked_mul(u32::MAX as i128);
+    assert!(
+        worst_deposit.is_some(),
+        "MAX_RATE_PER_CALL must keep every allowed deposit inside i128"
+    );
+    assert!(worst_deposit.unwrap() < i128::MAX);
 }
 
 #[test]
@@ -635,14 +994,158 @@ fn test_lease_status_discriminants_are_stable() {
     let env = Env::default();
     use soroban_sdk::{IntoVal, TryFromVal, Val};
 
-    // The ABI promises Active = 0, Expired = 1, Settled = 2.
+    // The ABI promises Active = 0, Expired = 1, Settled = 2, and `Revoked` is
+    // appended as 3 — nothing renumbered, so old clients still decode history.
     let active: Val = LeaseStatus::Active.into_val(&env);
     let expired: Val = LeaseStatus::Expired.into_val(&env);
     let settled: Val = LeaseStatus::Settled.into_val(&env);
+    let revoked: Val = LeaseStatus::Revoked.into_val(&env);
 
     assert_eq!(u32::try_from_val(&env, &active).unwrap(), 0u32);
     assert_eq!(u32::try_from_val(&env, &expired).unwrap(), 1u32);
     assert_eq!(u32::try_from_val(&env, &settled).unwrap(), 2u32);
+    assert_eq!(u32::try_from_val(&env, &revoked).unwrap(), 3u32);
+}
+
+#[test]
+fn test_lease_status_of_separates_revocation_from_settlement() {
+    let env = Env::default();
+    let consumer = Address::generate(&env);
+
+    // Pure view over the stored lease plus the registry's revocation marker.
+    let lease = |settled: bool| Lease {
+        lease_id: 1,
+        service_id: 1,
+        consumer: consumer.clone(),
+        allocated_calls: 10,
+        used_calls: 0,
+        expires_at: 4_600,
+        locked_deposit: RATE * 10,
+        settled,
+    };
+
+    assert_eq!(
+        LeaseStatus::of(&lease(false), 1_000, false),
+        LeaseStatus::Active
+    );
+    assert_eq!(
+        LeaseStatus::of(&lease(false), 4_600, false),
+        LeaseStatus::Expired
+    );
+    assert_eq!(
+        LeaseStatus::of(&lease(true), 1_000, false),
+        LeaseStatus::Settled
+    );
+    assert_eq!(
+        LeaseStatus::of(&lease(true), 4_600, false),
+        LeaseStatus::Settled
+    );
+    // A reclaimed lease is `Revoked` regardless of the timestamp it is read at:
+    // the funding path, not the clock, decides the terminal status.
+    assert_eq!(
+        LeaseStatus::of(&lease(true), 1_000, true),
+        LeaseStatus::Revoked
+    );
+    assert_eq!(
+        LeaseStatus::of(&lease(true), 9_999, true),
+        LeaseStatus::Revoked
+    );
+}
+
+#[test]
+fn test_revoked_lease_is_not_reported_as_settled() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Same service, same terms; only who closes the lease differs.
+    let settled_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let revoked_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    ctx.registry
+        .settle_lease(&ctx.provider, &settled_lease, &10);
+
+    env.ledger().set_timestamp(4_600 + GRACE);
+    ctx.registry
+        .revoke_expired_lease(&ctx.consumer, &revoked_lease);
+
+    assert_eq!(
+        ctx.registry.lease_status(&settled_lease),
+        LeaseStatus::Settled
+    );
+    assert_eq!(
+        ctx.registry.lease_status(&revoked_lease),
+        LeaseStatus::Revoked
+    );
+    assert_ne!(
+        ctx.registry.lease_status(&settled_lease),
+        ctx.registry.lease_status(&revoked_lease),
+        "a reclaimed deposit must not read as provider revenue"
+    );
+
+    // The stored `settled` flag stays true for both: the lease struct layout is
+    // frozen, so `Revoked` is carried by the marker, not by a new field.
+    assert!(ctx.registry.get_lease(&settled_lease).settled);
+    assert!(ctx.registry.get_lease(&revoked_lease).settled);
+}
+
+#[test]
+fn test_settle_after_revoke_is_rejected() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &lease_id);
+
+    // A provider that arrives after the consumer reclaimed the escrow gets
+    // nothing, and the lease stays `Revoked`.
+    assert_eq!(
+        ctx.registry.try_settle_lease(&ctx.provider, &lease_id, &10),
+        Err(Ok(Error::LeaseAlreadySettled))
+    );
+    assert_eq!(ctx.token.balance(&ctx.provider), 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Revoked);
+    assert_eq!(
+        ctx.registry.service_stats(&service_id),
+        ServiceStats::zero()
+    );
+}
+
+#[test]
+fn test_revoke_after_settle_is_rejected() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    // Provider settles the full usage before expiry, then the grace window
+    // opens: the consumer must not be able to convert a paid lease into a
+    // refund, and the status must remain `Settled`.
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
+    env.ledger().set_timestamp(1_100 + GRACE);
+
+    assert_eq!(
+        ctx.registry
+            .try_revoke_expired_lease(&ctx.consumer, &lease_id),
+        Err(Ok(Error::LeaseAlreadySettled))
+    );
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
 }
 
 #[test]
@@ -789,7 +1292,7 @@ fn test_version_matches_contract_metadata() {
 
     assert_eq!(
         ctx.registry.version(),
-        soroban_sdk::String::from_str(&env, "0.2.1")
+        soroban_sdk::String::from_str(&env, "0.3.0")
     );
 }
 

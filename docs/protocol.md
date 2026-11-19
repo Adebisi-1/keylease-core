@@ -7,6 +7,7 @@
 | **Admin** | one Stellar account | `init` once, `set_token`, `upgrade`. Cannot move escrowed funds. |
 | **Provider** | per service (account or contract address) | Register/pause services, settle leases it owns. |
 | **Consumer** | per lease (account or contract address) | Create leases, revoke expired unsettled leases. |
+| **Delegate** | optional, any account | Sponsor `create_lease_for` for a consumer. Pays the transaction fee only — never the deposit, and holds no claim on the lease. |
 
 The admin is a deployment role. It can point the registry at a token address and
 install a new Wasm, and nothing else. It has no path to user funds.
@@ -52,23 +53,31 @@ pub struct Lease {
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: create_lease<br/>(escrow rate × calls)
+    [*] --> Active: create_lease / create_lease_for<br/>(escrow rate × calls)
     Active --> Expired: now ≥ expires_at
     Active --> Settled: settle_lease<br/>(verified_calls == allocated_calls)
     Expired --> Settled: settle_lease<br/>(provider, within grace)
-    Expired --> Settled: revoke_expired_lease<br/>(consumer, after 24h grace)
+    Expired --> Revoked: revoke_expired_lease<br/>(consumer, after 24h grace)
     Settled --> [*]
+    Revoked --> [*]
 ```
 
-`lease_status` derives the state from `settled` and `expires_at`:
+`lease_status` derives the state from `settled`, `expires_at` and the lease's
+revocation marker:
 
 | Status | Discriminant | Condition |
 | --- | --- | --- |
 | `Active` | `0` | not settled, `now < expires_at` |
 | `Expired` | `1` | not settled, `now ≥ expires_at` |
-| `Settled` | `2` | `settled == true` |
+| `Settled` | `2` | `settled == true`, provider was paid |
+| `Revoked` | `3` | `settled == true`, consumer reclaimed the deposit |
 
-Discriminants are **stable on the wire**. They will never be renumbered.
+Discriminants are **stable on the wire**. They will never be renumbered, and
+`Revoked` was appended as `3` rather than replacing `Settled`, so a client
+written before the change still decodes every pre-existing lease. The two
+closed states share the same stored `settled` flag — `Lease` layout is frozen —
+and are told apart by the `LeaseRevoked(lease_id)` marker the registry writes
+when a consumer reclaims.
 
 ### When can a lease be settled?
 
@@ -115,9 +124,13 @@ remaining fields.
 | `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `provider`, `is_active` |
 | `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_delegated` | `lease_id` | `delegate`, `consumer` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
 | `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+
+`lease_delegated` follows `lease_created` only for a sponsored lease, so
+indexers that ignore it still see every lease.
 
 Events are the indexing contract between on-chain state and off-chain systems: a
 provider can settle from a projection built by subscribing to `lease_created`,
@@ -189,10 +202,20 @@ These must hold for every reachable state. They are asserted in tests.
 3. **Bounded claim.** A provider can never receive more than
    `allocated_calls × rate_per_call`, and only for a service it owns.
 4. **Guaranteed exit.** Every lease has a consumer path to a full refund.
-5. **Checked math.** Deposit, payout and timestamp arithmetic abort on overflow
-   rather than truncating.
+5. **Checked math.** Deposit, payout, aggregate and timestamp arithmetic abort on
+   overflow rather than truncating.
 6. **Claimable storage.** A lease's persistent entry outlives its term plus the
-   grace window (`MAX_LEASE_DURATION_SECS = 30 days`).
+   grace window (`MAX_LEASE_DURATION_SECS = 30 days`), and so does the
+   revocation marker recorded against it.
+7. **Representable price.** `register_service` rejects `rate_per_call` above
+   `MAX_RATE_PER_CALL = 2^64`, so `rate_per_call × allocated_calls` can never
+   exceed `2^96` and no accepted lease can quote a deposit `i128` cannot hold.
+8. **Refund ownership.** Whoever created a lease — consumer or delegate — the
+   **consumer** is debited, is the refund recipient, and is the only address
+   that can revoke.
+9. **Distinct closure.** A lease closed by the provider reads `Settled`; one
+   reclaimed by the consumer reads `Revoked`. Only `Settled` leases enter
+   `service_stats`.
 
 ## Storage and lifetime
 
@@ -202,6 +225,8 @@ These must hold for every reachable state. They are asserted in tests.
 | `ServiceCount`, `LeaseCount` | instance | monotonic id counters |
 | `Service(u64)` | persistent | TTL extended on save and on read |
 | `Lease(u64)` | persistent | TTL extended on save and on read to cover term + grace |
+| `ServiceStats(u64)` | persistent | cumulative settlements per service; extended on write and on read, so an untouched aggregate can age out and read as zero |
+| `LeaseRevoked(u64)` | persistent | written with the lease when a consumer reclaims; extended on the lease's own horizon |
 
 `LEDGER_BUMP_THRESHOLD = 17_280` ledgers (~1 day at 5s ledgers) and
 `LEDGER_BUMP_EXTEND = 518_400` ledgers (~30 days). For leases, `save_lease` and

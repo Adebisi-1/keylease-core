@@ -8,7 +8,8 @@ as authoritative.
 - **Wasm:** `target/wasm32v1-none/release/keylease_registry.wasm`
 - **Network target:** Stellar (`wasm32v1-none`), `soroban-sdk 26`
 - **Constants:** `SETTLE_GRACE_PERIOD_SECS = 86_400` (24 hours),
-  `MAX_LEASE_DURATION_SECS = 2_592_000` (30 days)
+  `MAX_LEASE_DURATION_SECS = 2_592_000` (30 days),
+  `MAX_RATE_PER_CALL = 18_446_744_073_709_551_616` (`2^64` stroops per call)
 - **Storage TTL:** `LEDGER_BUMP_THRESHOLD = 17_280`, `LEDGER_BUMP_EXTEND = 518_400`;
   leases extend to term + 24h grace + a 1-day buffer
 - **On-chain metadata:** `name = KeyLeaseRegistry`, `version`,
@@ -94,13 +95,17 @@ Publish a new leasable service.
 - **Caller / auth:** `provider` must authorize.
 - **Trigger:** when a provider lists an API or RPC endpoint.
 - **Parameters:**
-  - `rate_per_call` — price per metered call in token stroops; must be `> 0`.
+  - `rate_per_call` — price per metered call in token stroops; must satisfy
+    `0 < rate_per_call ≤ MAX_RATE_PER_CALL`.
   - `endpoint_hash` — 32-byte commitment to the off-chain descriptor.
 - **Returns:** the new `service_id` (monotonic, starts at `1`).
 - **State:** writes `Service(service_id)`, increments `ServiceCount`, extends
   instance TTL.
 - **Events:** `service_registered { service_id, provider, rate_per_call, endpoint_hash }`.
-- **Errors:** `InvalidRate`, `Overflow`.
+- **Errors:** `InvalidRate`, `RateTooHigh`, `Overflow`.
+- **Notes:** the rate bound is enforced where the price is published, not where
+  it is spent, so no consumer can ever be quoted a `rate_per_call` whose
+  deposit (`rate × allocated_calls`) is not representable in `i128`.
 
 ### `set_service_active`
 
@@ -154,6 +159,43 @@ Lock a deposit and mint a time-bound lease.
 - **Errors:** `InvalidCalls`, `InvalidDuration`, `DurationTooLong`,
   `ServiceNotFound`, `ServiceInactive`, `InvalidRate`, `TokenNotSet`, `Overflow`.
 
+### `create_lease_for`
+
+```rust
+pub fn create_lease_for(
+    env: Env,
+    delegate: Address,
+    consumer: Address,
+    service_id: u64,
+    requested_calls: u32,
+    duration_secs: u64,
+) -> Result<u64, Error>
+```
+
+Mint the same lease as `create_lease`, but sponsored by a third party (an
+employer, a treasury, or a build system paying for a team member).
+
+- **Caller / auth:** **both** `delegate` and `consumer` must authorize; the
+  consumer's signature is what permits the debit, so a delegate cannot lock
+  someone's deposit unilaterally. A smart-wallet (multisig) consumer satisfies
+  the requirement with its own `__check_auth`.
+- **Trigger:** a sponsor pays for a consumer's access.
+- **Preconditions:** identical to `create_lease` — same service checks, same
+  bounds, same escrow math.
+- **Effects:** `transfer(consumer → contract, rate_per_call × requested_calls)`.
+  The **consumer's** balance is debited, exactly as in `create_lease`; the
+  delegate pays only the transaction fee and holds no claim on the lease.
+- **Returns:** the new `lease_id` (same counter as `create_lease`).
+- **State:** writes `Lease(lease_id)` with `consumer` recorded as the owner; the
+  delegate is **not** stored on the lease.
+- **Events:** `lease_created { … }` (unchanged shape) followed by
+  `lease_delegated { lease_id, delegate, consumer }`.
+- **Errors:** the same set as `create_lease`, plus `Unauthorized` if either
+  signature is missing.
+- **Notes:** settlement and revocation are unchanged — the provider settles
+  against the lease, and the **consumer** owns the refund path, including for a
+  lease they never paid the fee for.
+
 ### `settle_lease`
 
 ```rust
@@ -172,7 +214,8 @@ Pay the provider for verified calls and refund the remainder to the consumer.
 - **Preconditions:** lease exists, is not settled, `verified_calls ≤
   allocated_calls`, the caller owns the service, and the lease has expired **or**
   `verified_calls == allocated_calls`.
-- **Effects:** persists `used_calls` and `settled = true` **first**, then calls
+- **Effects:** persists `used_calls` and `settled = true` **first**, then the
+  service's cumulative stats (`ServiceStats(service_id)`), then calls
   `transfer(contract → provider, verified_calls × rate_per_call)` and
   `transfer(contract → consumer, locked_deposit − payout)`.
 - **Events:** `lease_settled { lease_id, provider, verified_calls, payout, refund }`.
@@ -181,6 +224,9 @@ Pay the provider for verified calls and refund the remainder to the consumer.
 - **Notes:** zero-value transfers are skipped. Settling with
   `verified_calls = 0` is a legitimate way for a provider to refund an
   unusable lease. A re-entrant token sees `settled = true` and is rejected.
+  Stats are updated before any transfer, so a re-entrant token cannot inflate
+  them, and an overflow in the running totals aborts the settlement before any
+  funds move.
 
 ### `revoke_expired_lease`
 
@@ -196,13 +242,18 @@ Reclaim the **full** deposit when the provider never settled.
 
 - **Caller / auth:** `consumer`, and it must be the lease's consumer.
 - **Trigger:** after `expires_at + SETTLE_GRACE_PERIOD_SECS`.
-- **Effects:** persists `settled = true` first, then
+- **Effects:** persists `settled = true` **and** the revocation marker
+  (`LeaseRevoked(lease_id)`) first, then
   `transfer(contract → consumer, locked_deposit)`.
 - **Events:** `lease_revoked { lease_id, consumer, refund }`.
 - **Errors:** `LeaseNotFound`, `Unauthorized`, `LeaseAlreadySettled`,
   `LeaseNotExpired`, `RevokeWindowNotElapsed`, `TokenNotSet`, `Overflow`.
 - **Notes:** this is the consumer's escape hatch, and the reason escrow is safe
-  against an unresponsive provider.
+  against an unresponsive provider. A revoked lease reports
+  `LeaseStatus::Revoked`, not `Settled`: `used_calls` stays `0`,
+  `remaining_calls` and `locked_balance` read `0`, and the service's
+  `service_stats` are untouched, so a client can tell "provider earned nothing"
+  from "provider was paid" without replaying events.
 
 ---
 
@@ -219,13 +270,21 @@ These require no authorization.
 | `lease_count` | `(env) -> u64` | total leases ever created |
 | `get_service` | `(env, service_id: u64) -> Result<Service, Error>` | the `Service`, else `ServiceNotFound` |
 | `get_lease` | `(env, lease_id: u64) -> Result<Lease, Error>` | the `Lease`, else `LeaseNotFound` |
-| `lease_status` | `(env, lease_id: u64) -> Result<LeaseStatus, Error>` | derived status at current ledger time |
+| `lease_status` | `(env, lease_id: u64) -> Result<LeaseStatus, Error>` | derived status at current ledger time; `Revoked` for a consumer-reclaimed lease |
 | `remaining_calls` | `(env, lease_id: u64) -> Result<u32, Error>` | calls left; `0` once settled **or** expired |
 | `locked_balance` | `(env, lease_id: u64) -> Result<i128, Error>` | `locked_deposit`; `0` once settled |
+| `service_stats` | `(env, service_id: u64) -> Result<ServiceStats, Error>` | cumulative settled leases / calls / payout, else `ServiceNotFound` |
 
 > `remaining_calls` returns `0` as soon as the lease expires, even if calls were
 > never consumed. A caller that wants the raw allotment should read
 > `get_lease().allocated_calls`.
+
+> `service_stats` counts **provider settlements only**. A revoked lease is
+> absent from the totals, and the aggregate is a convenience view over the
+> `lease_settled` event stream: it is kept alive by settlements and reads, but
+> an entry untouched for long enough can age out and read as zero while its
+> events remain auditable on-chain. Treat `lease_settled` as authoritative for
+> accounting.
 
 ## Events
 
@@ -239,9 +298,15 @@ Events are part of the ABI. Each event name is a `Symbol` topic, followed by the
 | `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `provider`, `is_active` |
 | `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_delegated` | `lease_id` | `delegate`, `consumer` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
 | `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+
+`lease_delegated` is emitted **in addition to** `lease_created`, by
+`create_lease_for` only, and adds no secret material: both addresses already
+appear in the transaction's authorizations. Consumers that index
+`lease_created` need no change.
 
 ```bash
 stellar events --id $REGISTRY --network testnet --start-ledger 123456
@@ -269,21 +334,45 @@ pub struct Lease {
     pub settled: bool,
 }
 
-pub enum LeaseStatus { Active = 0, Expired = 1, Settled = 2 }
+pub struct ServiceStats {
+    pub settled_leases: u64,
+    pub settled_calls: u64,
+    pub total_payout: i128,
+}
+
+pub enum LeaseStatus { Active = 0, Expired = 1, Settled = 2, Revoked = 3 }
 ```
+
+`Lease` is stored on-chain and its field layout is frozen — appending a field
+breaks decoding of leases written by an older version. `Revoked` therefore
+derives from a separate `LeaseRevoked(lease_id)` marker rather than a
+`revoked: bool` on the struct, and `ServiceStats` lives under its own key for
+the same reason.
 
 ## Storage layout
 
 ```rust
 pub enum DataKey {
-    Admin,        // instance
-    Token,        // instance
-    ServiceCount, // instance
-    LeaseCount,   // instance
-    Service(u64), // persistent
-    Lease(u64),   // persistent
+    Admin,          // instance
+    Token,          // instance
+    ServiceCount,   // instance
+    LeaseCount,     // instance
+    Service(u64),   // persistent
+    Lease(u64),     // persistent
+    ServiceStats(u64), // persistent — cumulative settlement totals per service
+    LeaseRevoked(u64), // persistent — set when the consumer reclaimed the lease
 }
 ```
+
+TTL policy for the two appended keys: neither is user-controlled, and each stays
+readable at least as long as the entity it describes. `ServiceStats(id)` is
+bumped with the same `LEDGER_BUMP_THRESHOLD` / `LEDGER_BUMP_EXTEND` policy as
+`Service(id)` and is rewritten (and re-extended) on every settlement; an entry
+that sees neither a settlement nor a `service_stats` read for that horizon ages
+out and reads back as `ServiceStats::zero()`.
+`LeaseRevoked(id)` is written when the lease closes and extended with the lease's
+own horizon, so any ledger view that can still read a lease can read its
+revocation marker.
 
 `#[contracttype]` enums encode as a `SCV_VEC` whose first element is an
 `SCV_SYMBOL` variant name — so `DataKey::Lease(7)` is the wire key
@@ -313,6 +402,7 @@ never reused.
 | 14 | `TokenNotSet` | escrow token not configured |
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
+| 17 | `RateTooHigh` | `rate_per_call` above `MAX_RATE_PER_CALL` |
 
 ## Invoking with the Stellar CLI
 
@@ -331,6 +421,21 @@ stellar contract invoke --id $REGISTRY --source-account consumer --network testn
      --service_id 1 \
      --requested_calls 500 \
      --duration_secs 3600
+
+# create a lease for someone else: the delegate pays the fee, the consumer's
+# balance is debited, and both must sign
+stellar contract invoke --id $REGISTRY --source-account delegate --network testnet \
+  --sign $CONSUMER_SECRET_KEY \
+  -- create_lease_for \
+     --delegate $DELEGATE \
+     --consumer $CONSUMER \
+     --service_id 1 \
+     --requested_calls 500 \
+     --duration_secs 3600
+
+# lifetime revenue reported for one service
+stellar contract invoke --id $REGISTRY --network testnet \
+  -- service_stats --service_id 1
 
 # settle
 stellar contract invoke --id $REGISTRY --source-account provider --network testnet \

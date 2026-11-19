@@ -31,7 +31,11 @@ stellar contract invoke \
 ```
 
 `rate_per_call` is in the escrow token's smallest unit (**7 decimals** for the
-native asset, so `1000000` = `0.1 XLM` per call). The command prints the new
+native asset, so `1000000` = `0.1 XLM` per call). It must be positive and no
+more than `MAX_RATE_PER_CALL` (`2^64` stroops, ≈1.8×10¹⁹ tokens per call) — far
+above any price a lease can actually fund, and its only job is to guarantee that
+`rate_per_call × allocated_calls` always fits the ledger's arithmetic. A higher
+rate reverts with `RateTooHigh` and registers nothing. The command prints the new
 `service_id` — record it.
 
 The registration emits `service_registered { service_id, provider, rate_per_call,
@@ -117,6 +121,13 @@ manage.
 
 - **Revenue recognised:** `verified_calls × rate_per_call` per settlement,
   published in the `lease_settled` event.
+- **Lifetime totals:** `service_stats --service_id <id>` returns
+  `settled_leases`, `settled_calls` and `total_payout` for one service without
+  replaying history. It counts settlements only — a lease the consumer revoked
+  contributes nothing, so a reclaimed lease never inflates reported revenue.
+  Treat it as a convenience view and `lease_settled` as the book of record: the
+  aggregate is stored with a TTL, so an entry nothing has settled or read for a
+  long stretch can age out and read back as zero.
 - **Unused consumer balance:** refunded by you at settlement, or by the consumer
   via `revoke_expired_lease` after the 24h grace window.
 - **Disputes:** there is no dispute mechanism. The consumer's protection is the

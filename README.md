@@ -80,7 +80,7 @@ keylease-core/
 │   │   ├── src/
 │   │   │   ├── lib.rs     # entry points, contractmeta, upgrade, lifecycle docs
 │   │   │   ├── events.rs  # typed Soroban events (the indexing surface)
-│   │   │   ├── types.rs   # Service, Lease, LeaseStatus
+│   │   │   ├── types.rs   # Service, Lease, ServiceStats, LeaseStatus
 │   │   │   ├── storage.rs # DataKey layout + duration-aware TTL policy
 │   │   │   ├── errors.rs  # stable error codes
 │   │   │   └── test.rs    # lifecycle, SAC, events, upgrade, re-entrancy tests
@@ -106,13 +106,15 @@ keylease-core/
 | `init(admin)` | `admin` | One-time initialization; appoints the protocol admin. Emits `registry_initialized`. |
 | `set_token(admin, token)` | `admin` | Configure the SEP-41 escrow token (native SAC or custom). Emits `escrow_token_set`. |
 | `upgrade(admin, new_wasm_hash)` | `admin` | Install a new Wasm through the Soroban deployer. Emits `contract_upgraded`. |
-| `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. Returns `service_id`. Emits `service_registered`. |
+| `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. `rate_per_call` must be positive and at most `MAX_RATE_PER_CALL`. Returns `service_id`. Emits `service_registered`. |
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
 | `create_lease(consumer, service_id, requested_calls, duration_secs) -> u64` | `consumer` | Lock `rate × calls` and mint a lease. Emits `lease_created`. |
-| `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder. Emits `lease_settled`. |
+| `create_lease_for(delegate, consumer, service_id, requested_calls, duration_secs) -> u64` | `delegate` **and** `consumer` | Same lease, sponsored by a third party: the consumer's balance is debited and the consumer owns the refund. Emits `lease_created` then `lease_delegated`. |
+| `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder, and add the settlement to the service's stats. Emits `lease_settled`. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
 | `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `version()` | — | Read-only views. |
 | `lease_status(id)`, `remaining_calls(id)`, `locked_balance(id)` | — | Derived lifecycle queries. |
+| `service_stats(service_id)` | — | Cumulative settled leases, calls and payout for one service. |
 | `service_count()`, `lease_count()` | — | Monotonic counters. |
 
 ### Events
@@ -127,9 +129,14 @@ extra. Event names are the first topic; ids follow.
 | `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `provider`, `is_active` |
 | `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_delegated` | `lease_id` | `delegate`, `consumer` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
 | `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+
+`lease_created` is emitted unchanged whether the consumer or a delegate minted
+the lease; `lease_delegated` is added on top and names who paid the transaction
+fee. The delegate holds no claim on the lease.
 
 ```bash
 # Follow escrow from the ledger, no polling:
@@ -139,15 +146,20 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 ### Lifecycle
 
 ```
-Active ──(expires_at reached)──▶ Expired ──(24h grace)──▶ revocable by consumer
-   │                                  │
-   └──(fully consumed)────────────────┴──(provider settles)──▶ Settled
+Active ──(fully consumed + provider settles)────────────────────▶ Settled
+   │
+   └──(expires_at reached)──▶ Expired ──(provider settles)──────▶ Settled
+                                  │
+                                  └──(24h grace + consumer revokes)──▶ Revoked
 ```
 
 A lease is **settleable** when it has expired **or** `verified_calls ==
 allocated_calls`. It is **revocable** only when expired **and** the 24-hour
-provider grace window has elapsed. Either path ends in `Settled`; a settled
-lease can never be settled or revoked again.
+provider grace window has elapsed. Provider settlement ends the lease as
+`Settled`; consumer reclaim ends it as `Revoked`, and the two read differently
+to clients: a revoked lease reports `used_calls == 0`, earns the provider
+nothing, and never appears in `service_stats`. Either way a closed lease can
+never be settled or revoked again.
 
 ---
 
@@ -256,10 +268,19 @@ invariants:
    `MAX_LEASE_DURATION_SECS` (30 days) and extends the lease's persistent entry
    for its whole term plus the grace window, so escrow cannot be evicted while
    it is still claimable.
-6. **Explicit authorization.** Every state-changing entry point calls
+6. **Representable prices.** `register_service` caps `rate_per_call` at
+   `MAX_RATE_PER_CALL` (`2^64` stroops), so the deposit and payout behind any
+   accepted lease stay inside `i128` — checked arithmetic guards the arithmetic,
+   the bound guards the quoting surface.
+7. **Explicit authorization.** Every state-changing entry point calls
    `require_auth()` on the actor it claims to represent, and cross-checks that
-   actor against stored ownership where relevant.
-7. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
+   actor against stored ownership where relevant. A delegate sponsoring
+   `create_lease_for` needs the consumer's signature as well, so no third party
+   can lock a balance it does not own.
+8. **Revocation is not settlement.** A reclaimed lease reports
+   `LeaseStatus::Revoked`, keeps `used_calls == 0`, and never enters
+   `service_stats`, so refund and revenue stay distinguishable to any reader.
+9. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
    cannot move escrowed funds.
 
 ### Trusting the escrow token
