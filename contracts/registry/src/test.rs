@@ -1168,14 +1168,20 @@ fn wire_schema_version(env: &Env, event: &xdr::ContractEvent) -> Option<u32> {
 /// Assert every event the registry published in the last invocation carries the
 /// current schema version in its payload. Panics when the registry published
 /// nothing, so this can never pass by accident.
+///
+/// The expected value is a literal, not `EVENT_SCHEMA_VERSION`: a test that read
+/// the constant back would pass even if the constant were raised on its own,
+/// which is exactly the drift this has to catch. `contractmeta!` takes no path
+/// expression, so the metadata literal in `lib.rs` is the third copy of this
+/// number and has to move with it.
 fn assert_events_are_versioned(env: &Env, registry: &Address) {
     let all = env.events().all();
     let mut published = 0u32;
     for event in all.filter_by_contract(registry).events() {
         assert_eq!(
             wire_schema_version(env, event),
-            Some(EVENT_SCHEMA_VERSION),
-            "registry event without a versioned payload: {:?}",
+            Some(1),
+            "registry event without the published payload version: {:?}",
             event.body
         );
         published += 1;
@@ -1360,6 +1366,19 @@ fn test_service_read_never_extends_and_bump_service_does() {
     ctx.registry.bump_service(&service_id);
     let (bumps, _, _) = last_invocation(&env);
     assert_eq!(bumps, 1, "bump_service must pay for the extension");
+}
+
+#[test]
+fn test_bump_service_rejects_an_unknown_service() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // `extend_ttl` on a key that does not exist is a silent no-op, so the
+    // caller would pay for a bump that keeps nothing alive.
+    assert_eq!(
+        ctx.registry.try_bump_service(&404),
+        Err(Ok(Error::ServiceNotFound))
+    );
 }
 
 #[test]
