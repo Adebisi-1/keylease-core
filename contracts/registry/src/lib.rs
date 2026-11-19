@@ -90,6 +90,29 @@ pub const SETTLE_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60;
 /// is well under the network's maximum entry TTL (180 days on Testnet).
 pub const MAX_LEASE_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// Largest deposit a single lease may escrow, in the escrow token's base unit.
+///
+/// `required_deposit` is `rate_per_call * requested_calls`, so one extra zero in
+/// either input is multiplied straight into an escrow transfer. Checked
+/// arithmetic only rejects a product that does not fit `i128`; it cannot tell a
+/// deliberate wholesale lease from a fat-fingered one. This bound is the second
+/// guard, and it is what stops a token-scale change — a deployment pointed at a
+/// token with more decimals than the native asset — from turning a small lease
+/// into a large one.
+///
+/// One trillion base units is 100,000 of a seven-decimal token — XLM in every
+/// documented deployment — which is 2,000 times the largest amount in the
+/// worked protocol examples (500,000,000 base units). No documented lease shape
+/// reaches it, so the bound is invisible in normal use. Because it is denominated
+/// in base units and not in whole tokens, a deployment that switches to a token
+/// with more decimals gets a tighter ceiling in real terms, which is the
+/// direction the guard should fail in.
+///
+/// It is a compile-time constant rather than admin storage on purpose: the guard
+/// protects consumers from the contract's own arithmetic, so raising it should
+/// cost a Wasm upgrade and a release note, not one unsigned transaction.
+pub const MAX_LEASE_DEPOSIT: i128 = 1_000_000_000_000;
+
 #[contract]
 pub struct KeyLeaseRegistry;
 
@@ -237,6 +260,10 @@ impl KeyLeaseRegistry {
     /// for the whole term plus the grace window, so a longer lease could be
     /// evicted while escrow is still locked.
     ///
+    /// The resulting `rate_per_call * requested_calls` deposit must not exceed
+    /// `MAX_LEASE_DEPOSIT`; the bound is checked before the escrow token is
+    /// called, so an over-large lease moves nothing.
+    ///
     /// Returns the new `lease_id`.
     pub fn create_lease(
         env: Env,
@@ -270,6 +297,13 @@ impl KeyLeaseRegistry {
             .ok_or(Error::Overflow)?;
         if required_deposit <= 0 {
             return Err(Error::InvalidRate);
+        }
+        // Bound the escrow before any state or token interaction. This runs
+        // after the checked multiplication on purpose: `Overflow` means the
+        // product does not fit `i128`, `DepositTooLarge` means it fits and is
+        // still more than a lease is allowed to lock.
+        if required_deposit > MAX_LEASE_DEPOSIT {
+            return Err(Error::DepositTooLarge);
         }
 
         // A lease with no token configured can never be funded or settled, so

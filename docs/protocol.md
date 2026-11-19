@@ -70,6 +70,37 @@ stateDiagram-v2
 
 Discriminants are **stable on the wire**. They will never be renumbered.
 
+### `Settled` is one state, reached two ways
+
+`settled` records that escrow has left the contract — it does not record *why*.
+Both terminal transitions set it: `settle_lease` after paying the provider, and
+`revoke_expired_lease` after refunding the consumer in full. So `Settled` is the
+answer to "is this lease finished?", never to "did the provider earn?", and
+`Error::LeaseAlreadySettled` (7) likewise means "already settled or revoked".
+
+The two paths are separable, but not from the status:
+
+- `used_calls` is written only by `settle_lease`, so `settled && used_calls > 0`
+  is a provider settlement.
+- `settled && used_calls == 0` is ambiguous: a revocation, **or** a settlement
+  reported with `verified_calls = 0`, which is the provider's legitimate way of
+  refunding a lease it could not serve. The two leave identical storage.
+- The published event is the only discriminator — `lease_settled` versus
+  `lease_revoked` for that `lease_id`.
+
+| Lifecycle event | `settled` | `used_calls` | `lease_status` |
+| --- | --- | --- | --- |
+| `create_lease` | `false` | `0` | `Active` |
+| `settle_lease(320)` of 500, after expiry | `true` | `320` | `Settled` |
+| `settle_lease(0)` of 500, after expiry | `true` | `0` | `Settled` |
+| `revoke_expired_lease` after the grace window | `true` | `0` | `Settled` |
+
+The full state-by-event table, including `remaining_calls` and
+`locked_balance`, is in
+[`LeaseStatus` and the `settled` flag](contract-reference.md#leasestatus-and-the-settled-flag),
+and how to consume the two events is in
+[Following the event stream](integration.md#following-the-event-stream).
+
 ### When can a lease be settled?
 
 `settle_lease` reverts with `LeaseNotSettleable` unless **either**:
@@ -87,7 +118,7 @@ After expiry there is a 24-hour window (`SETTLE_GRACE_PERIOD_SECS = 86_400`)
 during which **only the provider** can settle. Once it elapses, the consumer may
 call `revoke_expired_lease` and reclaim the entire deposit.
 
-```
+```text
 expires_at ────────────────────┬─────────────────────────────┬──────────────▶ time
                                │                             │
                         expiry reached              expires_at + 24h
@@ -134,7 +165,7 @@ per call), and a consumer buys 500 calls for 1 hour.
 
 **1. `create_lease`**
 
-```
+```text
 required_deposit = rate_per_call × requested_calls
                  = 1_000_000 × 500
                  = 500_000_000        (50 XLM)
@@ -145,7 +176,7 @@ The registry transfers `500_000_000` from the consumer into escrow and sets
 
 **2a. `settle_lease` after 1 hour with 320 calls consumed**
 
-```
+```text
 payout = 1_000_000 × 320 = 320_000_000   (32 XLM to the provider)
 refund = 500_000_000 − 320_000_000
        = 180_000_000                     (18 XLM back to the consumer)
@@ -153,7 +184,7 @@ refund = 500_000_000 − 320_000_000
 
 **2b. Provider goes dark; consumer calls `revoke_expired_lease` after 24h**
 
-```
+```text
 refund = locked_deposit = 500_000_000    (50 XLM, the full deposit)
 ```
 
@@ -161,7 +192,7 @@ refund = locked_deposit = 500_000_000    (50 XLM, the full deposit)
 
 `settle_lease` is immediately allowed (`verified_calls == allocated_calls`):
 
-```
+```text
 payout = 1_000_000 × 500 = 500_000_000   (50 XLM)
 refund = 0
 ```
