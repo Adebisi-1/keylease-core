@@ -40,4 +40,8 @@ pub enum Error {
     /// Lease duration exceeds `MAX_LEASE_DURATION_SECS`, so its storage entry
     /// could not be kept alive for the whole term.
     DurationTooLong = 16,
+    /// The lease is already settled or revoked and cannot change hands.
+    LeaseNotTransferable = 17,
+    /// The transfer target is the current consumer.
+    InvalidConsumer = 18,
 }

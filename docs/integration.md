@@ -33,6 +33,8 @@ A provider should implement these steps, in order, and fail closed at every one:
    `ledger.timestamp() < expires_at`. Reject otherwise (`403`).
 4. **Check ownership.** The authenticated address must equal `lease.consumer`.
    Otherwise reject (`403`). This is what makes a stolen lease id worthless.
+   `consumer` is mutable: the current owner can transfer the lease, so treat a
+   cached lease as stale when the address no longer matches and re-read it.
 5. **Enforce the quota.** Use `max(lease.used_calls, local_counter)` against
    `lease.allocated_calls`; reject with `429` when exhausted, and increment the
    counter only for admitted requests.
@@ -115,6 +117,7 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 | Event | Use |
 | --- | --- |
 | `lease_created` | Build a work queue of leases to settle; alert on new demand. |
+| `lease_transferred` | Ownership changed hands; update the consumer→lease projection. The refund right moved with it. |
 | `lease_settled` | Reconcile payouts and refunds; close the lease in your ledger. |
 | `lease_revoked` | A consumer reclaimed an expired lease; the provider earned nothing. |
 | `service_registered` / `service_status_changed` | Keep a service catalogue in sync. |
