@@ -118,7 +118,7 @@ After expiry there is a 24-hour window (`SETTLE_GRACE_PERIOD_SECS = 86_400`)
 during which **only the provider** can settle. Once it elapses, the consumer may
 call `revoke_expired_lease` and reclaim the entire deposit.
 
-```
+```text
 expires_at ────────────────────┬─────────────────────────────┬──────────────▶ time
                                │                             │
                         expiry reached              expires_at + 24h
@@ -165,7 +165,7 @@ per call), and a consumer buys 500 calls for 1 hour.
 
 **1. `create_lease`**
 
-```
+```text
 required_deposit = rate_per_call × requested_calls
                  = 1_000_000 × 500
                  = 500_000_000        (50 XLM)
@@ -176,7 +176,7 @@ The registry transfers `500_000_000` from the consumer into escrow and sets
 
 **2a. `settle_lease` after 1 hour with 320 calls consumed**
 
-```
+```text
 payout = 1_000_000 × 320 = 320_000_000   (32 XLM to the provider)
 refund = 500_000_000 − 320_000_000
        = 180_000_000                     (18 XLM back to the consumer)
@@ -184,7 +184,7 @@ refund = 500_000_000 − 320_000_000
 
 **2b. Provider goes dark; consumer calls `revoke_expired_lease` after 24h**
 
-```
+```text
 refund = locked_deposit = 500_000_000    (50 XLM, the full deposit)
 ```
 
@@ -192,7 +192,7 @@ refund = locked_deposit = 500_000_000    (50 XLM, the full deposit)
 
 `settle_lease` is immediately allowed (`verified_calls == allocated_calls`):
 
-```
+```text
 payout = 1_000_000 × 500 = 500_000_000   (50 XLM)
 refund = 0
 ```

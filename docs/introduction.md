@@ -25,7 +25,7 @@ lease against Stellar instead of trusting a password, settles once with a
 verified call count, and is paid from escrow. Unused balance refunds
 automatically.
 
-```
+```text
 consumer                         registry                        provider
    |                                |                                |
    |-- create_lease(calls, secs) -->|                                |

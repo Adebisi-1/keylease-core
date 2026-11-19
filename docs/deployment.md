@@ -31,7 +31,7 @@ for tests and local sandboxes only.
 Then it re-reads `get_service` to confirm the write landed, and prints a block
 you can paste into `.env`:
 
-```
+```text
 KEYLEASE_CONTRACT_ID=C...
 KEYLEASE_SERVICE_ID=1
 KEYLEASE_TOKEN_ADDRESS=...
