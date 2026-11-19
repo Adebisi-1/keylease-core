@@ -9,7 +9,9 @@ as authoritative.
 - **Network target:** Stellar (`wasm32v1-none`), `soroban-sdk 26`
 - **Constants:** `SETTLE_GRACE_PERIOD_SECS = 86_400` (24 hours),
   `MAX_LEASE_DURATION_SECS = 2_592_000` (30 days),
-  `MAX_RATE_PER_CALL = 18_446_744_073_709_551_616` (`2^64` stroops per call)
+  `MAX_LEASE_DEPOSIT = 1_000_000_000_000` base units (100,000 of a
+  seven-decimal token such as XLM),
+  `MAX_RATE_PER_CALL = MAX_LEASE_DEPOSIT` base units per call
 - **Storage TTL:** `LEDGER_BUMP_THRESHOLD = 17_280`, `LEDGER_BUMP_EXTEND = 518_400`;
   leases extend to term + 24h grace + a 1-day buffer
 - **On-chain metadata:** `name = KeyLeaseRegistry`, `version`,
@@ -105,7 +107,9 @@ Publish a new leasable service.
 - **Errors:** `InvalidRate`, `RateTooHigh`, `Overflow`.
 - **Notes:** the rate bound is enforced where the price is published, not where
   it is spent, so no consumer can ever be quoted a `rate_per_call` whose
-  deposit (`rate × allocated_calls`) is not representable in `i128`.
+  deposit (`rate × allocated_calls`) is not representable in `i128`. Because
+  `MAX_RATE_PER_CALL` equals `MAX_LEASE_DEPOSIT` and a lease is at least one
+  call, a service can also never be listed at a price no lease can fund.
 
 ### `set_service_active`
 
@@ -149,7 +153,8 @@ Lock a deposit and mint a time-bound lease.
 - **Caller / auth:** `consumer` must authorize.
 - **Trigger:** a developer purchases metered access.
 - **Preconditions:** `requested_calls > 0`, `0 < duration_secs ≤
-  MAX_LEASE_DURATION_SECS`, the service exists and `is_active`, and `Token` is
+  MAX_LEASE_DURATION_SECS`, `rate_per_call × requested_calls ≤
+  MAX_LEASE_DEPOSIT`, the service exists and `is_active`, and `Token` is
   set.
 - **Effects:** `transfer(consumer → contract, rate_per_call × requested_calls)`.
 - **Returns:** the new `lease_id` (monotonic, starts at `1`).
@@ -157,7 +162,14 @@ Lock a deposit and mint a time-bound lease.
   duration_secs` and a TTL covering the term plus grace; increments `LeaseCount`.
 - **Events:** `lease_created { lease_id, service_id, consumer, allocated_calls, expires_at, locked_deposit }`.
 - **Errors:** `InvalidCalls`, `InvalidDuration`, `DurationTooLong`,
-  `ServiceNotFound`, `ServiceInactive`, `InvalidRate`, `TokenNotSet`, `Overflow`.
+  `ServiceNotFound`, `ServiceInactive`, `InvalidRate`, `TokenNotSet`, `Overflow`,
+  `DepositTooLarge`.
+
+The deposit is bounded twice, and the two rejections mean different things.
+`Overflow` says `rate_per_call × requested_calls` does not fit `i128`.
+`DepositTooLarge` says it fits and is still more than one lease may lock. The
+bound is checked after the multiplication and before the lease id is allocated
+or the token is called, so a rejected lease moves nothing and consumes no id.
 
 ### `create_lease_for`
 
@@ -278,7 +290,7 @@ These require no authorization.
 > `remaining_calls` returns `0` as soon as the lease expires, even if calls were
 > never consumed. A caller that wants the raw allotment should read
 > `get_lease().allocated_calls`.
-
+>
 > `service_stats` counts **provider settlements only**. A revoked lease is
 > absent from the totals, and the aggregate is a convenience view over the
 > `lease_settled` event stream: it is kept alive by settlements and reads, but
@@ -402,7 +414,8 @@ never reused.
 | 14 | `TokenNotSet` | escrow token not configured |
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
-| 17 | `RateTooHigh` | `rate_per_call` above `MAX_RATE_PER_CALL` |
+| 17 | `DepositTooLarge` | deposit above `MAX_LEASE_DEPOSIT` |
+| 18 | `RateTooHigh` | `rate_per_call` above `MAX_RATE_PER_CALL` |
 
 ## Invoking with the Stellar CLI
 

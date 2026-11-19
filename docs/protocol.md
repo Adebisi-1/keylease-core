@@ -96,7 +96,7 @@ After expiry there is a 24-hour window (`SETTLE_GRACE_PERIOD_SECS = 86_400`)
 during which **only the provider** can settle. Once it elapses, the consumer may
 call `revoke_expired_lease` and reclaim the entire deposit.
 
-```
+```text
 expires_at ────────────────────┬─────────────────────────────┬──────────────▶ time
                                │                             │
                         expiry reached              expires_at + 24h
@@ -147,7 +147,7 @@ per call), and a consumer buys 500 calls for 1 hour.
 
 **1. `create_lease`**
 
-```
+```text
 required_deposit = rate_per_call × requested_calls
                  = 1_000_000 × 500
                  = 500_000_000        (50 XLM)
@@ -158,7 +158,7 @@ The registry transfers `500_000_000` from the consumer into escrow and sets
 
 **2a. `settle_lease` after 1 hour with 320 calls consumed**
 
-```
+```text
 payout = 1_000_000 × 320 = 320_000_000   (32 XLM to the provider)
 refund = 500_000_000 − 320_000_000
        = 180_000_000                     (18 XLM back to the consumer)
@@ -166,7 +166,7 @@ refund = 500_000_000 − 320_000_000
 
 **2b. Provider goes dark; consumer calls `revoke_expired_lease` after 24h**
 
-```
+```text
 refund = locked_deposit = 500_000_000    (50 XLM, the full deposit)
 ```
 
@@ -174,7 +174,7 @@ refund = locked_deposit = 500_000_000    (50 XLM, the full deposit)
 
 `settle_lease` is immediately allowed (`verified_calls == allocated_calls`):
 
-```
+```text
 payout = 1_000_000 × 500 = 500_000_000   (50 XLM)
 refund = 0
 ```
@@ -207,9 +207,11 @@ These must hold for every reachable state. They are asserted in tests.
 6. **Claimable storage.** A lease's persistent entry outlives its term plus the
    grace window (`MAX_LEASE_DURATION_SECS = 30 days`), and so does the
    revocation marker recorded against it.
-7. **Representable price.** `register_service` rejects `rate_per_call` above
-   `MAX_RATE_PER_CALL = 2^64`, so `rate_per_call × allocated_calls` can never
-   exceed `2^96` and no accepted lease can quote a deposit `i128` cannot hold.
+7. **Funded, computable prices.** `register_service` rejects `rate_per_call`
+   above `MAX_RATE_PER_CALL`, and `create_lease` rejects a
+   `rate_per_call × requested_calls` above `MAX_LEASE_DEPOSIT`. The two bounds
+   are the same number, so every listed price can fund at least a one-call lease
+   and no accepted lease can quote a deposit `i128` cannot hold.
 8. **Refund ownership.** Whoever created a lease — consumer or delegate — the
    **consumer** is debited, is the refund recipient, and is the only address
    that can revoke.

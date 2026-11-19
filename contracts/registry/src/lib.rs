@@ -31,8 +31,9 @@
 //! * A consumer can always reclaim the full deposit if the provider fails to
 //!   settle within [`SETTLE_GRACE_PERIOD_SECS`] of expiry. A reclaimed lease
 //!   ends as `LeaseStatus::Revoked`, so a refund is never mistaken for revenue.
-//! * A published price is bounded by [`MAX_RATE_PER_CALL`], so the deposit a
-//!   consumer is quoted can always be computed.
+//! * A published price is bounded by [`MAX_RATE_PER_CALL`], which equals the
+//!   per-lease deposit cap, so the deposit a consumer is quoted can always be
+//!   computed and the cheapest lease of any listed service can always be funded.
 //! * A lease can be funded by a delegate, but only with the consumer's own
 //!   signature, and the deposit and the refund stay on the consumer.
 //! * All ledger math uses checked arithmetic; overflow reverts the transaction.
@@ -95,28 +96,51 @@ pub const SETTLE_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60;
 /// is well under the network's maximum entry TTL (180 days on Testnet).
 pub const MAX_LEASE_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// Largest deposit a single lease may escrow, in the escrow token's base unit.
+///
+/// `required_deposit` is `rate_per_call * requested_calls`, so one extra zero in
+/// either input is multiplied straight into an escrow transfer. Checked
+/// arithmetic only rejects a product that does not fit `i128`; it cannot tell a
+/// deliberate wholesale lease from a fat-fingered one. This bound is the second
+/// guard, and it is what stops a token-scale change — a deployment pointed at a
+/// token with more decimals than the native asset — from turning a small lease
+/// into a large one.
+///
+/// One trillion base units is 100,000 of a seven-decimal token — XLM in every
+/// documented deployment — which is 2,000 times the largest amount in the
+/// worked protocol examples (500,000,000 base units). No documented lease shape
+/// reaches it, so the bound is invisible in normal use. Because it is denominated
+/// in base units and not in whole tokens, a deployment that switches to a token
+/// with more decimals gets a tighter ceiling in real terms, which is the
+/// direction the guard should fail in.
+///
+/// It is a compile-time constant rather than admin storage on purpose: the guard
+/// protects consumers from the contract's own arithmetic, so raising it should
+/// cost a Wasm upgrade and a release note, not one unsigned transaction.
+pub const MAX_LEASE_DEPOSIT: i128 = 1_000_000_000_000;
+
 /// Highest per-call price a provider may publish, in the escrow token's
-/// smallest unit: `2^64` = 18,446,744,073,709,551,616 stroops.
+/// smallest unit. It is defined as `MAX_LEASE_DEPOSIT` rather than chosen
+/// independently, because the smallest legal lease is one call: a rate above
+/// the deposit cap describes a service whose cheapest possible lease
+/// `create_lease` must reject with `DepositTooLarge`, so binding the two means
+/// every accepted `rate_per_call` can fund at least one call. A rate exactly at
+/// the cap is leasable for one call only — two calls cross the deposit cap.
 ///
-/// Two independent reasons pick this exact number:
+/// At one trillion base units this is 100,000 of a seven-decimal token, against
+/// the 100 base units per call the worked examples price: a rate above the cap
+/// is a typo or an attack, not a tariff, so rejecting it costs no honest
+/// provider anything.
 ///
-/// 1. **It cannot block a real price.** At Stellar's 7-decimal asset scale the
-///    cap is 1.8 × 10^19 tokens *per call* — roughly 37 times the entire
-///    circulating lumen supply (5 × 10^17 stroops). A rate above it is a typo
-///    or an attack, not a tariff, so rejecting it costs no honest provider
-///    anything.
-/// 2. **It makes the deposit math predictable by inspection.** A power of two
-///    bounds the worst case exactly: a deposit is `rate_per_call × calls` with
-///    `calls ≤ u32::MAX < 2^32`, so every accepted lease, payout and refund
-///    lands below `2^96` — 2^31 of headroom inside `i128`. Before this bound,
-///    the only ceiling on a rate was `checked_mul` failing at lease time, an
-///    `Overflow` a consumer could not predict from the service listing.
+/// It also makes the deposit math predictable by inspection. `requested_calls`
+/// is `u32`, so the worst legal deposit is under 10^12 × 2^32 ≈ 4.3 × 10^21 —
+/// about 10^17 times inside `i128`. `Overflow` from the multiplication is
+/// therefore unreachable through a legal rate; the reachable `Overflow` at lease
+/// time is the expiry-timestamp addition.
 ///
-/// With the cap enforced at registration, `create_lease` and `settle_lease` can
-/// no longer overflow on rate math. Their `checked_mul` stays as the general
-/// guard for the paths this constant does not bound (id counters, ledger
-/// timestamps), not as the pricing check.
-pub const MAX_RATE_PER_CALL: i128 = 1i128 << 64;
+/// A compile-time constant, like `MAX_LEASE_DEPOSIT`: raising it must cost a
+/// Wasm upgrade and a release note, not one unsigned transaction.
+pub const MAX_RATE_PER_CALL: i128 = MAX_LEASE_DEPOSIT;
 
 #[contract]
 pub struct KeyLeaseRegistry;
@@ -204,7 +228,8 @@ impl KeyLeaseRegistry {
         }
         // The bound is checked here, where a listing is made, rather than at
         // lease time: a consumer should not be able to be quoted a price whose
-        // deposit cannot be computed.
+        // deposit cannot be computed, and a provider should not be able to
+        // advertise a service no lease can fund.
         if rate_per_call > MAX_RATE_PER_CALL {
             return Err(Error::RateTooHigh);
         }
@@ -270,6 +295,10 @@ impl KeyLeaseRegistry {
     /// is a Soroban storage constraint: the lease's persistent entry is extended
     /// for the whole term plus the grace window, so a longer lease could be
     /// evicted while escrow is still locked.
+    ///
+    /// The resulting `rate_per_call * requested_calls` deposit must not exceed
+    /// `MAX_LEASE_DEPOSIT`; the bound is checked before the escrow token is
+    /// called, so an over-large lease moves nothing.
     ///
     /// Returns the new `lease_id`.
     pub fn create_lease(
@@ -612,6 +641,13 @@ fn mint_lease(
         .ok_or(Error::Overflow)?;
     if required_deposit <= 0 {
         return Err(Error::InvalidRate);
+    }
+    // Bound the escrow before any state or token interaction. This runs
+    // after the checked multiplication on purpose: `Overflow` means the
+    // product does not fit `i128`, `DepositTooLarge` means it fits and is
+    // still more than a lease is allowed to lock.
+    if required_deposit > MAX_LEASE_DEPOSIT {
+        return Err(Error::DepositTooLarge);
     }
 
     // A lease with no token configured can never be funded or settled, so

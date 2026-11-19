@@ -212,9 +212,9 @@ pub fn get_service_stats(env: &Env, service_id: u64) -> ServiceStats {
 ///
 /// Totals are checked, never saturating: a silently clamped revenue counter is
 /// worse for a reporter than a reverted settlement. The bound is arithmetic,
-/// not economic — with `MAX_RATE_PER_CALL` capping a payout below `2^96`,
-/// overflowing `total_payout` would take ~2^31 max-size settlements, i.e. far
-/// more tokens than exist.
+/// not economic — with `MAX_RATE_PER_CALL` capping one settlement's payout
+/// below 2^72, overflowing `total_payout` would take ~4 × 10^16 such
+/// settlements, i.e. far more tokens than exist.
 pub fn record_settlement(
     env: &Env,
     service_id: u64,

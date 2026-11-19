@@ -145,7 +145,7 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 
 ### Lifecycle
 
-```
+```text
 Active ──(fully consumed + provider settles)────────────────────▶ Settled
    │
    └──(expires_at reached)──▶ Expired ──(provider settles)──────▶ Settled
@@ -243,6 +243,7 @@ protocol, its Stellar dependencies and how to integrate with it:
 | [Provider](./docs/provider-guide.md) / [Consumer](./docs/consumer-guide.md) guides | using the protocol |
 | [Developer guide](./docs/developer-guide.md) | building, testing, upgrading and extending |
 | [Deployment](./docs/deployment.md) | `stellar contract` commands and upgrade procedure |
+| [Troubleshooting](./docs/troubleshooting.md) | every failure by actor, with the command that verifies it |
 
 ---
 
@@ -268,19 +269,24 @@ invariants:
    `MAX_LEASE_DURATION_SECS` (30 days) and extends the lease's persistent entry
    for its whole term plus the grace window, so escrow cannot be evicted while
    it is still claimable.
-6. **Representable prices.** `register_service` caps `rate_per_call` at
-   `MAX_RATE_PER_CALL` (`2^64` stroops), so the deposit and payout behind any
-   accepted lease stay inside `i128` — checked arithmetic guards the arithmetic,
-   the bound guards the quoting surface.
-7. **Explicit authorization.** Every state-changing entry point calls
+6. **Bounded deposits.** `create_lease` rejects a `rate_per_call ×
+   requested_calls` product above `MAX_LEASE_DEPOSIT` with `DepositTooLarge`,
+   before allocating a lease id or calling the token. Checked arithmetic cannot
+   cover this: a product can fit `i128` and still be far more than the consumer
+   meant to lock.
+7. **Listed prices are leasable.** `register_service` caps `rate_per_call` at
+   `MAX_RATE_PER_CALL`, which equals `MAX_LEASE_DEPOSIT` — so no service can be
+   advertised at a price that cannot fund even a one-call lease, and every
+   accepted deposit and payout stays inside `i128`.
+8. **Explicit authorization.** Every state-changing entry point calls
    `require_auth()` on the actor it claims to represent, and cross-checks that
    actor against stored ownership where relevant. A delegate sponsoring
    `create_lease_for` needs the consumer's signature as well, so no third party
    can lock a balance it does not own.
-8. **Revocation is not settlement.** A reclaimed lease reports
+9. **Revocation is not settlement.** A reclaimed lease reports
    `LeaseStatus::Revoked`, keeps `used_calls == 0`, and never enters
    `service_stats`, so refund and revenue stay distinguishable to any reader.
-9. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
+10. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
    cannot move escrowed funds.
 
 ### Trusting the escrow token
@@ -303,7 +309,7 @@ re-entrant token.
 cargo test --all
 ```
 
-The 40 tests in `contracts/registry/src/test.rs` cover:
+The 60 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
 - the happy path (lock → full-usage settle before expiry),
@@ -312,6 +318,11 @@ The 40 tests in `contracts/registry/src/test.rs` cover:
 - the 24-hour grace window (boundary, early-settle, and post-settle cases),
 - unauthorized settle/revoke/upgrade attempts,
 - rate-math, timestamp and duration overflow/rejection,
+- the deposit ceiling at the limit, one unit above it, and as a product,
+- the published-price bound, and the one-call lease it still has to fund,
+- per-service settlement totals, including zero-call settlements,
+- delegated creation: both signatures required, refund owned by the consumer,
+- revoked leases excluded from `service_stats` and read as `Revoked`,
 - every emitted event, including its topics and payload,
 - the full lifecycle escrowed with the **native Stellar Asset Contract**,
 - a **re-entrant token** attempting a second settlement,
@@ -321,7 +332,7 @@ The 40 tests in `contracts/registry/src/test.rs` cover:
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). 
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## Security
 

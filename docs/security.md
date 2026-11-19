@@ -41,23 +41,29 @@ take more than it is owed, and it cannot prevent the consumer's refund.
    `MAX_LEASE_DURATION_SECS` (30 days) revert with `DurationTooLong`, and the
    persistent entry is extended for the term plus the grace window, so escrow
    cannot be evicted while it is claimable.
-7. **Prices stay representable.** `register_service` rejects `rate_per_call`
-   above `MAX_RATE_PER_CALL` (`RateTooHigh`), which caps the worst-case deposit
-   and payout below `2^96` — inside `i128` with a wide margin, so no accepted
-   service can price a lease whose escrow the ledger cannot express.
-8. **The admin cannot touch user funds.** It can only call `set_token` and
+7. **A single lease cannot escrow an unbounded amount.** A deposit that fits
+   `i128` but exceeds `MAX_LEASE_DEPOSIT` reverts with `DepositTooLarge`, before
+   the lease id is allocated and before the token is called. Checked arithmetic
+   alone cannot catch this: a product can be perfectly representable and still
+   be three orders of magnitude more than the consumer meant to lock.
+8. **Listed prices are leasable.** `register_service` rejects `rate_per_call`
+   above `MAX_RATE_PER_CALL`, which equals `MAX_LEASE_DEPOSIT`. A service can
+   therefore never be listed at a price that cannot fund even the smallest
+   (one-call) lease, and the worst legal `rate × calls` product stays far inside
+   `i128`, so a consumer's quote is always the amount that moves.
+9. **The admin cannot touch user funds.** It can only call `set_token` and
    `upgrade`.
-9. **Every mutation is authenticated.** No state-changing entry point trusts its
-   caller without `require_auth()`.
-10. **A sponsor cannot spend your balance.** `create_lease_for` calls
+10. **Every mutation is authenticated.** No state-changing entry point trusts its
+    caller without `require_auth()`.
+11. **A sponsor cannot spend your balance.** `create_lease_for` calls
     `require_auth()` on the delegate *and* the consumer, and the deposit is
     transferred from the consumer; the refund and revoke paths stay bound to the
     consumer alone. Missing either signature reverts before any state changes.
-11. **Revocation is not settlement.** A reclaimed lease reports
+12. **Revocation is not settlement.** A reclaimed lease reports
     `LeaseStatus::Revoked`, keeps `used_calls == 0`, pays the provider nothing,
     and is excluded from `service_stats`, so revenue reporting cannot be
     confused with a refund.
-12. **Every mutation is observable.** Each transition emits a typed Soroban event
+13. **Every mutation is observable.** Each transition emits a typed Soroban event
     with no secret material in it.
 
 ## Invariants
@@ -88,6 +94,9 @@ violation.
 | Provider strands funds by never settling | 24h grace, then full consumer refund |
 | Consumer races the provider at expiry | 24h grace window reserved for the provider |
 | Rate overflow creates a cheap lease | `checked_mul` → `Overflow`, and `RateTooHigh` blocks the price before it can ever be leased |
+| Typo locks a consumer into an enormous deposit | `MAX_LEASE_DEPOSIT` → `DepositTooLarge` |
+| Escrow token has more decimals than assumed | `MAX_LEASE_DEPOSIT` is in base units, so the ceiling tightens as the scale grows |
+| Provider lists a price no consumer can rent | `MAX_RATE_PER_CALL = MAX_LEASE_DEPOSIT`, so the cheapest lease of any listed service is fundable |
 | Duration overflow wraps expiry | `checked_add` → `Overflow` |
 | Delegate locks a consumer's deposit unilaterally | `create_lease_for` requires the consumer's `require_auth()` as well; no state changes without both |
 | Delegate claims a refund it sponsored | refunds and revocation are keyed to `lease.consumer`, and the delegate is never stored on the lease |
