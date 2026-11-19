@@ -25,6 +25,7 @@
 
 ## Project
 
+- [Design: time-locked upgrades](design/upgrade-timelock.md)
 - [Deployments](deployments.md)
 - [Release notes: v0.2.1](releases/v0.2.1.md)
 - [Release notes: v0.2.0](releases/v0.2.0.md)
