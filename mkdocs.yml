@@ -73,6 +73,7 @@ nav:
       - Developer guide: developer-guide.md
       - Deployment: deployment.md
   - Project:
+      - Design: consumer challenge window: design/consumer-challenge-window.md
       - Deployments: deployments.md
       - Release notes: releases/v0.2.1.md
       - v0.2.0: releases/v0.2.0.md

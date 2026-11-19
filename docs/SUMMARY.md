@@ -25,6 +25,7 @@
 
 ## Project
 
+- [Design: consumer challenge window](design/consumer-challenge-window.md)
 - [Deployments](deployments.md)
 - [Release notes: v0.2.1](releases/v0.2.1.md)
 - [Release notes: v0.2.0](releases/v0.2.0.md)

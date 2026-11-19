@@ -1,7 +1,7 @@
 use soroban_sdk::{contracttype, Address, Env};
 
 use crate::errors::Error;
-use crate::types::{Lease, Service};
+use crate::types::{Lease, Service, Settlement};
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
 /// Expected Stellar ledger close time, used to translate lease durations into
@@ -29,6 +29,8 @@ pub enum DataKey {
     Service(u64),
     /// `Lease` by id (persistent storage).
     Lease(u64),
+    /// `Settlement` by lease id (persistent storage).
+    Settlement(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -165,4 +167,29 @@ pub fn get_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
         lease_ttl_extend(env, &lease),
     );
     Ok(lease)
+}
+
+// ---------------------------------------------------------------------------
+// Settlements
+// ---------------------------------------------------------------------------
+
+pub fn save_settlement(env: &Env, settlement: &Settlement) {
+    let key = DataKey::Settlement(settlement.lease_id);
+    env.storage().persistent().set(&key, settlement);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+}
+
+pub fn get_settlement(env: &Env, lease_id: u64) -> Result<Settlement, Error> {
+    let key = DataKey::Settlement(lease_id);
+    let settlement = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::SettlementNotFound)?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    Ok(settlement)
 }

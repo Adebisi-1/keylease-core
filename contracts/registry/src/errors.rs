@@ -40,4 +40,18 @@ pub enum Error {
     /// Lease duration exceeds `MAX_LEASE_DURATION_SECS`, so its storage entry
     /// could not be kept alive for the whole term.
     DurationTooLong = 16,
+    /// No settlement has been proposed for the given `lease_id`.
+    SettlementNotFound = 17,
+    /// The settlement has already been finalized; funds have been released.
+    SettlementFinalized = 18,
+    /// The consumer challenge window has closed (or was never open).
+    ChallengeWindowClosed = 19,
+    /// The settlement is already under an active consumer challenge.
+    SettlementChallenged = 20,
+    /// There is no active challenge to cancel or resolve.
+    NoActiveChallenge = 21,
+    /// The challenge window has not closed yet, so the payout stays locked.
+    ChallengeWindowStillOpen = 22,
+    /// The challenge evidence hash is all zeroes.
+    InvalidEvidence = 23,
 }
