@@ -87,7 +87,17 @@ done <<< "$LABELS_OF"
 PROTECTION='{
   "required_status_checks": {
     "strict": true,
-    "contexts": ["Format", "Shellcheck", "Clippy", "Test", "Build (wasm32v1-none)", "Dependency Policy", "Malware Scan"]
+    "contexts": [
+      "Format",
+      "Shellcheck",
+      "Clippy",
+      "Test",
+      "Build (wasm32v1-none)",
+      "Spell Check",
+      "Markdown Lint",
+      "Dependency Policy",
+      "Malware Scan"
+    ]
   },
   "enforce_admins": false,
   "required_pull_request_reviews": {
