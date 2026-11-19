@@ -68,13 +68,16 @@ and `latestLedger`, so read it from the endpoint rather than assuming it: on the
 public Testnet RPC those two came back as `5698126` and `5819085`, a span of
 120,959 ledgers over 604,791 seconds — seven days at five seconds a ledger.
 
-Two things follow for anyone verifying this record. The rows above stay
-checkable through the explorer links and the live read views (`get_lease`,
-`get_service`, `lease_status`), which are not time-bounded. They do not stay
-checkable through the event log, and re-running the deploy script will not
-reproduce them either, since it stops after `register_service` and funds no
-lease. Use `stellar events` against the window it does serve to prove the
-contract is still publishing events. See
+Two things follow for anyone verifying this record. The rows above stay checkable
+through the explorer links, and `get_lease 1` still returns them on the deployed
+build (`locked_deposit = 100000000`, `used_calls = 100`, `settled = true`) — but
+a persistent entry has its own lifetime, and reads only keep it alive for as
+long as the deployed Wasm extends on read, so that proof decays too; see
+[Storage lifetime](integration.md#storage-lifetime). The event log is gone from
+the endpoint already, and re-running the deploy script will not reproduce
+either, since it stops after `register_service` and funds no lease. Use
+`stellar events` against the window it does serve to prove the contract is still
+publishing events. See
 [Resuming where you left off](integration.md#resuming-where-you-left-off).
 
 ### Deployment economics (Testnet)

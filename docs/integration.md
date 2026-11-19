@@ -257,6 +257,34 @@ Every id you can filter on is in the table above; event names, topics and payloa
 fields are part of the ABI and are listed in the
 [contract reference](contract-reference.md#events).
 
+### Event schema version
+
+Every payload includes a `schema_version` key (`u32`), and the contract also
+publishes it as on-chain metadata under `eventSchemaVersion`. The number
+describes the **event schema**, not the release: `version` moves on every deploy,
+`schema_version` only when an event gains or loses a field. Fields are added and
+never removed, renamed or retyped, and topics never change, so an old decoder
+keeps working on new events.
+
+Branch on the payload key, not on the contract's `version`:
+
+| Payload says | What to do |
+| --- | --- |
+| no `schema_version` key | Revision 0: an event from before versioning was introduced. Its fields are today's fields minus `schema_version`, so decode it with the current parser and ignore the missing key. |
+| `0 < schema_version <= 1` | Decode the keys you know and ignore any extra key. A payload newer than your build within the same major revision stays readable by design. |
+| `schema_version > 1` | Your decoder is behind the deployment. Store the event verbatim, surface it as unhandled, and alert — do not guess at the shape of an escrow record. |
+
+```python
+version = payload.get("schema_version", 0)   # absent means pre-versioning
+if version > SUPPORTED_SCHEMA_VERSION:
+    quarantine(event)                        # never silently drop escrow
+```
+
+Prefer the payload key over the `eventSchemaVersion` metadata when decoding
+history: metadata describes the Wasm running *now*, while an event from an old
+ledger was emitted by the schema that was running *then*. Read the metadata once
+at startup to learn the current version, and index from there.
+
 ### Resuming where you left off
 
 `stellar events` takes `--start-ledger` or `--cursor`, and a JSON-RPC subscriber
@@ -265,9 +293,9 @@ a restart, so key every projection row by `lease_id` or `service_id` and make
 the writes idempotent.
 
 Retention is the endpoint's, not yours, and it is a rolling window, so a resume
-from too far back is refused rather than answered with an empty list. The
-deploy ledger recorded in [Deployments](deployments.md) is `5382788`; asking the
-public Testnet endpoint for it today returns:
+from too far back is refused rather than answered with an empty list. The deploy
+ledger recorded in [Deployments](deployments.md) is `5382788`; asking the public
+Testnet endpoint for it today returns:
 
 ```text
 startLedger must be within the ledger range: 5698139 - 5819098
@@ -289,8 +317,27 @@ Three consequences:
   `oldestLedger`, and mark the range you cannot replay instead of treating it as
   empty.
 - **Anything older than the window needs the explorer.** The recorded history in
-  [Deployments](deployments.md) is provable by transaction link and by live
-  reads, not by `stellar events`.
+  [Deployments](deployments.md) is provable by transaction link, not by
+  `stellar events` — and not by a read, either, once the entry's lifetime has
+  run out; see [Storage lifetime](#storage-lifetime).
+
+## Storage lifetime
+
+Lease and service entries are persistent entries with a bounded lifetime, and
+reading one no longer extends it. If you keep a long-lived projection of leases,
+you may want to keep the on-chain record alive alongside it:
+
+```bash
+stellar contract invoke --id $REGISTRY --source-account indexer --network testnet \
+  -- bump_lease --lease_id 1
+```
+
+`bump_lease` and `bump_service` are permissionless; whoever calls them pays the
+rent for the extension. A bump can only lengthen a lifetime, never shorten it, and
+`bump_lease` rejects a settled lease, so there is nothing to grief with an entry
+whose funds have already moved. Settlement itself and `create_lease` keep the
+entries they touch alive on their own; you only need an explicit bump for state
+that is being read and not written for the length of its horizon.
 
 ## Settling
 
