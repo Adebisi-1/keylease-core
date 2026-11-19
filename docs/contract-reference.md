@@ -95,12 +95,19 @@ Publish a new leasable service.
 - **Trigger:** when a provider lists an API or RPC endpoint.
 - **Parameters:**
   - `rate_per_call` — price per metered call in token stroops; must be `> 0`.
-  - `endpoint_hash` — 32-byte commitment to the off-chain descriptor.
+  - `endpoint_hash` — 32-byte commitment to the off-chain descriptor. It must
+    be the digest of the descriptor's actual content (for example its SHA-256),
+    **not** a placeholder: an all-zero value commits to nothing and is rejected.
 - **Returns:** the new `service_id` (monotonic, starts at `1`).
 - **State:** writes `Service(service_id)`, increments `ServiceCount`, extends
   instance TTL.
 - **Events:** `service_registered { service_id, provider, rate_per_call, endpoint_hash }`.
-- **Errors:** `InvalidRate`, `Overflow`.
+- **Errors:** `InvalidRate`, `InvalidEndpointHash`, `Overflow`.
+
+`endpoint_hash` is the service's only on-chain commitment to the descriptor, so
+consumers compare it against the descriptor they fetched out of band before
+leasing. A registry entry whose hash is all zeros would match every descriptor
+and every unset field equally, which is why it can never be registered.
 
 ### `set_service_active`
 
@@ -313,6 +320,7 @@ never reused.
 | 14 | `TokenNotSet` | escrow token not configured |
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
+| 17 | `InvalidEndpointHash` | `endpoint_hash` was all zeros (a placeholder, not a commitment) |
 
 ## Invoking with the Stellar CLI
 

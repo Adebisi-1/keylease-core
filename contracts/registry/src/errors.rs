@@ -40,4 +40,7 @@ pub enum Error {
     /// Lease duration exceeds `MAX_LEASE_DURATION_SECS`, so its storage entry
     /// could not be kept alive for the whole term.
     DurationTooLong = 16,
+    /// `register_service` received an all-zero `endpoint_hash`, which commits to
+    /// nothing and would leave the service without a real descriptor commitment.
+    InvalidEndpointHash = 17,
 }
