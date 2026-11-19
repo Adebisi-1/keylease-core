@@ -353,7 +353,7 @@ performed one could not be used to price a read.
 > `remaining_calls` returns `0` as soon as the lease expires, even if calls were
 > never consumed. A caller that wants the raw allotment should read
 > `get_lease().allocated_calls`.
-
+>
 > `quote_lease` repeats `create_lease`'s validation in the same order, so the
 > error it returns is the error `create_lease` would return for the same
 > arguments — the `test_quote_lease_reports_the_same_errors_as_create_lease` test
@@ -361,7 +361,7 @@ performed one could not be used to price a read.
 > things are still not guaranteed: `expires_at` is derived from the current
 > ledger time, so it drifts by one ledger per close, and the registry never reads
 > the consumer's balance, so a quote you can read is not a quote you can afford.
-
+>
 > `services_for_provider` walks a per-provider index of service ids, oldest
 > first. `limit` must be in `1..=MAX_PAGE_SIZE` (`100`); each entry consumed
 > costs a ledger read, which is why an unbounded page is an error rather than a
