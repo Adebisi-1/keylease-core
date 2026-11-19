@@ -11,7 +11,7 @@ contract and its ABI are identical.
 | Testnet | `Test SDF Network ; September 2015` | `https://soroban-testnet.stellar.org` | SDF-hosted; resets 2–4× per year |
 | Futurenet | `Test SDF Future Network ; October 2022` | `https://rpc-futurenet.stellar.org` | SDF-hosted; previews protocol changes |
 | Mainnet | `Public Global Stellar Network ; September 2015` | third-party only, e.g. `https://mainnet.sorobanrpc.com` | **SDF does not host a mainnet RPC** |
-| Local standalone | `Standalone Network ; February 2017` | your local RPC | `stellar network container start` / `stellar scaffold` |
+| Local standalone | `Standalone Network ; February 2017` | `http://localhost:8000/rpc` | `stellar container start local` — see the [local sandbox walkthrough](developer-guide.md#local-sandbox-walkthrough) |
 
 The CLI resolves these names from its config:
 
@@ -54,8 +54,11 @@ stellar keys generate consumer --network testnet --fund
 curl "https://friendbot.stellar.org?addr=$(stellar keys address consumer)"
 ```
 
-The CLI's `--fund` flag and the HTTP endpoint above are Testnet-only; Mainnet
-requires real XLM for fees and for the escrowed asset.
+The CLI's `--fund` flag and the HTTP endpoint above are for networks with a
+friendbot: Testnet, and the local container's own friendbot at
+`http://localhost:8000/friendbot` (`stellar keys generate x --network local --fund`
+hits it). Mainnet has neither and requires real XLM for fees and for the escrowed
+asset. See [Developer guide → Local sandbox walkthrough](developer-guide.md#local-sandbox-walkthrough).
 
 ## Testnet resets
 
