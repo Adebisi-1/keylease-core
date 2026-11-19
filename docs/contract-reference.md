@@ -51,10 +51,16 @@ Point the registry at the SEP-41 token used for every deposit and payout.
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
 - **Trigger:** once at setup; again only to migrate the escrow asset.
 - **State:** sets `Token`; extends instance TTL.
-- **Events:** `escrow_token_set { admin, token }`.
+- **Events:** `escrow_token_set { admin, token }` — only when the token actually
+  changes.
 - **Errors:** `NotInitialized`, `Unauthorized`.
 - **Notes:** the native Stellar Asset Contract (SAC) is the usual value. Changing
   the token while leases are unsettled is a migration hazard — settle first.
+- **Idempotent:** calling `set_token` with the token that is already configured
+  returns `Ok(())` and does nothing — no storage write, no TTL extension and no
+  event — so a repeated call cannot be mistaken for a migration. Auth and the
+  stored-admin check still run first, so an unauthorized caller receives
+  `Unauthorized` either way.
 
 ### `upgrade`
 

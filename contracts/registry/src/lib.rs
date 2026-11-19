@@ -123,9 +123,23 @@ impl KeyLeaseRegistry {
     /// Kept as a separate, admin-gated entry point so that deployments can point
     /// the registry at the native Stellar asset contract (SAC) or a custom SEP-41
     /// token without redeploying the registry logic.
+    ///
+    /// Repeating the call with the token that is already configured is a **no-op**:
+    /// nothing is written, the instance TTL is not extended and no
+    /// `escrow_token_set` event is published, so an idempotent retry can never be
+    /// mistaken for a token migration. The no-op is decided *after*
+    /// `require_auth()` and the stored-admin check, so it cannot be used to probe
+    /// or bypass either of them.
     pub fn set_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         admin.require_auth();
         require_admin(&env, &admin)?;
+
+        // Guard the early return with the authorization above: an unauthorized
+        // caller must still get `Unauthorized`, never a silent `Ok(())`.
+        if storage::get_token(&env) == Some(token.clone()) {
+            return Ok(());
+        }
+
         storage::set_token(&env, &token);
         storage::extend_instance_ttl(&env);
         EscrowTokenSet {
