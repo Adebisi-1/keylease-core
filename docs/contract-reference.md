@@ -54,10 +54,16 @@ Point the registry at the SEP-41 token used for every deposit and payout.
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
 - **Trigger:** once at setup; again only to migrate the escrow asset.
 - **State:** sets `Token`; extends instance TTL.
-- **Events:** `escrow_token_set { admin, token }`.
+- **Events:** `escrow_token_set { admin, token }` — only when the token actually
+  changes.
 - **Errors:** `NotInitialized`, `Unauthorized`.
 - **Notes:** the native Stellar Asset Contract (SAC) is the usual value. Changing
   the token while leases are unsettled is a migration hazard — settle first.
+- **Idempotent:** calling `set_token` with the token that is already configured
+  returns `Ok(())` and does nothing — no storage write, no TTL extension and no
+  event — so a repeated call cannot be mistaken for a migration. Auth and the
+  stored-admin check still run first, so an unauthorized caller receives
+  `Unauthorized` either way.
 
 ### `upgrade`
 
@@ -266,6 +272,81 @@ Reclaim the **full** deposit when the provider never settled.
   `remaining_calls` and `locked_balance` read `0`, and the service's
   `service_stats` are untouched, so a client can tell "provider earned nothing"
   from "provider was paid" without replaying events.
+
+---
+
+## `LeaseStatus` and the `settled` flag
+
+`LeaseStatus::of` (`contracts/registry/src/types.rs`) reads two fields off the
+lease plus one marker off storage:
+
+```rust
+if lease.settled {
+    if revoked { LeaseStatus::Revoked } else { LeaseStatus::Settled }
+} else if now >= lease.expires_at { LeaseStatus::Expired }
+else { LeaseStatus::Active }
+```
+
+`revoked` is `LeaseRevoked(lease_id)`, a marker `revoke_expired_lease` writes
+before the refund. It exists because `settled` is the **escrow-release flag**,
+not the reason the funds left: `settle_lease` sets it after a provider payout
+and `revoke_expired_lease` sets it after a full refund. Recording the reason in
+a separate key instead of a new `Lease` field keeps the stored struct byte-for-byte
+compatible with leases already on Testnet — see
+[Upgrade safety](deployment.md#upgrading-safety-checklist) — and the marker is
+extended for the same horizon as the lease, so it cannot age out while the
+status is still readable.
+
+`LeaseAlreadySettled` (`7`) still means "already settled **or** revoked": both
+close the escrow, so neither path may run twice. It is the state that is shared,
+not the reason.
+
+### Telling the two paths apart
+
+`lease_status` answers it on its own: `Settled` (`2`) means the provider was
+paid for `used_calls`, `Revoked` (`3`) means the consumer reclaimed the whole
+deposit and the provider earned nothing.
+
+| Status | `used_calls` | Provider earned | In `service_stats` |
+| --- | --- | --- | --- |
+| `Settled` | whatever `settle_lease` reported | yes, `payout` | yes |
+| `Revoked` | always `0` | no | no |
+
+The one case `lease_status` deliberately does not separate is a settle reported
+with `verified_calls = 0`: it reads `Settled` with `used_calls == 0`, so it pays
+nothing and looks like a revoke in the lease fields. The status keeps them
+apart — `Revoked` versus `Settled` — and the payout in `lease_settled` confirms
+it, so an indexer still has both signals for provider-reliability reporting:
+see [Topics, payloads and filters](integration.md#topics-payloads-and-filters).
+
+### Status by lifecycle event
+
+Worked terms: `rate_per_call = 1_000_000`, `allocated_calls = 500`,
+`duration_secs = 3600`, so `locked_deposit = 500_000_000`.
+
+| Lifecycle point | `settled` | `used_calls` | `lease_status` | `remaining_calls` | `locked_balance` |
+| --- | --- | --- | --- | --- | --- |
+| `create_lease` | `false` | `0` | `Active` | `500` | `500_000_000` |
+| 120 calls served, not yet expired | `false` | `0` | `Active` | `500` | `500_000_000` |
+| `settle_lease(320)` before expiry | *rejected* — `LeaseNotSettleable` | `0` | `Active` | `500` | `500_000_000` |
+| expiry reached, nobody acted | `false` | `0` | `Expired` | `0` | `500_000_000` |
+| `settle_lease(320)` inside the 24h grace | `true` | `320` | `Settled` | `0` | `0` |
+| `settle_lease(500)` (all calls used) | `true` | `500` | `Settled` | `0` | `0` |
+| `settle_lease(0)` inside the 24h grace | `true` | `0` | `Settled` | `0` | `0` |
+| `revoke_expired_lease` after the grace | `true` | `0` | `Revoked` | `0` | `0` |
+
+Three things to read off that table:
+
+- `used_calls` and `remaining_calls` describe the **settled** allotment, not live
+  usage. Providers report call counts at settlement, so mid-term rows keep
+  `used_calls = 0`; per-request enforcement is the provider's own counter,
+  bounded on chain by `allocated_calls` (see
+  [the verification pipeline](integration.md#the-verification-pipeline)).
+- `lease_status` separates the last row from the three above it: a reclaimed
+  lease is `Revoked`, a settled one is `Settled`, whatever was reported.
+- The three `Settled` rows still need `used_calls` to tell a fully-consumed
+  lease from a partial payout from a zero payout. The status code is not the
+  place that distinction lives.
 
 ---
 

@@ -121,9 +121,85 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 | `service_registered` / `service_status_changed` | Keep a service catalogue in sync. |
 | `contract_upgraded` | Detect a new Wasm version (`version()` also changes). |
 
-Every event carries the ids as topics, so a subscriber can filter by `lease_id`
-or `service_id` without decoding the payload. Event names and fields are part of
-the ABI; see the [contract reference](contract-reference.md#events).
+An event's **first topic is always the event name** as a symbol; the fields
+marked `#[topic]` in `contracts/registry/src/events.rs` follow it, and every
+remaining field is carried in the payload map. Topics are what a subscriber
+filters on, so which side of that line a field falls on decides whether you can
+act on it without decoding.
+
+### Topics, payloads and filters
+
+The `--topic` filter takes base64-encoded `ScVal` segments, one per topic
+position, and matches only events with **exactly** that many topics unless the
+last segment is the `**` wildcard. A `*` segment matches any single topic.
+
+| Event | Topics (in order) | Payload-only fields | Filter |
+| --- | --- | --- | --- |
+| `lease_created` | name, `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` | `--topic "AAAADwAAAA1sZWFzZV9jcmVhdGVkAAAA,*"` |
+| `lease_settled` | name, `lease_id` | `provider`, `verified_calls`, `payout`, `refund` | `--topic "AAAADwAAAA1sZWFzZV9zZXR0bGVkAAAA,*"` |
+| `lease_revoked` | name, `lease_id` | `consumer`, `refund` | `--topic "AAAADwAAAA1sZWFzZV9yZXZva2VkAAAA,*"` |
+| `service_registered` | name, `service_id` | `provider`, `rate_per_call`, `endpoint_hash` | `--topic "AAAADwAAABJzZXJ2aWNlX3JlZ2lzdGVyZWQAAA==,*"` |
+| `service_status_changed` | name, `service_id` | `provider`, `is_active` | `--topic "AAAADwAAABZzZXJ2aWNlX3N0YXR1c19jaGFuZ2VkAAA=,*"` |
+| `contract_upgraded` | name only | `admin`, `new_wasm_hash` | `--topic "AAAADwAAABFjb250cmFjdF91cGdyYWRlZAAAAA=="` |
+| `registry_initialized` | name only | `admin` | `--topic "AAAADwAAABRyZWdpc3RyeV9pbml0aWFsaXplZA=="` |
+| `escrow_token_set` | name only | `admin`, `token` | `--topic "AAAADwAAABBlc2Nyb3dfdG9rZW5fc2V0"` |
+
+Note that only five of the eight events carry an id topic at all:
+`contract_upgraded`, `registry_initialized` and `escrow_token_set` have **no**
+id topics, so they can only be narrowed by contract id, and a lease's
+`service_id` is payload-only — a per-service queue must decode the payload
+rather than filter. Regenerate any of these strings yourself when you need a
+different id, e.g. for lease 1:
+
+```bash
+printf '{"symbol":"lease_created"}' | stellar xdr encode --type ScVal
+# AAAADwAAAA1sZWFzZV9jcmVhdGVkAAAA
+printf '{"u64":"1"}' | stellar xdr encode --type ScVal
+# AAAABQAAAAAAAAAB
+stellar events --id $REGISTRY --network testnet --start-ledger <ledger> \
+  --topic "AAAADwAAAA1sZWFzZV9jcmVhdGVkAAAA,AAAABQAAAAAAAAAB"
+```
+
+`--output json` and `--output pretty` decode names and fields for you, which is
+usually enough for a one-off check; the encoded filters matter when a subscriber
+needs the server to narrow the stream.
+
+### Recipes
+
+- **`lease_created`** — open (or upsert) a lease record keyed by `lease_id`,
+  storing `service_id`, `consumer`, `allocated_calls`, `expires_at` and
+  `locked_deposit` from the payload, and push it onto the settlement queue
+  ordered by `expires_at`. This is the only event that tells you escrow exists,
+  so anything you do not record here must be re-read with `get_lease`.
+- **`lease_settled`** — close the lease in your ledger and reconcile: assert
+  `payout + refund == locked_deposit` from the create event, and credit the
+  provider `payout`. A `payout` of `0` means the provider refunded a lease it
+  could not serve, which is worth alerting on.
+- **`lease_revoked`** — mark the lease closed with **no** revenue and record it
+  against the provider's reliability. `refund` here is always the full
+  `locked_deposit`. This event is also the only way to tell a revocation apart
+  from a zero-call settlement, because both leave `settled = true`: see
+  [LeaseStatus and the `settled` flag](contract-reference.md#leasestatus-and-the-settled-flag).
+- **`service_status_changed`** — update the catalogue entry for `service_id`.
+  `is_active = false` blocks *new* `create_lease` calls only, so stop quoting the
+  service to new consumers while still serving and settling leases you already
+  hold.
+- **`contract_upgraded`** — the running logic changed. Take `new_wasm_hash` from
+  the payload, confirm `version()` reports the release you expected, and re-run
+  the post-upgrade checks in
+  [Upgrading](deployment.md#upgrading-safety-checklist) before trusting new
+  leases. Reconcile any in-flight lease counters your indexer holds, because the
+  payload carries no ids to scope this to.
+- **`service_registered`** — add the service to the catalogue with its
+  `rate_per_call` and `endpoint_hash`; the hash is the commitment your enforcement
+  layer compares the real endpoint against.
+- **`registry_initialized` / `escrow_token_set`** — deployment-lifecycle events.
+  Treat `escrow_token_set` as a hard stop: the escrow asset changed, so the unit
+  of every `payout` and `refund` you have been accumulating changed with it.
+
+Every id you can filter on is in the table above; event names, topics and payload
+fields are part of the ABI and are listed in the
+[contract reference](contract-reference.md#events).
 
 ## Settling
 

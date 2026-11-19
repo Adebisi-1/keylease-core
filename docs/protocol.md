@@ -79,6 +79,39 @@ closed states share the same stored `settled` flag — `Lease` layout is frozen 
 and are told apart by the `LeaseRevoked(lease_id)` marker the registry writes
 when a consumer reclaims.
 
+### Two ways to close a lease, one stored flag
+
+`settled` records that escrow has left the contract — it does not record *why*.
+Both terminal transitions set it: `settle_lease` after paying the provider, and
+`revoke_expired_lease` after refunding the consumer in full.
+`Error::LeaseAlreadySettled` (7) keeps that combined meaning: either way the
+escrow is gone, so neither path may run twice.
+
+Why it *left* is recorded separately, in the `LeaseRevoked(lease_id)` marker
+that `revoke_expired_lease` writes before the refund. It is a second key rather
+than a `Lease` field because the stored struct is part of the decoding ABI: a
+new field would stop live leases from decoding. `lease_status` reads the flag,
+the marker and the clock, and so answers "did the provider earn?" directly:
+
+| Lifecycle event | `settled` | `used_calls` | `lease_status` |
+| --- | --- | --- | --- |
+| `create_lease` | `false` | `0` | `Active` |
+| `settle_lease(320)` of 500, after expiry | `true` | `320` | `Settled` |
+| `settle_lease(0)` of 500, after expiry | `true` | `0` | `Settled` |
+| `revoke_expired_lease` after the grace window | `true` | `0` | `Revoked` |
+
+One row still needs the event to be read fully: `settle_lease(0)` — the
+provider's legitimate way of refunding a lease it could not serve — is
+`Settled` with `used_calls == 0`, so the status says "no revenue" without
+naming it as a refund. `lease_settled` carries `payout = 0` and `refund` for
+that lease, and it is the record an accountant should trust anyway.
+
+The full state-by-event table, including `remaining_calls` and
+`locked_balance`, is in
+[`LeaseStatus` and the `settled` flag](contract-reference.md#leasestatus-and-the-settled-flag),
+and how to consume the two events is in
+[Following the event stream](integration.md#following-the-event-stream).
+
 ### When can a lease be settled?
 
 `settle_lease` reverts with `LeaseNotSettleable` unless **either**:
