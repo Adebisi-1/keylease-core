@@ -220,11 +220,18 @@ refundable in exactly the same proportions. The deposit is only bounded above, b
 example above — so an ordinary lease never meets the cap.
 
 **Duration changes the rent line.** `save_lease` extends the lease entry for its
-term, the 24-hour settlement grace window and a one-day read buffer, which is the
-`lease_ttl_extend` column: `(duration + 86_400) / 5 + 17_280` ledgers. The first
-two rows land under the Testnet minimum persistent TTL, so an hour and a day cost
-the same here — buying a longer window only starts to cost more once it exceeds
-the floor.
+remaining term, the 24-hour settlement grace window and a one-day read buffer,
+which is the `lease_ttl_extend` column. At creation the remaining term is the whole
+duration, so the ask is `(duration + 86_400) / 5 + 17_280` ledgers, clamped to
+`min(MAX_ENTRY_TTL_LEDGERS, network maxEntryTtl)`. The clamp never binds a legal
+lease: the longest one asks for 552,960 ledgers against a 1,555,200-ledger ceiling.
+The first two rows land under the Testnet minimum persistent TTL, so an hour and a
+day cost the same here — buying a longer window only starts to cost more once it
+exceeds the floor.
+
+Bumping a lease *later* is a smaller ask, because the same formula is applied to the
+time still remaining rather than to the original term; see
+[`bump_lease`](contract-reference.md#bump_lease).
 
 **Counting transactions.** A normal lifecycle is two of them: `create_lease` and
 `settle_lease`. The refund path is also two: `create_lease` and
@@ -300,14 +307,16 @@ derived from stored `expires_at` alone.
 ### The provider index
 
 `ProviderServices(provider)` holds that provider's `service_id`s, oldest first.
-Its lifetime rules are asymmetric on purpose:
+Its lifetime rules are the service rules, not a new third policy:
 
-- **Written with the record.** `save_service` appends to the index in the same
-  step it stores the `Service`, using the same `LEDGER_BUMP_THRESHOLD` /
-  `LEDGER_BUMP_EXTEND` pair, so an entry and the index row that points at it
-  cannot drift apart in rent terms.
-- **Bumped by whoever lists it.** `services_for_provider` extends the index
-  entry — the provider is the party that keeps its own catalogue alive.
+- **Written with the record.** `save_service` appends to the index and extends it
+  in the same step it stores the `Service`, with the same clamped horizon, so an
+  entry and the index row that points at it cannot drift apart in rent terms.
+- **Refreshed by any write to the catalogue, not by reading it.** `save_service`
+  also runs on `set_service_active`, whose id is already in the index, so pausing
+  or resuming one service keeps the whole catalogue alive. Nothing on the read path
+  extends anything, this entry included — see the module doc in
+  `contracts/registry/src/storage.rs` for the rent measurement behind that rule.
 - **Never bumped for the listed services.** Paging reads each `Service` record to
   re-check ownership but does not extend it: a page is a discovery read over
   entries somebody else owns, so their rent stays with their owner. A caller
@@ -320,9 +329,13 @@ Its lifetime rules are asymmetric on purpose:
   read to skip, and a provider that re-registers does not duplicate it.
 
 If the index entry expires while its services live on, the provider's pages go
-empty until the next `register_service` recreates the row from that point. That
-is a discovery-availability failure, not a loss of funds or of ownership, which
-is why the index is safe to treat as cache.
+empty until the next write to any of its services recreates the row. That is a
+discovery-availability failure, not a loss of funds or of ownership, which is why
+the index is safe to treat as cache. `bump_service` does not refresh it: that call
+takes a `service_id` and extends one record without loading it, and finding the
+index key means reading the record — the cost it exists to avoid. A provider that
+needs a durable index across months of inactivity is the case an explicit index
+bump would serve, and it is not implemented here.
 
 ## Read next
 

@@ -13,7 +13,9 @@ use crate::events::{
     EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
     ServiceStatusChanged, EVENT_SCHEMA_VERSION,
 };
-use crate::storage::{self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
+use crate::storage::{
+    self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS,
+};
 use crate::types::Service;
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
@@ -816,19 +818,44 @@ fn test_provider_index_entry_shares_the_service_rent_policy() {
     );
     assert_eq!(at_write, LEDGER_BUMP_EXTEND);
 
-    // Walk past the bump threshold without touching the registry: the entry has
-    // to be revived by the next read rather than left to expire.
+    // Walk past the bump threshold without touching the registry: nothing on the
+    // read-only path is allowed to revive the entry, so it has to arrive decayed.
     let now = env.ledger().sequence();
     env.ledger()
         .set_sequence_number(now + LEDGERS_PAST_BUMP_THRESHOLD);
     let decayed = persistent_ttl(&env, &ctx.registry_id(), &index_key);
     assert!(decayed < LEDGER_BUMP_THRESHOLD);
 
+    // Listing is the read-only surface the module doc bills at zero rent, and that
+    // includes the reader's own index entry: a page must not pay for anything.
     ctx.registry
         .services_for_provider(&ctx.provider, &0, &MAX_PAGE_SIZE);
     assert_eq!(
         persistent_ttl(&env, &ctx.registry_id(), &index_key),
-        at_write
+        decayed
+    );
+}
+
+#[test]
+fn test_a_catalogue_write_revives_the_provider_index() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let index_key = DataKey::ProviderServices(ctx.provider.clone());
+
+    let now = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(now + LEDGERS_PAST_BUMP_THRESHOLD);
+    assert!(persistent_ttl(&env, &ctx.registry_id(), &index_key) < LEDGER_BUMP_THRESHOLD);
+
+    // Pausing appends no id — the service is already indexed — so this is the call
+    // that fails if the extension lives inside the append guard. Without it, a
+    // provider could only refresh its index by registering something new.
+    ctx.registry
+        .set_service_active(&ctx.provider, &service_id, &false);
+    assert_eq!(
+        persistent_ttl(&env, &ctx.registry_id(), &index_key),
+        LEDGER_BUMP_EXTEND
     );
 }
 

@@ -108,8 +108,10 @@ Publish a new leasable service.
   - `rate_per_call` — price per metered call in token stroops; must be `> 0`.
   - `endpoint_hash` — 32-byte commitment to the off-chain descriptor.
 - **Returns:** the new `service_id` (monotonic, starts at `1`).
-- **State:** writes `Service(service_id)`, increments `ServiceCount`, extends
-  instance TTL.
+- **State:** writes `Service(service_id)` and appends it to
+  `ProviderServices(provider)`, increments `ServiceCount`, extends instance TTL.
+  Both persistent entries are extended to the same clamped horizon, in the same
+  call.
 - **Events:** `service_registered { service_id, provider, rate_per_call, endpoint_hash }`.
 - **Errors:** `InvalidRate`, `Overflow`.
 
@@ -128,7 +130,10 @@ Pause or resume **new** leases for a service.
 
 - **Caller / auth:** `provider`, and it must own the service.
 - **Trigger:** maintenance, incident response, or retirement.
-- **State:** updates `Service(service_id).is_active`.
+- **State:** updates `Service(service_id).is_active`. Because this goes through
+  `save_service`, it also re-extends that provider's `ProviderServices` index
+  without appending to it — the only way to keep a catalogue discoverable without
+  registering anything new.
 - **Events:** `service_status_changed { service_id, provider, is_active }`.
 - **Errors:** `ServiceNotFound`, `Unauthorized`.
 - **Notes:** existing leases stay valid and settleable. Deactivation only blocks
@@ -370,8 +375,9 @@ performed one could not be used to price a read.
 > without being final: an id whose `Service` record now names a different
 > provider is skipped, because `Service.provider` is the authority and the index
 > is derived state. A provider that has never registered gets an empty page with
-> `next == 0` and `done == true`, not an error. The listed `Service` records are
-> read without extending their TTL — see [protocol.md](protocol.md#the-provider-index).
+> `next == 0` and `done == true`, not an error. This is a pure read: it extends no
+> TTL at all, neither the listed `Service` records nor the provider's own index
+> entry — see [protocol.md](protocol.md#the-provider-index).
 
 ## Events
 
