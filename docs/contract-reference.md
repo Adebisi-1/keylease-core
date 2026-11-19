@@ -462,6 +462,33 @@ The deposit is bounded twice, and the two rejections mean different things.
 bound is checked after the multiplication and before the lease id is allocated
 or the token is called, so a rejected lease moves nothing and consumes no id.
 
+### `transfer_lease`
+
+```rust
+pub fn transfer_lease(
+    env: Env,
+    consumer: Address,
+    lease_id: u64,
+    new_consumer: Address,
+) -> Result<(), Error>
+```
+
+Hand a lease to another consumer, moving access and the refund path together.
+
+- **Caller / auth:** the current `consumer` must authorize.
+- **Trigger:** reselling unused access or moving a lease to another account.
+- **Preconditions:** the lease exists, `lease.consumer == consumer`,
+  `!settled`, and `new_consumer != consumer`.
+- **Effects:** sets `lease.consumer = new_consumer`. The provider check, the
+  refund at settlement and the revoke path all read that field, so ownership
+  moves atomically.
+- **Events:** `lease_transferred { lease_id, from, to }`.
+- **Errors:** `LeaseNotFound`, `Unauthorized`, `LeaseNotTransferable`,
+  `InvalidConsumer`.
+- **Notes:** this is a direct assignment; the recipient does not accept or sign.
+  An expired but unsettled lease can be transferred, which moves the refund claim
+  even though access has lapsed. A settled or revoked lease cannot change hands.
+
 ### `settle_lease`
 
 ```rust
@@ -680,6 +707,7 @@ because topics are positional and indexers filter on them.
 | `service_registered` | `service_id` | `schema_version`, `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `schema_version`, `provider`, `is_active` |
 | `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_transferred` | `lease_id` | `schema_version`, `from`, `to` |
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
@@ -891,6 +919,8 @@ never reused.
 | 22 | `NoPendingUpgrade` | `cancel_upgrade`/`execute_upgrade` with no proposal |
 | 23 | `UpgradeDelayNotElapsed` | `execute_upgrade` before `execute_after` |
 | 24 | `InvalidLimit` | page size outside `1..=MAX_PAGE_SIZE` |
+| 25 | `LeaseNotTransferable` | lease already settled or revoked |
+| 26 | `InvalidConsumer` | transfer target is the current consumer |
 
 ## Invoking with the Stellar CLI
 
@@ -924,6 +954,10 @@ stellar contract invoke --id $REGISTRY --source-account consumer --network testn
      --service_id 1 \
      --requested_calls 500 \
      --duration_secs 3600
+
+# transfer a lease to another consumer
+stellar contract invoke --id $REGISTRY --source-account consumer --network testnet \
+  -- transfer_lease --consumer $CONSUMER --lease_id 1 --new_consumer <NEW_ADDRESS>
 
 # settle
 stellar contract invoke --id $REGISTRY --source-account provider --network testnet \

@@ -112,6 +112,28 @@ The second clause is the "consumer got what it paid for" fast path: if every
 allocated call was consumed, the provider should not have to wait for expiry to
 be paid.
 
+### Transferring a lease
+
+The current consumer may hand a lease to another address with
+`transfer_lease(consumer, lease_id, new_consumer)`. The transfer is an assignment
+— the recipient does not accept — and it moves both the access right and the
+refund path, because every path reads the single `Lease.consumer` field.
+
+- Only an unsettled, unrevoked lease can be transferred; a settled lease has no
+  rights left (`LeaseNotTransferable`).
+- Self-transfers are rejected (`InvalidConsumer`).
+- An expired but unsettled lease may be transferred: access has lapsed, but the
+  refund claim still belongs to the consumer and can change hands until the
+  provider settles or the consumer revokes.
+- A transfer emits `lease_transferred { lease_id, from, to }`, which indexers use
+  to keep an ownership projection current.
+- Providers must treat `lease.consumer` as mutable: a stale cache can keep
+  admitting the previous owner, so re-read on an ownership mismatch.
+
+If the consumer challenge window is enabled, a lease that has been proposed for
+settlement is `settled` and therefore cannot be transferred. Ownership freezes
+when the provider proposes a split, just like revocation does.
+
 ### The 24-hour grace window
 
 After expiry there is a 24-hour window (`SETTLE_GRACE_PERIOD_SECS = 86_400`)
@@ -206,6 +228,7 @@ spans a contract upgrade stays decodable (see
 | `service_registered` | `service_id` | `schema_version`, `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `schema_version`, `provider`, `is_active` |
 | `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_transferred` | `lease_id` | `schema_version`, `from`, `to` |
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
@@ -332,9 +355,12 @@ These must hold for every reachable state. They are asserted in tests.
 3. **Bounded claim.** A provider can never receive more than
    `allocated_calls × rate_per_call`, and only for a service it owns.
 4. **Guaranteed exit.** Every lease has a consumer path to a full refund.
-5. **Checked math.** Deposit, payout and timestamp arithmetic abort on overflow
+5. **Single-owner leases.** `Lease.consumer` is the only ownership record, and a
+   transfer rewrites it in one save. Access and the refund path can never belong
+   to different addresses.
+6. **Checked math.** Deposit, payout and timestamp arithmetic abort on overflow
    rather than truncating.
-6. **Claimable storage.** A lease's persistent entry outlives its term plus the
+7. **Claimable storage.** A lease's persistent entry outlives its term plus the
    grace window (`MAX_LEASE_DURATION_SECS = 30 days`).
 
 ## Storage and lifetime

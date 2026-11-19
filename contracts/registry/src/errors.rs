@@ -62,4 +62,8 @@ pub enum Error {
     /// A page size outside `1..=MAX_PAGE_SIZE`, so serving it would read an
     /// unbounded number of ledger entries in one transaction.
     InvalidLimit = 24,
+    /// The lease is already settled or revoked and cannot change hands.
+    LeaseNotTransferable = 25,
+    /// The transfer target is the current consumer.
+    InvalidConsumer = 26,
 }

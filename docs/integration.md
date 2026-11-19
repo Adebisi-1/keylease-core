@@ -43,7 +43,9 @@ A provider should implement these steps, in order, and fail closed at every one:
    actually sells. A provider that runs more than one service and skips the
    second half admits traffic from the wrong pool — and because `settle_lease`
    resolves the price from `lease.service_id`, it is paid that service's rate
-   for this service's work.
+   for this service's work. `consumer` is mutable: the current owner can call
+   `transfer_lease`, so treat a cached lease as stale when the address no longer
+   matches and re-read it before answering 403.
 5. **Enforce the quota.** Use `max(lease.used_calls, local_counter)` against
    `lease.allocated_calls`; reject with `429` when exhausted, and increment the
    counter only for admitted requests.
