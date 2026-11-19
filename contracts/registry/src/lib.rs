@@ -684,6 +684,12 @@ impl KeyLeaseRegistry {
         if locked_deposit <= 0 {
             return Err(Error::InvalidRate);
         }
+        // Same position in create_lease's order, for the same reason: `Overflow`
+        // means the product does not fit `i128`, `DepositTooLarge` means it fits
+        // and is still more than one lease may lock.
+        if locked_deposit > MAX_LEASE_DEPOSIT {
+            return Err(Error::DepositTooLarge);
+        }
 
         // Mirrors create_lease: a registry with no escrow token could never fund
         // the lease this quote predicts.

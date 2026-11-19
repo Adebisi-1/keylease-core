@@ -490,6 +490,40 @@ fn test_quote_lease_rejects_an_overflowing_deposit() {
 }
 
 #[test]
+fn test_quote_lease_rejects_a_deposit_over_the_cap() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    // Two calls at this rate fit `i128` and still clear `MAX_LEASE_DEPOSIT`, so
+    // the rejection must be `DepositTooLarge` and never `Overflow`.
+    let rate = MAX_LEASE_DEPOSIT / 2 + 1;
+    let service_id = ctx
+        .registry
+        .register_service(&ctx.provider, &rate, &endpoint_hash(&env));
+
+    assert_eq!(
+        ctx.registry.try_quote_lease(&service_id, &2, &3_600),
+        Err(Ok(Error::DepositTooLarge))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &2, &3_600),
+        Err(Ok(Error::DepositTooLarge))
+    );
+
+    // The cap is the only money check a view can make: `cap - 1` is quotable
+    // even though this consumer could not fund it, because the registry never
+    // reads the caller's balance.
+    let boundary = ctx.registry.register_service(
+        &ctx.provider,
+        &(MAX_LEASE_DEPOSIT - 1),
+        &endpoint_hash(&env),
+    );
+    let quote = ctx.registry.quote_lease(&boundary, &1, &3_600);
+    assert_eq!(quote.locked_deposit, MAX_LEASE_DEPOSIT - 1);
+}
+
+#[test]
 fn test_quote_lease_rejects_an_overflowing_expiry() {
     let env = Env::default();
     env.ledger().set_timestamp(u64::MAX);
