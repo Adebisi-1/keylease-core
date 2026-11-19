@@ -1,6 +1,9 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events as _, Ledger as _,
+    },
     token, xdr, Address, BytesN, Env, Event, IntoVal, Map, Symbol, TryFromVal, Val, Vec,
 };
 
@@ -10,10 +13,11 @@ use crate::events::{
     EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
     ServiceStatusChanged, EVENT_SCHEMA_VERSION,
 };
-use crate::storage::{self, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
+use crate::storage::{self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
+use crate::types::Service;
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS,
+    MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE,
 };
 
 /// Per-call rate used across the tests.
@@ -22,6 +26,9 @@ const RATE: i128 = 100;
 const FUNDING: i128 = 1_000_000;
 /// The 24h provider settlement grace period, mirrored from the contract.
 const GRACE: u64 = 24 * 60 * 60;
+/// Ledgers to jump so an entry extended to the bump target falls below the bump
+/// threshold while keeping enough life left to stay readable.
+const LEDGERS_PAST_BUMP_THRESHOLD: u32 = LEDGER_BUMP_EXTEND - 5_000;
 
 struct Ctx<'a> {
     registry: KeyLeaseRegistryClient<'a>,
@@ -519,6 +526,315 @@ fn test_quote_lease_requires_configured_token() {
         registry.try_quote_lease(&service_id, &10, &3_600),
         Err(Ok(Error::TokenNotSet))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Provider service index
+// ---------------------------------------------------------------------------
+
+/// Read the TTL of one of the registry's persistent entries.
+fn persistent_ttl(env: &Env, registry: &Address, key: &DataKey) -> u32 {
+    env.as_contract(registry, || env.storage().persistent().get_ttl(key))
+}
+
+/// Rewrite a service's owner through `save_service`, the path a future
+/// `transfer_service` entry point would have to use.
+fn reassign_service(env: &Env, registry: &Address, service_id: u64, to: &Address) {
+    env.as_contract(registry, || {
+        let mut service: Service = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Service(service_id))
+            .unwrap();
+        service.provider = to.clone();
+        crate::storage::save_service(env, &service);
+    });
+}
+
+#[test]
+fn test_services_for_provider_lists_in_registration_order() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let first = register_default_service(&env, &ctx);
+    let second = register_default_service(&env, &ctx);
+    let third = register_default_service(&env, &ctx);
+
+    let page = ctx.registry.services_for_provider(&ctx.provider, &0, &10);
+    assert_eq!(
+        page.service_ids,
+        Vec::from_slice(&env, &[first, second, third])
+    );
+    assert_eq!(page.next, 3);
+    assert!(page.done);
+}
+
+#[test]
+fn test_services_for_provider_pages_without_gaps_or_repeats() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let mut all = [0u64; 5];
+    for id in all.iter_mut() {
+        *id = register_default_service(&env, &ctx);
+    }
+
+    let mut seen = Vec::new(&env);
+    let mut after = 0u32;
+    for _ in 0..5 {
+        let page = ctx
+            .registry
+            .services_for_provider(&ctx.provider, &after, &2);
+        for service_id in page.service_ids.iter() {
+            seen.push_back(service_id);
+        }
+        after = page.next;
+        if page.done {
+            break;
+        }
+    }
+
+    assert_eq!(seen, Vec::from_slice(&env, &all));
+}
+
+#[test]
+fn test_services_for_provider_reports_page_bounds() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    for _ in 0..5 {
+        register_default_service(&env, &ctx);
+    }
+
+    let first = ctx.registry.services_for_provider(&ctx.provider, &0, &2);
+    assert_eq!(first.service_ids.len(), 2);
+    assert_eq!(first.next, 2);
+    assert!(!first.done);
+
+    let middle = ctx
+        .registry
+        .services_for_provider(&ctx.provider, &first.next, &2);
+    assert_eq!(middle.service_ids.len(), 2);
+    assert_eq!(middle.next, 4);
+    assert!(!middle.done);
+
+    let last = ctx
+        .registry
+        .services_for_provider(&ctx.provider, &middle.next, &2);
+    assert_eq!(last.service_ids.len(), 1);
+    assert_eq!(last.next, 5);
+    assert!(last.done);
+}
+
+#[test]
+fn test_services_for_provider_cursors_past_the_end_are_done() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    register_default_service(&env, &ctx);
+
+    // A cursor past the index yields nothing and is terminal, so a client that
+    // re-reads with a stale cursor cannot loop forever.
+    let page = ctx
+        .registry
+        .services_for_provider(&ctx.provider, &1_000, &10);
+    assert!(page.service_ids.is_empty());
+    assert_eq!(page.next, 1);
+    assert!(page.done);
+}
+
+#[test]
+fn test_services_for_provider_of_an_unknown_provider_is_an_empty_page() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    register_default_service(&env, &ctx);
+
+    let stranger = Address::generate(&env);
+    let page = ctx.registry.services_for_provider(&stranger, &0, &10);
+
+    assert!(page.service_ids.is_empty());
+    assert_eq!(page.next, 0);
+    assert!(page.done);
+}
+
+#[test]
+fn test_services_for_provider_never_leaks_another_providers_services() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let other = Address::generate(&env);
+
+    let mine_a = register_default_service(&env, &ctx);
+    let their_id = ctx
+        .registry
+        .register_service(&other, &RATE, &endpoint_hash(&env));
+    let mine_b = register_default_service(&env, &ctx);
+
+    let mine = ctx.registry.services_for_provider(&ctx.provider, &0, &10);
+    assert_eq!(mine.service_ids, Vec::from_slice(&env, &[mine_a, mine_b]));
+
+    let theirs = ctx.registry.services_for_provider(&other, &0, &10);
+    assert_eq!(theirs.service_ids, Vec::from_slice(&env, &[their_id]));
+}
+
+#[test]
+fn test_services_for_provider_bounds_the_page_size() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Zero would be a silent no-op and unbounded would read the whole index in
+    // one transaction; both have to be explicit errors.
+    assert_eq!(
+        ctx.registry
+            .try_services_for_provider(&ctx.provider, &0, &0),
+        Err(Ok(Error::InvalidLimit))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_services_for_provider(&ctx.provider, &0, &(MAX_PAGE_SIZE + 1)),
+        Err(Ok(Error::InvalidLimit))
+    );
+
+    let max = ctx
+        .registry
+        .services_for_provider(&ctx.provider, &0, &MAX_PAGE_SIZE);
+    assert_eq!(max.service_ids, Vec::from_slice(&env, &[service_id]));
+}
+
+#[test]
+fn test_services_for_provider_drops_a_transferred_service_from_the_old_owner() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let new_owner = Address::generate(&env);
+
+    let kept = register_default_service(&env, &ctx);
+    let transferred = register_default_service(&env, &ctx);
+    let last = register_default_service(&env, &ctx);
+
+    reassign_service(&env, &ctx.registry_id(), transferred, &new_owner);
+
+    // The stale id is still in the old owner's index; the read path is what
+    // hides it, and `next` still counts the entry it consumed.
+    let old = ctx.registry.services_for_provider(&ctx.provider, &0, &10);
+    assert_eq!(old.service_ids, Vec::from_slice(&env, &[kept, last]));
+    assert_eq!(old.next, 3);
+    assert!(old.done);
+
+    let new = ctx.registry.services_for_provider(&new_owner, &0, &10);
+    assert_eq!(new.service_ids, Vec::from_slice(&env, &[transferred]));
+    assert_eq!(new.next, 1);
+    assert!(new.done);
+}
+
+#[test]
+fn test_transferred_service_can_be_leased_by_its_new_owner() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let new_owner = Address::generate(&env);
+
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    reassign_service(&env, &ctx.registry_id(), service_id, &new_owner);
+
+    // Ownership lives on the record, so settlement follows the transfer even
+    // though the old owner's index entry is now dead weight.
+    assert_eq!(
+        ctx.registry.try_settle_lease(&ctx.provider, &lease_id, &10),
+        Err(Ok(Error::Unauthorized))
+    );
+    ctx.registry.settle_lease(&new_owner, &lease_id, &10);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+}
+
+#[test]
+fn test_reregistering_a_service_does_not_duplicate_its_index_entry() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Any entry point that re-saves an owned service must stay idempotent.
+    ctx.registry
+        .set_service_active(&ctx.provider, &service_id, &false);
+    ctx.registry
+        .set_service_active(&ctx.provider, &service_id, &true);
+
+    let page = ctx.registry.services_for_provider(&ctx.provider, &0, &10);
+    assert_eq!(page.service_ids, Vec::from_slice(&env, &[service_id]));
+    assert_eq!(page.next, 1);
+}
+
+#[test]
+fn test_provider_index_entry_shares_the_service_rent_policy() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let service_key = DataKey::Service(service_id);
+    let index_key = DataKey::ProviderServices(ctx.provider.clone());
+    let at_write = persistent_ttl(&env, &ctx.registry_id(), &index_key);
+
+    // Same constants as the record it points at, so neither can be evicted
+    // while the other is still readable.
+    assert_eq!(
+        at_write,
+        persistent_ttl(&env, &ctx.registry_id(), &service_key)
+    );
+    assert_eq!(at_write, LEDGER_BUMP_EXTEND);
+
+    // Walk past the bump threshold without touching the registry: the entry has
+    // to be revived by the next read rather than left to expire.
+    let now = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(now + LEDGERS_PAST_BUMP_THRESHOLD);
+    let decayed = persistent_ttl(&env, &ctx.registry_id(), &index_key);
+    assert!(decayed < LEDGER_BUMP_THRESHOLD);
+
+    ctx.registry
+        .services_for_provider(&ctx.provider, &0, &MAX_PAGE_SIZE);
+    assert_eq!(
+        persistent_ttl(&env, &ctx.registry_id(), &index_key),
+        at_write
+    );
+}
+
+#[test]
+fn test_services_for_provider_does_not_pay_the_listed_services_rent() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let service_key = DataKey::Service(service_id);
+    let now = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(now + LEDGERS_PAST_BUMP_THRESHOLD);
+    let before = persistent_ttl(&env, &ctx.registry_id(), &service_key);
+    assert!(before < LEDGER_BUMP_THRESHOLD);
+
+    ctx.registry
+        .services_for_provider(&ctx.provider, &0, &MAX_PAGE_SIZE);
+
+    // Paging is a discovery read over somebody else's entries: the owner pays to
+    // keep them alive, not whoever happens to list them.
+    assert_eq!(
+        persistent_ttl(&env, &ctx.registry_id(), &service_key),
+        before
+    );
+}
+
+#[test]
+fn test_services_for_provider_is_a_view() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    register_default_service(&env, &ctx);
+
+    let counter_before = ctx.registry.service_count();
+    ctx.registry
+        .services_for_provider(&ctx.provider, &0, &MAX_PAGE_SIZE);
+
+    assert_eq!(ctx.registry.service_count(), counter_before);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+    assert!(env.events().all().events().is_empty());
 }
 
 // ---------------------------------------------------------------------------

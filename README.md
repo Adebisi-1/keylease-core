@@ -115,6 +115,7 @@ keylease-core/
 | `bump_service(service_id)` | — | Extend a service entry's TTL to its standard horizon. Permissionless; the caller pays the rent. |
 | `bump_lease(lease_id)` | — | Extend a live lease entry using the lease TTL policy. Permissionless; rejects a settled lease. |
 | `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `version()` | — | Read-only views. Never extend a TTL. |
+| `services_for_provider(provider, after, limit) -> ProviderServicePage` | — | One bounded page of a provider's service ids; page with `next` until `done`. Never extends a TTL. |
 | `lease_status(id)`, `remaining_calls(id)`, `locked_balance(id)` | — | Derived lifecycle queries. Never extend a TTL. |
 | `service_count()`, `lease_count()` | — | Monotonic counters. |
 

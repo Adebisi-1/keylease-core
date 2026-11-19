@@ -343,6 +343,7 @@ performed one could not be used to price a read.
 | `service_count` | `(env) -> u64` | total services ever registered |
 | `lease_count` | `(env) -> u64` | total leases ever created |
 | `get_service` | `(env, service_id: u64) -> Result<Service, Error>` | the `Service`, else `ServiceNotFound` |
+| `services_for_provider` | `(env, provider: Address, after: u32, limit: u32) -> Result<ProviderServicePage, Error>` | one bounded page of the provider's service ids, else `InvalidLimit` |
 | `get_lease` | `(env, lease_id: u64) -> Result<Lease, Error>` | the `Lease`, else `LeaseNotFound` |
 | `quote_lease` | `(env, service_id: u64, requested_calls: u32, duration_secs: u64) -> Result<LeaseQuote, Error>` | the `locked_deposit` and `expires_at` `create_lease` would produce |
 | `lease_status` | `(env, lease_id: u64) -> Result<LeaseStatus, Error>` | derived status at current ledger time |
@@ -360,6 +361,17 @@ performed one could not be used to price a read.
 > things are still not guaranteed: `expires_at` is derived from the current
 > ledger time, so it drifts by one ledger per close, and the registry never reads
 > the consumer's balance, so a quote you can read is not a quote you can afford.
+
+> `services_for_provider` walks a per-provider index of service ids, oldest
+> first. `limit` must be in `1..=MAX_PAGE_SIZE` (`100`); each entry consumed
+> costs a ledger read, which is why an unbounded page is an error rather than a
+> slow call. Page by passing `next` back as `after` until `done` is `true`.
+> `next` counts index entries consumed, not ids returned, so a page can be short
+> without being final: an id whose `Service` record now names a different
+> provider is skipped, because `Service.provider` is the authority and the index
+> is derived state. A provider that has never registered gets an empty page with
+> `next == 0` and `done == true`, not an error. The listed `Service` records are
+> read without extending their TTL — see [protocol.md](protocol.md#the-provider-index).
 
 ## Events
 
@@ -417,18 +429,28 @@ pub struct LeaseQuote {
     pub locked_deposit: i128,
     pub expires_at: u64,
 }
+
+/// Returned by `services_for_provider`.
+pub struct ProviderServicePage {
+    pub service_ids: Vec<u64>,
+    /// Index entries consumed; pass back as `after`.
+    pub next: u32,
+    /// `true` once the index is exhausted.
+    pub done: bool,
+}
 ```
 
 ## Storage layout
 
 ```rust
 pub enum DataKey {
-    Admin,        // instance
-    Token,        // instance
-    ServiceCount, // instance
-    LeaseCount,   // instance
-    Service(u64), // persistent
-    Lease(u64),   // persistent
+    Admin,                     // instance
+    Token,                     // instance
+    ServiceCount,              // instance
+    LeaseCount,                // instance
+    Service(u64),              // persistent
+    Lease(u64),                // persistent
+    ProviderServices(Address), // persistent: service ids, oldest first
 }
 ```
 
@@ -461,6 +483,7 @@ never reused.
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
 | 17 | `DepositTooLarge` | deposit above `MAX_LEASE_DEPOSIT` |
+| 18 | `InvalidLimit` | page size outside `1..=MAX_PAGE_SIZE` |
 
 ## Invoking with the Stellar CLI
 
@@ -471,6 +494,14 @@ stellar contract invoke --id $REGISTRY --source-account provider --network testn
      --provider $PROVIDER \
      --rate_per_call 1000000 \
      --endpoint_hash 0707070707070707070707070707070707070707070707070707070707070707
+
+# list a provider's services, one page at a time (read-only)
+# pass `next` back as --after until the response reports done: true
+stellar contract invoke --id $REGISTRY --source-account consumer --network testnet \
+  -- services_for_provider \
+     --provider $PROVIDER \
+     --after 0 \
+     --limit 100
 
 # quote before you buy (read-only: no auth, no transfer)
 stellar contract invoke --id $REGISTRY --source-account consumer --network testnet \

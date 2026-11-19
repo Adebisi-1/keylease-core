@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
 /// A provider-published API or RPC service that can be leased by consumers.
 ///
@@ -54,6 +54,19 @@ pub struct LeaseQuote {
     pub locked_deposit: i128,
     /// `ledger.timestamp() + duration_secs` at the moment the quote was read.
     pub expires_at: u64,
+}
+
+/// One page of a provider's service list, as returned by
+/// [`crate::KeyLeaseRegistry::services_for_provider`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderServicePage {
+    /// Ids the provider owns right now, oldest first.
+    pub service_ids: Vec<u64>,
+    /// How many index entries this call consumed. Pass it back as `after`.
+    pub next: u32,
+    /// `true` once the provider's index is exhausted; `next == 0` means no index.
+    pub done: bool,
 }
 
 /// Derived lifecycle state of a [`Lease`]. Discriminants are stable on the wire.

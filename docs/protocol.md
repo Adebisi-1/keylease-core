@@ -235,6 +235,7 @@ These must hold for every reachable state. They are asserted in tests.
 | `ServiceCount`, `LeaseCount` | instance | monotonic id counters |
 | `Service(u64)` | persistent | TTL extended on save and by `bump_service` |
 | `Lease(u64)` | persistent | TTL extended on save and by `bump_lease`, never by a read |
+| `ProviderServices(Address)` | persistent | service-id index per provider; extended by `save_service`, never by a read |
 
 `LEDGER_BUMP_THRESHOLD = 17_280` ledgers (~1 day at 5s ledgers) and
 `LEDGER_BUMP_EXTEND = 518_400` ledgers (~30 days). For leases, `save_lease` and
@@ -250,6 +251,33 @@ for `get_lease`, which is why reads do not extend. `MAX_ENTRY_TTL_LEDGERS`
 (1,555,200 ledgers ≈ 90 days) caps any single extension, and the cap is also
 taken against the network's live `maxEntryTtl`, so an entry's horizon is never
 derived from stored `expires_at` alone.
+
+### The provider index
+
+`ProviderServices(provider)` holds that provider's `service_id`s, oldest first.
+Its lifetime rules are asymmetric on purpose:
+
+* **Written with the record.** `save_service` appends to the index in the same
+  step it stores the `Service`, using the same `LEDGER_BUMP_THRESHOLD` /
+  `LEDGER_BUMP_EXTEND` pair, so an entry and the index row that points at it
+  cannot drift apart in rent terms.
+* **Bumped by whoever lists it.** `services_for_provider` extends the index
+  entry — the provider is the party that keeps its own catalogue alive.
+* **Never bumped for the listed services.** Paging reads each `Service` record to
+  re-check ownership but does not extend it: a page is a discovery read over
+  entries somebody else owns, so their rent stays with their owner. A caller
+  cannot keep another provider's records alive, nor evict them.
+* **Append-only, pruned on read.** The index is derived state; `Service.provider`
+  is the authority. If a service is later transferred, its id stays in the old
+  owner's row and the read path drops it, while `save_service` puts it in the new
+  owner's row. An index can therefore only ever make a page shorter — never
+  disclose a service that belongs to someone else. The stale id costs one ledger
+  read to skip, and a provider that re-registers does not duplicate it.
+
+If the index entry expires while its services live on, the provider's pages go
+empty until the next `register_service` recreates the row from that point. That
+is a discovery-availability failure, not a loss of funds or of ownership, which
+is why the index is safe to treat as cache.
 
 ## Read next
 
