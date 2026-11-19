@@ -34,8 +34,8 @@ token. **The credential is the lease, and the lease lives on Stellar.**
 | **`Address` authorization** | every state-changing entry point | Actors are Stellar accounts (`G…`) or contracts (`C…`) authenticated by the host's `require_auth()`. Multi-sig and smart-wallet accounts work with no contract change. |
 | **Soroban contract events** | `contracts/registry/src/events.rs` | Each transition publishes a typed event with the ids in its topics, so indexers and providers can follow escrow from the RPC event stream instead of polling storage. |
 | **Ledger time** | lease expiry and the 24-hour settlement grace window | Timestamps come from `env.ledger().timestamp()`, never from an off-chain clock. |
-| **Persistent-storage TTL** | `contracts/registry/src/storage.rs` | Lease entries are extended for their whole term plus the grace window, so escrow can never be evicted while it is still claimable. |
-| **`contractmeta!`** | `contracts/registry/src/lib.rs` | Name, version, description and repository are embedded in the Wasm and readable on-chain. |
+| **Persistent-storage TTL** | `contracts/registry/src/storage.rs` | Writes extend the lease entry for its whole term plus the grace window, so escrow cannot be evicted while it is still claimable. Reads never extend: `bump_lease` / `bump_service` do that, on purpose and on the caller's meter. |
+| **`contractmeta!`** | `contracts/registry/src/lib.rs` | Name, version, description, repository and `eventSchemaVersion` are embedded in the Wasm and readable on-chain. |
 | **Soroban deployer upgrades** | `upgrade(admin, new_wasm_hash)` | The admin can install a new Wasm through `update_current_contract_wasm`, keeping the contract id, balances and in-flight leases. |
 | **`wasm32v1-none` + `soroban-sdk 26`** | `Cargo.toml`, CI | The workspace builds the exact artifact Stellar runs. |
 | **Soroban test utilities incl. the real SAC** | `contracts/registry/src/test.rs` | The suite escrows against `register_stellar_asset_contract_v2`, not just a mock token. |
@@ -112,9 +112,11 @@ keylease-core/
 | `create_lease_for(delegate, consumer, service_id, requested_calls, duration_secs) -> u64` | `delegate` **and** `consumer` | Same lease, sponsored by a third party: the consumer's balance is debited and the consumer owns the refund. Emits `lease_created` then `lease_delegated`. |
 | `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder, and add the settlement to the service's stats. Emits `lease_settled`. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
-| `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `version()` | — | Read-only views. |
-| `lease_status(id)`, `remaining_calls(id)`, `locked_balance(id)` | — | Derived lifecycle queries. |
-| `service_stats(service_id)` | — | Cumulative settled leases, calls and payout for one service. |
+| `bump_service(service_id)` | — | Extend a service entry's TTL to its standard horizon. Permissionless; the caller pays the rent. |
+| `bump_lease(lease_id)` | — | Extend a live lease entry using the lease TTL policy. Permissionless; rejects a settled lease. |
+| `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `version()` | — | Read-only views. Never extend a TTL. |
+| `lease_status(id)`, `remaining_calls(id)`, `locked_balance(id)` | — | Derived lifecycle queries. Never extend a TTL. |
+| `service_stats(service_id)` | — | Cumulative settled leases, calls and payout for one service. Never extend a TTL. |
 | `service_count()`, `lease_count()` | — | Monotonic counters. |
 
 ### Events
@@ -122,17 +124,23 @@ keylease-core/
 Contract events are part of the protocol's public interface, not a debugging
 extra. Event names are the first topic; ids follow.
 
+Every payload also carries `schema_version`, the version of the event schema
+that emitted it. It lives in the payload map, never in a topic, because topics
+are positional and an indexer filters on them. See
+[`docs/integration.md`](./docs/integration.md#event-schema-version) for how a
+consumer of the stream should branch on it.
+
 | Event | Topics | Data |
 | --- | --- | --- |
-| `registry_initialized` | — | `admin` |
-| `escrow_token_set` | — | `admin`, `token` |
-| `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
-| `service_status_changed` | `service_id` | `provider`, `is_active` |
-| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
-| `lease_delegated` | `lease_id` | `delegate`, `consumer` |
-| `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
-| `lease_revoked` | `lease_id` | `consumer`, `refund` |
-| `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+| `registry_initialized` | — | `schema_version`, `admin` |
+| `escrow_token_set` | — | `schema_version`, `admin`, `token` |
+| `service_registered` | `service_id` | `schema_version`, `provider`, `rate_per_call`, `endpoint_hash` |
+| `service_status_changed` | `service_id` | `schema_version`, `provider`, `is_active` |
+| `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_delegated` | `lease_id` | `schema_version`, `delegate`, `consumer` |
+| `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
+| `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
+| `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
 
 `lease_created` is emitted unchanged whether the consumer or a delegate minted
 the lease; `lease_delegated` is added on top and names who paid the transaction
@@ -268,7 +276,9 @@ invariants:
 5. **TTL-safe leases.** `create_lease` caps `duration_secs` at
    `MAX_LEASE_DURATION_SECS` (30 days) and extends the lease's persistent entry
    for its whole term plus the grace window, so escrow cannot be evicted while
-   it is still claimable.
+   it is still claimable. Every extension is clamped to
+   `MAX_ENTRY_TTL_LEDGERS` (90 days) and to the network's live `maxEntryTtl`, so
+   no entry horizon is derived only from a stored `expires_at`.
 6. **Bounded deposits.** `create_lease` rejects a `rate_per_call ×
    requested_calls` product above `MAX_LEASE_DEPOSIT` with `DepositTooLarge`,
    before allocating a lease id or calling the token. Checked arithmetic cannot
@@ -309,7 +319,7 @@ re-entrant token.
 cargo test --all
 ```
 
-The 62 tests in `contracts/registry/src/test.rs` cover:
+The 81 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
 - the happy path (lock → full-usage settle before expiry),
@@ -324,6 +334,11 @@ The 62 tests in `contracts/registry/src/test.rs` cover:
 - delegated creation: both signatures required, refund owned by the consumer,
 - revoked leases excluded from `service_stats` and read as `Revoked`,
 - every emitted event, including its topics and payload,
+- the `schema_version` on each payload, and that topics stay position-stable,
+- reads that never extend a TTL, including the revocation marker and the
+  settlement counters,
+- the explicit `bump_service` / `bump_lease` maintenance calls and the lease TTL
+  policy behind them,
 - the full lifecycle escrowed with the **native Stellar Asset Contract**,
 - a **re-entrant token** attempting a second settlement,
 - status transitions and derived views.

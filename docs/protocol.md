@@ -148,19 +148,21 @@ consumer's exit bounded at 24 hours.
 
 Every transition publishes a typed Soroban event. Event names are the first
 topic, followed by the id fields marked `#[topic]`; the payload is a map of the
-remaining fields.
+remaining fields. Each payload also carries `schema_version`, so a stream that
+spans a contract upgrade stays decodable (see
+[Integration → Event schema version](integration.md#event-schema-version)).
 
 | Event | Topics | Data |
 | --- | --- | --- |
-| `registry_initialized` | — | `admin` |
-| `escrow_token_set` | — | `admin`, `token` |
-| `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
-| `service_status_changed` | `service_id` | `provider`, `is_active` |
-| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
-| `lease_delegated` | `lease_id` | `delegate`, `consumer` |
-| `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
-| `lease_revoked` | `lease_id` | `consumer`, `refund` |
-| `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+| `registry_initialized` | — | `schema_version`, `admin` |
+| `escrow_token_set` | — | `schema_version`, `admin`, `token` |
+| `service_registered` | `service_id` | `schema_version`, `provider`, `rate_per_call`, `endpoint_hash` |
+| `service_status_changed` | `service_id` | `schema_version`, `provider`, `is_active` |
+| `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_delegated` | `lease_id` | `schema_version`, `delegate`, `consumer` |
+| `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
+| `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
+| `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
 
 `lease_delegated` follows `lease_created` only for a sponsored lease, so
 indexers that ignore it still see every lease.
@@ -258,18 +260,25 @@ These must hold for every reachable state. They are asserted in tests.
 | --- | --- | --- |
 | `Admin`, `Token` | instance | configuration; instance TTL is bumped on every state change |
 | `ServiceCount`, `LeaseCount` | instance | monotonic id counters |
-| `Service(u64)` | persistent | TTL extended on save and on read |
-| `Lease(u64)` | persistent | TTL extended on save and on read to cover term + grace |
-| `ServiceStats(u64)` | persistent | cumulative settlements per service; extended on write and on read, so an untouched aggregate can age out and read as zero |
-| `LeaseRevoked(u64)` | persistent | written with the lease when a consumer reclaims; extended on the lease's own horizon |
+| `Service(u64)` | persistent | TTL extended on save, on `create_lease` and by `bump_service`, never by a read |
+| `Lease(u64)` | persistent | TTL extended on save and by `bump_lease`, never by a read |
+| `ServiceStats(u64)` | persistent | cumulative settlements per service; extended only by `settle_lease`, so an untouched aggregate can age out and read as zero |
+| `LeaseRevoked(u64)` | persistent | written with the lease when a consumer reclaims, given that transaction's lease horizon; `lease_status` reads it without extending |
 
 `LEDGER_BUMP_THRESHOLD = 17_280` ledgers (~1 day at 5s ledgers) and
 `LEDGER_BUMP_EXTEND = 518_400` ledgers (~30 days). For leases, `save_lease` and
-`get_lease` extend to `(expires_at − now + 24h) / 5s + LEDGER_BUMP_THRESHOLD`
+`bump_lease` extend to `(expires_at − now + 24h) / 5s + LEDGER_BUMP_THRESHOLD`
 ledgers, so the escrow stays claimable for the whole lease, the provider's grace
 window and a one-day read buffer — without paying rent for unused storage time.
-The host clamps persistent TTL to its network minimum (120,960 ledgers ≈ 7 days
-on Testnet), so very short leases pay that floor rather than a month.
+Once a lease is past its term and grace window that ask settles at about two
+days, so keeping a dead lease alive costs rent per bump rather than per month.
+
+Rent scales with that ask: at the ledger where an extension is due, `bump_lease`
+estimates 48,684 stroops of persistent rent for a 30-day-term lease against zero
+for `get_lease`, which is why reads do not extend. `MAX_ENTRY_TTL_LEDGERS`
+(1,555,200 ledgers ≈ 90 days) caps any single extension, and the cap is also
+taken against the network's live `maxEntryTtl`, so an entry's horizon is never
+derived from stored `expires_at` alone.
 
 ## Read next
 

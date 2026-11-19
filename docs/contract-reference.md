@@ -12,10 +12,13 @@ as authoritative.
   `MAX_LEASE_DEPOSIT = 1_000_000_000_000` base units (100,000 of a
   seven-decimal token such as XLM),
   `MAX_RATE_PER_CALL = MAX_LEASE_DEPOSIT` base units per call
-- **Storage TTL:** `LEDGER_BUMP_THRESHOLD = 17_280`, `LEDGER_BUMP_EXTEND = 518_400`;
-  leases extend to term + 24h grace + a 1-day buffer
+- **Storage TTL:** `LEDGER_BUMP_THRESHOLD = 17_280`, `LEDGER_BUMP_EXTEND = 518_400`,
+  `MAX_ENTRY_TTL_LEDGERS = 1_555_200` (90 days); leases extend to term + 24h
+  grace + a 1-day buffer, clamped to `MAX_ENTRY_TTL_LEDGERS` and to the network's
+  live `maxEntryTtl`. Only writes and the two `bump_*` entry points extend a TTL;
+  reads never do.
 - **On-chain metadata:** `name = KeyLeaseRegistry`, `version`,
-  `description`, `repository`, embedded with `contractmeta!`
+  `eventSchemaVersion`, `description`, `repository`, embedded with `contractmeta!`
 
 Every state-changing entry point calls `require_auth()` on the actor it
 represents. Errors are returned as `Result<_, Error>`; codes are stable and never
@@ -275,6 +278,46 @@ Reclaim the **full** deposit when the provider never settled.
 
 ---
 
+## Storage maintenance
+
+Reads no longer keep entries alive, so extending a lifetime is an explicit,
+metered call of its own. Both entry points are permissionless: the caller pays
+for the extension with their own transaction fee, and the horizon comes from the
+contract's policy rather than from the caller.
+
+### `bump_service`
+
+```rust
+pub fn bump_service(env: Env, service_id: u64) -> Result<(), Error>
+```
+
+Extend a service entry to `LEDGER_BUMP_EXTEND` ledgers.
+
+- **Caller / auth:** anyone.
+- **Errors:** `ServiceNotFound` — a miss is an error, not a silent no-op, so a
+  caller never pays for an extension that kept nothing alive.
+- **Notes:** `create_lease` extends the service it leases from, so an actively
+  used service does not need this. It exists for a published-but-idle service.
+
+### `bump_lease`
+
+```rust
+pub fn bump_lease(env: Env, lease_id: u64) -> Result<(), Error>
+```
+
+Extend a lease entry using the lease TTL policy (remaining term + 24h grace + a
+1-day buffer, clamped to `MAX_ENTRY_TTL_LEDGERS` and the network's
+`maxEntryTtl`).
+
+- **Caller / auth:** anyone.
+- **Errors:** `LeaseNotFound`, `LeaseAlreadySettled`.
+- **Notes:** the extension can only raise the entry's lifetime, never lower it,
+  and stops once the remaining term is exhausted: a long-expired lease is bumped
+  by about two days at a time, not by its original term. A settled lease is
+  rejected because its funds have already moved.
+
+---
+
 ## `LeaseStatus` and the `settled` flag
 
 `LeaseStatus::of` (`contracts/registry/src/types.rs`) reads two fields off the
@@ -352,7 +395,9 @@ Three things to read off that table:
 
 ## Read-only views
 
-These require no authorization.
+These require no authorization, and none of them extends a TTL. An extension
+bills the caller for rent across the whole extended horizon, so a "view" that
+performed one could not be used to price a read.
 
 | View | Signature | Returns |
 | --- | --- | --- |
@@ -384,17 +429,24 @@ These require no authorization.
 Events are part of the ABI. Each event name is a `Symbol` topic, followed by the
 `#[topic]` fields; the payload is a map keyed by field name.
 
+Every payload carries `schema_version` (`EVENT_SCHEMA_VERSION`, currently `1`) as
+its first map key. Topics are frozen: a version is never added as a topic,
+because topics are positional and indexers filter on them.
+
 | Event | Topics | Payload fields |
 | --- | --- | --- |
-| `registry_initialized` | — | `admin` |
-| `escrow_token_set` | — | `admin`, `token` |
-| `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
-| `service_status_changed` | `service_id` | `provider`, `is_active` |
-| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
-| `lease_delegated` | `lease_id` | `delegate`, `consumer` |
-| `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
-| `lease_revoked` | `lease_id` | `consumer`, `refund` |
-| `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+| `registry_initialized` | — | `schema_version`, `admin` |
+| `escrow_token_set` | — | `schema_version`, `admin`, `token` |
+| `service_registered` | `service_id` | `schema_version`, `provider`, `rate_per_call`, `endpoint_hash` |
+| `service_status_changed` | `service_id` | `schema_version`, `provider`, `is_active` |
+| `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_delegated` | `lease_id` | `schema_version`, `delegate`, `consumer` |
+| `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
+| `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
+| `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
+
+See [integration.md](./integration.md#event-schema-version) for how to branch on
+the version.
 
 `lease_delegated` is emitted **in addition to** `lease_created`, by
 `create_lease_for` only, and adds no secret material: both addresses already
