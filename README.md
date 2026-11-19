@@ -138,7 +138,7 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 
 ### Lifecycle
 
-```
+```text
 Active ──(expires_at reached)──▶ Expired ──(24h grace)──▶ revocable by consumer
    │                                  │
    └──(fully consumed)────────────────┴──(provider settles)──▶ Settled
@@ -231,6 +231,7 @@ protocol, its Stellar dependencies and how to integrate with it:
 | [Provider](./docs/provider-guide.md) / [Consumer](./docs/consumer-guide.md) guides | using the protocol |
 | [Developer guide](./docs/developer-guide.md) | building, testing, upgrading and extending |
 | [Deployment](./docs/deployment.md) | `stellar contract` commands and upgrade procedure |
+| [Troubleshooting](./docs/troubleshooting.md) | every failure by actor, with the command that verifies it |
 
 ---
 
@@ -306,7 +307,7 @@ The 44 tests in `contracts/registry/src/test.rs` cover:
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). 
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## Security
 

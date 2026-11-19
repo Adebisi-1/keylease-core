@@ -72,6 +72,7 @@ nav:
       - Consumer guide: consumer-guide.md
       - Developer guide: developer-guide.md
       - Deployment: deployment.md
+      - Troubleshooting: troubleshooting.md
   - Project:
       - Deployments: deployments.md
       - Release notes: releases/v0.2.1.md
