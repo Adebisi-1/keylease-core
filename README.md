@@ -138,7 +138,7 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 
 ### Lifecycle
 
-```
+```text
 Active ──(expires_at reached)──▶ Expired ──(24h grace)──▶ revocable by consumer
    │                                  │
    └──(fully consumed)────────────────┴──(provider settles)──▶ Settled
@@ -301,7 +301,7 @@ The 40 tests in `contracts/registry/src/test.rs` cover:
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). 
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## Security
 
