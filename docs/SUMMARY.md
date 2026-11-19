@@ -22,6 +22,7 @@
 - [Consumer guide](consumer-guide.md)
 - [Developer guide](developer-guide.md)
 - [Deployment](deployment.md)
+- [Troubleshooting](troubleshooting.md)
 
 ## Project
 
