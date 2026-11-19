@@ -53,12 +53,29 @@ moved through the native Stellar Asset Contract.
 | `settle_lease` (lease 2, 4 verified after expiry) | ledger `5382835` — tx [`7a6a939d…5a01`](https://stellar.expert/explorer/testnet/tx/7a6a939deb07e6993da544d1e24e755194c783d9e8fef29c2beb7d8cd4975a01); `payout = 4000000`, `refund = 6000000` |
 
 Both settlements emitted `lease_settled`; every create emitted `lease_created`.
-Replay the whole history with:
+Those events are not retrievable, though: a public RPC serves a rolling window
+of ledgers, and this deployment predates the window it currently offers. The
+command that looks right on the table above is refused today:
 
 ```bash
 stellar events --id CCEZYHUJUICXVPLH6UC2OFZL2RG23QQ7EMZOWE32WVQPT25DCTIAFH62 \
   --network testnet --start-ledger 5382788
+# error: startLedger must be within the ledger range: 5698139 - 5819098
 ```
+
+The window is stated in every JSON-RPC `getEvents` response as `oldestLedger`
+and `latestLedger`, so read it from the endpoint rather than assuming it: on the
+public Testnet RPC those two came back as `5698126` and `5819085`, a span of
+120,959 ledgers over 604,791 seconds — seven days at five seconds a ledger.
+
+Two things follow for anyone verifying this record. The rows above stay
+checkable through the explorer links and the live read views (`get_lease`,
+`get_service`, `lease_status`), which are not time-bounded. They do not stay
+checkable through the event log, and re-running the deploy script will not
+reproduce them either, since it stops after `register_service` and funds no
+lease. Use `stellar events` against the window it does serve to prove the
+contract is still publishing events. See
+[Resuming where you left off](integration.md#resuming-where-you-left-off).
 
 ### Deployment economics (Testnet)
 
