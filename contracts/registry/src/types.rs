@@ -42,6 +42,20 @@ pub struct Lease {
     pub settled: bool,
 }
 
+/// What [`crate::KeyLeaseRegistry::create_lease`] would lock, computed without
+/// authorization and without moving funds.
+///
+/// The field names match [`Lease`] so a quote can be compared field by field
+/// with the lease it predicted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseQuote {
+    /// Deposit that would be transferred: `rate_per_call * requested_calls`.
+    pub locked_deposit: i128,
+    /// `ledger.timestamp() + duration_secs` at the moment the quote was read.
+    pub expires_at: u64,
+}
+
 /// Derived lifecycle state of a [`Lease`]. Discriminants are stable on the wire.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

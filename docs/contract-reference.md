@@ -344,6 +344,7 @@ performed one could not be used to price a read.
 | `lease_count` | `(env) -> u64` | total leases ever created |
 | `get_service` | `(env, service_id: u64) -> Result<Service, Error>` | the `Service`, else `ServiceNotFound` |
 | `get_lease` | `(env, lease_id: u64) -> Result<Lease, Error>` | the `Lease`, else `LeaseNotFound` |
+| `quote_lease` | `(env, service_id: u64, requested_calls: u32, duration_secs: u64) -> Result<LeaseQuote, Error>` | the `locked_deposit` and `expires_at` `create_lease` would produce |
 | `lease_status` | `(env, lease_id: u64) -> Result<LeaseStatus, Error>` | derived status at current ledger time |
 | `remaining_calls` | `(env, lease_id: u64) -> Result<u32, Error>` | calls left; `0` once settled **or** expired |
 | `locked_balance` | `(env, lease_id: u64) -> Result<i128, Error>` | `locked_deposit`; `0` once settled |
@@ -351,6 +352,14 @@ performed one could not be used to price a read.
 > `remaining_calls` returns `0` as soon as the lease expires, even if calls were
 > never consumed. A caller that wants the raw allotment should read
 > `get_lease().allocated_calls`.
+
+> `quote_lease` repeats `create_lease`'s validation in the same order, so the
+> error it returns is the error `create_lease` would return for the same
+> arguments — the `test_quote_lease_reports_the_same_errors_as_create_lease` test
+> asserts that parity. It needs no authorization and moves no funds, but two
+> things are still not guaranteed: `expires_at` is derived from the current
+> ledger time, so it drifts by one ledger per close, and the registry never reads
+> the consumer's balance, so a quote you can read is not a quote you can afford.
 
 ## Events
 
@@ -402,6 +411,12 @@ pub struct Lease {
 }
 
 pub enum LeaseStatus { Active = 0, Expired = 1, Settled = 2 }
+
+/// Returned by `quote_lease`; the two fields mirror the `Lease` they predict.
+pub struct LeaseQuote {
+    pub locked_deposit: i128,
+    pub expires_at: u64,
+}
 ```
 
 ## Storage layout
@@ -456,6 +471,13 @@ stellar contract invoke --id $REGISTRY --source-account provider --network testn
      --provider $PROVIDER \
      --rate_per_call 1000000 \
      --endpoint_hash 0707070707070707070707070707070707070707070707070707070707070707
+
+# quote before you buy (read-only: no auth, no transfer)
+stellar contract invoke --id $REGISTRY --source-account consumer --network testnet \
+  -- quote_lease \
+     --service_id 1 \
+     --requested_calls 500 \
+     --duration_secs 3600
 
 # create a lease
 stellar contract invoke --id $REGISTRY --source-account consumer --network testnet \

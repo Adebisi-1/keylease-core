@@ -363,6 +363,165 @@ fn test_create_lease_requires_configured_token() {
 }
 
 // ---------------------------------------------------------------------------
+// Quote view
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_quote_lease_predicts_the_lease_it_mints() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let quote = ctx.registry.quote_lease(&service_id, &500, &3_600);
+    assert_eq!(quote.locked_deposit, RATE * 500);
+    assert_eq!(quote.expires_at, 1_000 + 3_600);
+
+    // The quote must not drift from what the lease actually records.
+    let lease = ctx.registry.get_lease(&ctx.registry.create_lease(
+        &ctx.consumer,
+        &service_id,
+        &500,
+        &3_600,
+    ));
+    assert_eq!(quote.locked_deposit, lease.locked_deposit);
+    assert_eq!(quote.expires_at, lease.expires_at);
+}
+
+#[test]
+fn test_quote_lease_changes_nothing() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let consumer_before = ctx.token.balance(&ctx.consumer);
+
+    ctx.registry.quote_lease(&service_id, &500, &3_600);
+
+    assert_eq!(ctx.token.balance(&ctx.consumer), consumer_before);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+    assert_eq!(ctx.registry.lease_count(), 0);
+    // `events().all()` reports the invocation just completed, which is the
+    // quote itself: a view must emit no Soroban event.
+    assert!(env.events().all().events().is_empty());
+}
+
+#[test]
+fn test_quote_lease_rejects_a_paused_service() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    ctx.registry
+        .set_service_active(&ctx.provider, &service_id, &false);
+
+    assert_eq!(
+        ctx.registry.try_quote_lease(&service_id, &10, &3_600),
+        Err(Ok(Error::ServiceInactive))
+    );
+}
+
+#[test]
+fn test_quote_lease_reports_the_same_errors_as_create_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    ctx.registry
+        .set_service_active(&ctx.provider, &service_id, &false);
+
+    // (service, calls, duration, expected) — every rejection that
+    // `create_lease` reaches before it touches a token balance.
+    let cases = [
+        (service_id, 0, 3_600, Error::InvalidCalls),
+        (service_id, 10, 0, Error::InvalidDuration),
+        (
+            service_id,
+            10,
+            MAX_LEASE_DURATION_SECS + 1,
+            Error::DurationTooLong,
+        ),
+        (service_id, 10, 3_600, Error::ServiceInactive),
+        (999, 10, 3_600, Error::ServiceNotFound),
+    ];
+
+    for (id, calls, duration, expected) in cases {
+        assert_eq!(
+            ctx.registry.try_quote_lease(&id, &calls, &duration),
+            Err(Ok(expected)),
+            "quote_lease(service {id}, {calls} calls, {duration}s)"
+        );
+        assert_eq!(
+            ctx.registry
+                .try_create_lease(&ctx.consumer, &id, &calls, &duration),
+            Err(Ok(expected)),
+            "create_lease(service {id}, {calls} calls, {duration}s)"
+        );
+    }
+}
+
+#[test]
+fn test_quote_lease_rejects_an_overflowing_deposit() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    // A rate that overflows i128 for any call count above 1.
+    let service_id = ctx
+        .registry
+        .register_service(&ctx.provider, &i128::MAX, &endpoint_hash(&env));
+
+    assert_eq!(
+        ctx.registry.try_quote_lease(&service_id, &2, &3_600),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &2, &3_600),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+}
+
+#[test]
+fn test_quote_lease_rejects_an_overflowing_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(u64::MAX);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    assert_eq!(
+        ctx.registry.try_quote_lease(&service_id, &10, &1),
+        Err(Ok(Error::Overflow))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &10, &1),
+        Err(Ok(Error::Overflow))
+    );
+}
+
+#[test]
+fn test_quote_lease_requires_configured_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    let registry_id = env.register(KeyLeaseRegistry, ());
+    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
+    registry.init(&admin);
+    // Note: no set_token call, same as test_create_lease_requires_configured_token.
+
+    let service_id = registry.register_service(&provider, &RATE, &endpoint_hash(&env));
+
+    assert_eq!(
+        registry.try_quote_lease(&service_id, &10, &3_600),
+        Err(Ok(Error::TokenNotSet))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Settlement
 // ---------------------------------------------------------------------------
 

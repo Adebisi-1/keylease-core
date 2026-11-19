@@ -68,7 +68,7 @@ pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
     RegistryInitialized, ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
 };
-pub use crate::types::{Lease, LeaseStatus, Service};
+pub use crate::types::{Lease, LeaseQuote, LeaseStatus, Service};
 
 // On-chain contract metadata, readable from the ledger without the source.
 soroban_sdk::contractmeta!(key = "name", val = "KeyLeaseRegistry");
@@ -609,6 +609,64 @@ impl KeyLeaseRegistry {
     /// Use [`Self::bump_lease`] to keep an entry alive.
     pub fn get_lease(env: Env, lease_id: u64) -> Result<Lease, Error> {
         storage::get_lease(&env, lease_id)
+    }
+
+    /// Predict what [`Self::create_lease`] would lock, without auth or a transfer.
+    ///
+    /// Consumers and SDKs used to re-derive the deposit and the expiry off-chain,
+    /// where any change to contract semantics turns into silent drift. This view
+    /// runs the same validation, in the same order, as `create_lease`, so every
+    /// error it returns is the error `create_lease` would return for the same
+    /// arguments — with the single exception of a balance the registry never
+    /// reads: a quote says nothing about whether `consumer` can actually pay.
+    ///
+    /// `expires_at` is derived from the current ledger time, so a quote goes
+    /// stale as soon as the ledger advances.
+    pub fn quote_lease(
+        env: Env,
+        service_id: u64,
+        requested_calls: u32,
+        duration_secs: u64,
+    ) -> Result<LeaseQuote, Error> {
+        if requested_calls == 0 {
+            return Err(Error::InvalidCalls);
+        }
+        if duration_secs == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        if duration_secs > MAX_LEASE_DURATION_SECS {
+            return Err(Error::DurationTooLong);
+        }
+
+        let service = storage::get_service(&env, service_id)?;
+        if !service.is_active {
+            return Err(Error::ServiceInactive);
+        }
+
+        let locked_deposit = service
+            .rate_per_call
+            .checked_mul(requested_calls as i128)
+            .ok_or(Error::Overflow)?;
+        if locked_deposit <= 0 {
+            return Err(Error::InvalidRate);
+        }
+
+        // Mirrors create_lease: a registry with no escrow token could never fund
+        // the lease this quote predicts.
+        if storage::get_token(&env).is_none() {
+            return Err(Error::TokenNotSet);
+        }
+
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration_secs)
+            .ok_or(Error::Overflow)?;
+
+        Ok(LeaseQuote {
+            locked_deposit,
+            expires_at,
+        })
     }
 
     /// Derive the lifecycle status of a lease at the current ledger time.
