@@ -70,6 +70,37 @@ stateDiagram-v2
 
 Discriminants are **stable on the wire**. They will never be renumbered.
 
+### `Settled` is one state, reached two ways
+
+`settled` records that escrow has left the contract — it does not record *why*.
+Both terminal transitions set it: `settle_lease` after paying the provider, and
+`revoke_expired_lease` after refunding the consumer in full. So `Settled` is the
+answer to "is this lease finished?", never to "did the provider earn?", and
+`Error::LeaseAlreadySettled` (7) likewise means "already settled or revoked".
+
+The two paths are separable, but not from the status:
+
+- `used_calls` is written only by `settle_lease`, so `settled && used_calls > 0`
+  is a provider settlement.
+- `settled && used_calls == 0` is ambiguous: a revocation, **or** a settlement
+  reported with `verified_calls = 0`, which is the provider's legitimate way of
+  refunding a lease it could not serve. The two leave identical storage.
+- The published event is the only discriminator — `lease_settled` versus
+  `lease_revoked` for that `lease_id`.
+
+| Lifecycle event | `settled` | `used_calls` | `lease_status` |
+| --- | --- | --- | --- |
+| `create_lease` | `false` | `0` | `Active` |
+| `settle_lease(320)` of 500, after expiry | `true` | `320` | `Settled` |
+| `settle_lease(0)` of 500, after expiry | `true` | `0` | `Settled` |
+| `revoke_expired_lease` after the grace window | `true` | `0` | `Settled` |
+
+The full state-by-event table, including `remaining_calls` and
+`locked_balance`, is in
+[`LeaseStatus` and the `settled` flag](contract-reference.md#leasestatus-and-the-settled-flag),
+and how to consume the two events is in
+[Following the event stream](integration.md#following-the-event-stream).
+
 ### When can a lease be settled?
 
 `settle_lease` reverts with `LeaseNotSettleable` unless **either**:
