@@ -1034,6 +1034,19 @@ fn test_expiry_timestamp_overflow_reverts() {
     assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
 }
 
+#[test]
+fn test_error_codes_are_appended_not_renumbered() {
+    // The `#[contracterror]` numbers are what clients switch on, so the
+    // append-only rule needs a test rather than a comment: everything that
+    // predates this PR keeps its number and `RateTooHigh` is the new tail.
+    assert_eq!(Error::InvalidCalls as u32, 11);
+    assert_eq!(Error::TokenNotSet as u32, 14);
+    assert_eq!(Error::Overflow as u32, 15);
+    assert_eq!(Error::DurationTooLong as u32, 16);
+    assert_eq!(Error::DepositTooLarge as u32, 17);
+    assert_eq!(Error::RateTooHigh as u32, 18);
+}
+
 // ---------------------------------------------------------------------------
 // Status transitions
 // ---------------------------------------------------------------------------

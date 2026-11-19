@@ -319,7 +319,7 @@ re-entrant token.
 cargo test --all
 ```
 
-The 81 tests in `contracts/registry/src/test.rs` cover:
+The 82 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
 - the happy path (lock → full-usage settle before expiry),
@@ -341,7 +341,9 @@ The 81 tests in `contracts/registry/src/test.rs` cover:
   policy behind them,
 - the full lifecycle escrowed with the **native Stellar Asset Contract**,
 - a **re-entrant token** attempting a second settlement,
-- status transitions and derived views.
+- status transitions and derived views,
+- the stored `LeaseStatus` and `Error` discriminants, so nothing existing can be
+  silently renumbered.
 
 ---
 
