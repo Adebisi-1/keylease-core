@@ -114,7 +114,7 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 
 | Event | Use |
 | --- | --- |
-| `lease_created` | Build a work queue of leases to settle; alert on new demand. |
+| `lease_created` | Build a work queue of leases to settle; alert on new demand. Carries `rate_per_call` as a creation-time snapshot, so `locked_deposit` can be interpreted without reading the service at that ledger. |
 | `lease_settled` | Reconcile payouts and refunds; close the lease in your ledger. |
 | `lease_revoked` | A consumer reclaimed an expired lease; the provider earned nothing. |
 | `service_registered` / `service_status_changed` | Keep a service catalogue in sync. |

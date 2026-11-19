@@ -311,6 +311,7 @@ impl KeyLeaseRegistry {
             allocated_calls: requested_calls,
             expires_at,
             locked_deposit: required_deposit,
+            rate_per_call: service.rate_per_call,
         }
         .publish(&env);
 

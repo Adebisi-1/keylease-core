@@ -126,7 +126,7 @@ extra. Event names are the first topic; ids follow.
 | `escrow_token_set` | — | `admin`, `token` |
 | `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `provider`, `is_active` |
-| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit`, `rate_per_call` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
 | `contract_upgraded` | — | `admin`, `new_wasm_hash` |

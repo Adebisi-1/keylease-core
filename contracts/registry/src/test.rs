@@ -735,6 +735,7 @@ fn test_lease_lifecycle_emits_events() {
             allocated_calls: 10,
             expires_at: 4_600,
             locked_deposit: RATE * 10,
+            rate_per_call: RATE,
         },
     );
 

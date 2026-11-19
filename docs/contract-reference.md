@@ -150,7 +150,10 @@ Lock a deposit and mint a time-bound lease.
 - **Returns:** the new `lease_id` (monotonic, starts at `1`).
 - **State:** writes `Lease(lease_id)` with `expires_at = ledger.timestamp() +
   duration_secs` and a TTL covering the term plus grace; increments `LeaseCount`.
-- **Events:** `lease_created { lease_id, service_id, consumer, allocated_calls, expires_at, locked_deposit }`.
+- **Events:** `lease_created { lease_id, service_id, consumer, allocated_calls,
+  expires_at, locked_deposit, rate_per_call }`. `rate_per_call` is a snapshot
+  taken at creation, so indexers can interpret `locked_deposit` without reading
+  the service at the event's ledger.
 - **Errors:** `InvalidCalls`, `InvalidDuration`, `DurationTooLong`,
   `ServiceNotFound`, `ServiceInactive`, `InvalidRate`, `TokenNotSet`, `Overflow`.
 
@@ -238,7 +241,7 @@ Events are part of the ABI. Each event name is a `Symbol` topic, followed by the
 | `escrow_token_set` | — | `admin`, `token` |
 | `service_registered` | `service_id` | `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `provider`, `is_active` |
-| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit`, `rate_per_call` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
 | `contract_upgraded` | — | `admin`, `new_wasm_hash` |
