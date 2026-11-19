@@ -147,6 +147,7 @@ fn test_set_token_first_time_and_change_are_recorded() {
         &env,
         &registry_id,
         &EscrowTokenSet {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             token: first.clone(),
         },
@@ -160,6 +161,7 @@ fn test_set_token_first_time_and_change_are_recorded() {
         &env,
         &registry_id,
         &EscrowTokenSet {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             token: second.clone(),
         },

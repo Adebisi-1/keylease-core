@@ -131,11 +131,12 @@ rent bump and bills the caller for across the whole extended horizon. Only these
 calls extend anything:
 `init`, `set_token`, `upgrade`, `register_service`, `set_service_active`,
 `create_lease`, `settle_lease`, `revoke_expired_lease`, `bump_service` and
-`bump_lease`. Every read-only view — `get_service`, `get_lease`, `lease_status`,
-`remaining_calls`, `locked_balance` — is pure, so a simulation of a view costs
-instructions and no rent. At the ledger where an extension is due, `get_lease`
-estimates at 113 stroops (all instructions) against 48,798 for `bump_lease`, of
-which 48,684 is persistent rent.
+`bump_lease` — and, since PR #152, `set_token` only when it actually changes the
+configured token. Every read-only view — `get_service`, `get_lease`,
+`lease_status`, `remaining_calls`, `locked_balance` — is pure, so a simulation of
+a view costs instructions and no rent. At the ledger where an extension is due,
+`get_lease` estimates at 113 stroops (all instructions) against 48,798 for
+`bump_lease`, of which 48,684 is persistent rent.
 
 Because reads stopped bumping, state that is only ever looked at has to be kept
 alive deliberately, and `create_lease` therefore extends the service it leases

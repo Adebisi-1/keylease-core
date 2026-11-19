@@ -12,7 +12,8 @@
 //!
 //! | Call | Instance | Service entry | Lease entry |
 //! | --- | --- | --- | --- |
-//! | `init`, `set_token`, `upgrade`, `register_service` | extend | — | — |
+//! | `init`, `upgrade`, `register_service` | extend | — | — |
+//! | `set_token` | extend, unless the token is unchanged | — | — |
 //! | `set_service_active` | — | extend (save) | — |
 //! | `create_lease` | extend | extend | extend (save) |
 //! | `settle_lease`, `revoke_expired_lease` | — | — | extend (save) |
