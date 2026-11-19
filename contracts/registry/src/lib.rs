@@ -237,6 +237,9 @@ impl KeyLeaseRegistry {
     /// for the whole term plus the grace window, so a longer lease could be
     /// evicted while escrow is still locked.
     ///
+    /// The lease records `created_at` (the current ledger timestamp) alongside
+    /// `expires_at`, so its age and terms are readable from storage alone.
+    ///
     /// Returns the new `lease_id`.
     pub fn create_lease(
         env: Env,
@@ -276,9 +279,8 @@ impl KeyLeaseRegistry {
         // fail before mutating state.
         let token_addr = storage::get_token(&env).ok_or(Error::TokenNotSet)?;
 
-        let expires_at = env
-            .ledger()
-            .timestamp()
+        let created_at = env.ledger().timestamp();
+        let expires_at = created_at
             .checked_add(duration_secs)
             .ok_or(Error::Overflow)?;
 
@@ -289,6 +291,7 @@ impl KeyLeaseRegistry {
             consumer: consumer.clone(),
             allocated_calls: requested_calls,
             used_calls: 0,
+            created_at,
             expires_at,
             locked_deposit: required_deposit,
             settled: false,

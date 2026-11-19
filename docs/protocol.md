@@ -42,11 +42,18 @@ pub struct Lease {
     pub consumer: Address,
     pub allocated_calls: u32,
     pub used_calls: u32,
-    pub expires_at: u64,       // unix seconds, ledger time
+    pub created_at: u64,       // unix seconds, ledger time of create_lease
+    pub expires_at: u64,       // created_at + duration_secs
     pub locked_deposit: i128,  // rate_per_call * allocated_calls
     pub settled: bool,
 }
 ```
+
+`created_at` and `expires_at` are both ledger timestamps, so a lease's age,
+remaining term and original duration (`expires_at - created_at`) can be derived
+from the stored lease alone. A `created_at` of `0` marks a lease written by a
+release that predates the field; such leases remain settleable and report an
+unknown creation time (see the [contract reference](contract-reference.md#created_at-and-upgrade-compatibility)).
 
 ## Lifecycle
 
