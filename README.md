@@ -257,10 +257,15 @@ invariants:
    `MAX_LEASE_DURATION_SECS` (30 days) and extends the lease's persistent entry
    for its whole term plus the grace window, so escrow cannot be evicted while
    it is still claimable.
-6. **Explicit authorization.** Every state-changing entry point calls
+6. **Bounded deposits.** `create_lease` rejects a `rate_per_call ×
+   requested_calls` product above `MAX_LEASE_DEPOSIT` with `DepositTooLarge`,
+   before allocating a lease id or calling the token. Checked arithmetic cannot
+   cover this: a product can fit `i128` and still be far more than the consumer
+   meant to lock.
+7. **Explicit authorization.** Every state-changing entry point calls
    `require_auth()` on the actor it claims to represent, and cross-checks that
    actor against stored ownership where relevant.
-7. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
+8. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
    cannot move escrowed funds.
 
 ### Trusting the escrow token
@@ -283,7 +288,7 @@ re-entrant token.
 cargo test --all
 ```
 
-The 40 tests in `contracts/registry/src/test.rs` cover:
+The 44 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
 - the happy path (lock → full-usage settle before expiry),
@@ -292,6 +297,7 @@ The 40 tests in `contracts/registry/src/test.rs` cover:
 - the 24-hour grace window (boundary, early-settle, and post-settle cases),
 - unauthorized settle/revoke/upgrade attempts,
 - rate-math, timestamp and duration overflow/rejection,
+- the deposit ceiling at the limit, one unit above it, and against `Overflow`,
 - every emitted event, including its topics and payload,
 - the full lifecycle escrowed with the **native Stellar Asset Contract**,
 - a **re-entrant token** attempting a second settlement,
