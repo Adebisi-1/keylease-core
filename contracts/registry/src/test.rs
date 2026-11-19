@@ -11,7 +11,8 @@ use crate::events::{
     ServiceStatusChanged,
 };
 use crate::{
-    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, LeaseStatus, MAX_LEASE_DURATION_SECS,
+    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, LeaseStatus, MAX_LEASE_DEPOSIT,
+    MAX_LEASE_DURATION_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -634,19 +635,23 @@ fn test_large_but_valid_deposit_is_accepted() {
     env.ledger().set_timestamp(1_000);
     let ctx = setup(&env);
 
-    // (2^62) * 2 fits comfortably in i128, so the lease must be accepted.
-    let rate: i128 = 1i128 << 62;
+    // This test used `(1i128 << 62) * 2`, which fits `i128` with room to spare.
+    // `MAX_LEASE_DEPOSIT` now sits far below that, so "large but valid" means
+    // "large and still inside the bound": one unit under the cap, which is the
+    // last amount the protocol accepts. The cap itself and `cap + 1` are covered
+    // by the `MAX_LEASE_DEPOSIT` tests below.
+    let rate: i128 = MAX_LEASE_DEPOSIT - 1;
     let service_id = ctx
         .registry
         .register_service(&ctx.provider, &rate, &endpoint_hash(&env));
 
-    // Fund the consumer for the full deposit (rate * 2).
-    ctx.token.mint(&ctx.consumer, &(rate * 2));
+    // Fund the consumer for the full deposit (rate * 1).
+    ctx.token.mint(&ctx.consumer, &rate);
     let lease_id = ctx
         .registry
-        .create_lease(&ctx.consumer, &service_id, &2, &3_600);
+        .create_lease(&ctx.consumer, &service_id, &1, &3_600);
 
-    assert_eq!(ctx.registry.get_lease(&lease_id).locked_deposit, rate * 2);
+    assert_eq!(ctx.registry.get_lease(&lease_id).locked_deposit, rate);
 }
 
 #[test]
@@ -901,6 +906,99 @@ fn test_max_duration_is_accepted() {
     assert_eq!(
         ctx.registry.get_lease(&lease_id).expires_at,
         1_000 + MAX_LEASE_DURATION_SECS
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Maximum deposit bound (MAX_LEASE_DEPOSIT)
+// ---------------------------------------------------------------------------
+
+/// Register a service at an explicit rate and return its id. The deposit bound
+/// lives in the `rate × requested_calls` product, so these tests need rates far
+/// outside the `RATE` the rest of the suite uses.
+fn register_service_at(env: &Env, ctx: &Ctx, rate: i128) -> u64 {
+    ctx.registry
+        .register_service(&ctx.provider, &rate, &endpoint_hash(env))
+}
+
+#[test]
+fn test_deposit_exactly_at_max_is_accepted() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_service_at(&env, &ctx, MAX_LEASE_DEPOSIT);
+    ctx.token.mint(&ctx.consumer, &MAX_LEASE_DEPOSIT);
+
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &1, &3_600);
+
+    assert_eq!(
+        ctx.registry.get_lease(&lease_id).locked_deposit,
+        MAX_LEASE_DEPOSIT
+    );
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+}
+
+#[test]
+fn test_deposit_one_above_max_is_rejected() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_service_at(&env, &ctx, MAX_LEASE_DEPOSIT + 1);
+    // Fund the lease the bound is meant to stop: the consumer could otherwise
+    // afford it, and a passing assertion would only be proving poverty.
+    ctx.token.mint(&ctx.consumer, &(MAX_LEASE_DEPOSIT + 1));
+    let funded = ctx.token.balance(&ctx.consumer);
+    let leases_before = ctx.registry.lease_count();
+
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &1, &3_600),
+        Err(Ok(Error::DepositTooLarge))
+    );
+    assert_eq!(ctx.token.balance(&ctx.consumer), funded);
+    assert_eq!(
+        ctx.registry.lease_count(),
+        leases_before,
+        "the bound must reject before the lease id is allocated"
+    );
+}
+
+#[test]
+fn test_deposit_bound_applies_to_the_product_not_the_rate() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    // Every input is well under the bound; only their product crosses it, which
+    // is the case a rate-only check would let through.
+    let service_id = register_service_at(&env, &ctx, 1_000_000);
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &1_000_001, &3_600),
+        Err(Ok(Error::DepositTooLarge))
+    );
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+}
+
+#[test]
+fn test_deposit_bound_rejects_before_the_overflow_path() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_service_at(&env, &ctx, i128::MAX / 2);
+    // `2 × (i128::MAX / 2)` fits in `i128`, so this is not an arithmetic
+    // failure — it is the bound doing its job, and the two errors stay
+    // distinguishable for clients.
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &2, &3_600),
+        Err(Ok(Error::DepositTooLarge))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &3, &3_600),
+        Err(Ok(Error::Overflow))
     );
 }
 
