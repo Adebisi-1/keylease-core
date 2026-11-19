@@ -28,6 +28,7 @@
 ## Project
 
 - [Design: time-locked upgrades](design/upgrade-timelock.md)
+- [Design: consumer challenge window](design/consumer-challenge-window.md)
 - [Deployments](deployments.md)
 - Design notes
   - [Provider staking and slashing (#137)](design/137-provider-staking.md)

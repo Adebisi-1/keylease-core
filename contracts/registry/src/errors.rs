@@ -62,4 +62,18 @@ pub enum Error {
     /// A page size outside `1..=MAX_PAGE_SIZE`, so serving it would read an
     /// unbounded number of ledger entries in one transaction.
     InvalidLimit = 24,
+    /// No settlement has been proposed for the given `lease_id`.
+    SettlementNotFound = 25,
+    /// The settlement has already been finalized; funds have been released.
+    SettlementFinalized = 26,
+    /// The consumer challenge window has closed (or was never open).
+    ChallengeWindowClosed = 27,
+    /// The settlement is already under an active consumer challenge.
+    SettlementChallenged = 28,
+    /// There is no active challenge to cancel or resolve.
+    NoActiveChallenge = 29,
+    /// The challenge window has not closed yet, so the payout stays locked.
+    ChallengeWindowStillOpen = 30,
+    /// The challenge evidence hash is all zeroes.
+    InvalidEvidence = 31,
 }
