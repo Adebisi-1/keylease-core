@@ -36,7 +36,7 @@ token. **The credential is the lease, and the lease lives on Stellar.**
 | **Ledger time** | lease expiry and the 24-hour settlement grace window | Timestamps come from `env.ledger().timestamp()`, never from an off-chain clock. |
 | **Persistent-storage TTL** | `contracts/registry/src/storage.rs` | Lease entries are extended for their whole term plus the grace window, so escrow can never be evicted while it is still claimable. |
 | **`contractmeta!`** | `contracts/registry/src/lib.rs` | Name, version, description and repository are embedded in the Wasm and readable on-chain. |
-| **Soroban deployer upgrades** | `upgrade(admin, new_wasm_hash)` | The admin can install a new Wasm through `update_current_contract_wasm`, keeping the contract id, balances and in-flight leases. |
+| **Time-locked Soroban upgrades** | `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` | The admin queues a Wasm behind a 24-hour on-ledger delay before `update_current_contract_wasm` installs it, keeping the contract id, balances and in-flight leases. |
 | **`wasm32v1-none` + `soroban-sdk 26`** | `Cargo.toml`, CI | The workspace builds the exact artifact Stellar runs. |
 | **Soroban test utilities incl. the real SAC** | `contracts/registry/src/test.rs` | The suite escrows against `register_stellar_asset_contract_v2`, not just a mock token. |
 
@@ -83,7 +83,7 @@ keylease-core/
 │   │   │   ├── types.rs   # Service, Lease, LeaseStatus
 │   │   │   ├── storage.rs # DataKey layout + duration-aware TTL policy
 │   │   │   ├── errors.rs  # stable error codes
-│   │   │   └── test.rs    # lifecycle, SAC, events, upgrade, re-entrancy tests
+│   │   │   └── test.rs    # lifecycle, SAC, events, upgrade, TTL, re-entrancy tests
 │   │   └── Cargo.toml
 │   └── mock_token/        # minimal SEP-41 token for tests & local sandboxes
 ├── scripts/
@@ -105,13 +105,15 @@ keylease-core/
 | --- | --- | --- |
 | `init(admin)` | `admin` | One-time initialization; appoints the protocol admin. Emits `registry_initialized`. |
 | `set_token(admin, token)` | `admin` | Configure the SEP-41 escrow token (native SAC or custom). Emits `escrow_token_set`. |
-| `upgrade(admin, new_wasm_hash)` | `admin` | Install a new Wasm through the Soroban deployer. Emits `contract_upgraded`. |
+| `propose_upgrade(admin, new_wasm_hash)` | `admin` | Queue a Wasm behind the 24h delay. Emits `upgrade_proposed`. |
+| `cancel_upgrade(admin)` | `admin` | Drop a pending proposal. Emits `upgrade_cancelled`. |
+| `execute_upgrade(admin)` | `admin` | Install the proposed Wasm after the delay. Emits `contract_upgraded`. |
 | `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. Returns `service_id`. Emits `service_registered`. |
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
 | `create_lease(consumer, service_id, requested_calls, duration_secs) -> u64` | `consumer` | Lock `rate × calls` and mint a lease. Emits `lease_created`. |
 | `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder. Emits `lease_settled`. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
-| `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `version()` | — | Read-only views. |
+| `get_admin()`, `get_token()`, `get_service(id)`, `get_lease(id)`, `get_pending_upgrade()`, `version()` | — | Read-only views. |
 | `lease_status(id)`, `remaining_calls(id)`, `locked_balance(id)` | — | Derived lifecycle queries. |
 | `service_count()`, `lease_count()` | — | Monotonic counters. |
 
@@ -129,7 +131,9 @@ extra. Event names are the first topic; ids follow.
 | `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
-| `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+| `upgrade_proposed` | — | `admin`, `new_wasm_hash`, `execute_after` |
+| `upgrade_cancelled` | — | `admin`, `new_wasm_hash` |
+| `contract_upgraded` | — | `admin`, `new_wasm_hash`, `execute_after` |
 
 ```bash
 # Follow escrow from the ledger, no polling:
@@ -259,8 +263,9 @@ invariants:
 6. **Explicit authorization.** Every state-changing entry point calls
    `require_auth()` on the actor it claims to represent, and cross-checks that
    actor against stored ownership where relevant.
-7. **Bounded admin.** The admin can configure the token and upgrade the Wasm. It
-   cannot move escrowed funds.
+7. **Bounded, time-locked admin.** The admin can configure the token and propose
+   Wasm upgrades, but execution waits 24 hours on-ledger and can be cancelled.
+   The admin cannot move escrowed funds.
 
 ### Trusting the escrow token
 

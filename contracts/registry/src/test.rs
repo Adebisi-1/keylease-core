@@ -7,11 +7,13 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
-    ServiceStatusChanged,
+    ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
+    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
 };
+use crate::storage::{lease_ttl_extend_ledgers, LEDGER_BUMP_THRESHOLD, LEDGER_CLOSE_SECS};
 use crate::{
-    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, LeaseStatus, MAX_LEASE_DURATION_SECS,
+    test_wasm::UPGRADE_TEST_WASM, Error, KeyLeaseRegistry, KeyLeaseRegistryClient, LeaseStatus,
+    MAX_LEASE_DURATION_SECS, MAX_LEASE_TTL_EXTEND_LEDGERS, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -60,6 +62,19 @@ fn setup(env: &Env) -> Ctx<'_> {
         provider,
         consumer,
     }
+}
+
+/// Ready-to-use registry: initialized, token configured, consumer funded and
+/// one active service registered.
+///
+/// Ledger time is deliberately *not* touched here. Every test sets its own
+/// timestamp so timing assumptions stay visible at the call site.
+fn setup_with_service(env: &Env) -> (Ctx<'_>, u64) {
+    let ctx = setup(env);
+    let service_id = ctx
+        .registry
+        .register_service(&ctx.provider, &RATE, &endpoint_hash(env));
+    (ctx, service_id)
 }
 
 fn endpoint_hash(env: &Env) -> BytesN<32> {
@@ -212,8 +227,7 @@ fn test_set_service_active_is_provider_only() {
 fn test_create_lease_locks_deposit_and_records_terms() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
 
     let lease_id = ctx
         .registry
@@ -309,8 +323,7 @@ fn test_create_lease_requires_configured_token() {
 fn test_full_usage_can_settle_before_expiry() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
@@ -332,8 +345,7 @@ fn test_full_usage_can_settle_before_expiry() {
 fn test_partial_settle_after_expiry_refunds_remainder() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
@@ -435,8 +447,7 @@ fn test_provider_cannot_over_claim_calls() {
 fn test_expired_unsettled_lease_is_fully_reclaimed() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &100);
@@ -718,8 +729,7 @@ fn test_service_status_change_emits_event() {
 fn test_lease_lifecycle_emits_events() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
 
     let lease_id = ctx
         .registry
@@ -794,23 +804,162 @@ fn test_version_matches_contract_metadata() {
 }
 
 #[test]
-fn test_upgrade_is_admin_only() {
+fn test_propose_upgrade_records_hash_and_execution_ledger() {
     let env = Env::default();
-    let ctx = setup(&env);
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    // Read events before any further invocation: the host resets them per call.
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &UpgradeProposed {
+            admin: ctx.admin.clone(),
+            new_wasm_hash: new_wasm_hash.clone(),
+            execute_after: 1_000 + UPGRADE_DELAY_SECS,
+        },
+    );
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.execute_after, 1_000 + UPGRADE_DELAY_SECS);
+}
+
+#[test]
+fn test_execute_upgrade_before_delay_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    // One second short of the recorded execution ledger.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS - 1);
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::UpgradeDelayNotElapsed))
+    );
+    // A failed execution must not consume the proposal.
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.execute_after, 1_000 + UPGRADE_DELAY_SECS);
+}
+
+#[test]
+fn test_execute_upgrade_after_delay_reports_hash_and_ledger() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let wasm_hash = env.deployer().upload_contract_wasm(UPGRADE_TEST_WASM);
+    ctx.registry.propose_upgrade(&ctx.admin, &wasm_hash);
+
+    // At the recorded ledger, execution becomes legal.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    ctx.registry.execute_upgrade(&ctx.admin);
+
+    // The install swaps the contract code, so all registry reads happen before
+    // execution. Host-level events remain readable afterwards.
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &ContractUpgraded {
+            admin: ctx.admin.clone(),
+            new_wasm_hash: wasm_hash,
+            execute_after: 1_000 + UPGRADE_DELAY_SECS,
+        },
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_prevents_execution() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    ctx.registry.cancel_upgrade(&ctx.admin);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &UpgradeCancelled {
+            admin: ctx.admin.clone(),
+            new_wasm_hash: new_wasm_hash.clone(),
+        },
+    );
+    assert!(ctx.registry.get_pending_upgrade().is_none());
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::NoPendingUpgrade))
+    );
+}
+
+#[test]
+fn test_upgrade_entry_points_are_admin_only() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
     let impostor = Address::generate(&env);
     let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
 
     assert_eq!(
-        ctx.registry.try_upgrade(&impostor, &new_wasm_hash),
+        ctx.registry.try_propose_upgrade(&impostor, &new_wasm_hash),
         Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_cancel_upgrade(&impostor),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&impostor),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(ctx.registry.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn test_reproposal_restarts_the_delay() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let first_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let second_hash = BytesN::from_array(&env, &[2u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &first_hash);
+
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS - 1);
+    ctx.registry.propose_upgrade(&ctx.admin, &second_hash);
+
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_eq!(
+        pending.execute_after,
+        1_000 + UPGRADE_DELAY_SECS - 1 + UPGRADE_DELAY_SECS
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::UpgradeDelayNotElapsed))
     );
 }
 
-// A successful upgrade installs a real Wasm uploaded with
-// `stellar contract upload`, which the unit-test host cannot fabricate (it
-// requires a valid `contractspecv0` metadata section). The success path is
-// exercised end to end by `scripts/deploy-testnet.sh --upgrade` against
-// Testnet; here we pin the authorization guard.
+#[test]
+fn test_cancel_or_execute_without_proposal_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+
+    assert_eq!(
+        ctx.registry.try_cancel_upgrade(&ctx.admin),
+        Err(Ok(Error::NoPendingUpgrade))
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::NoPendingUpgrade))
+    );
+}
 
 #[test]
 fn test_duration_above_max_is_rejected() {
@@ -987,4 +1136,83 @@ fn test_reentrant_token_cannot_settle_a_lease_twice() {
         "re-entrant settle_lease should have been rejected"
     );
     assert!(registry.get_lease(&lease_id).settled);
+}
+
+// ---------------------------------------------------------------------------
+// Lease TTL policy properties
+// ---------------------------------------------------------------------------
+
+/// Small deterministic xorshift generator. Keeping it local makes the property
+/// test reproducible without adding a dependency to the contract workspace.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+/// The TTL must not shrink when the lease lasts longer (or the clock is earlier).
+fn assert_ttl_monotonic(expires_at: u64, now: u64) {
+    let ttl = lease_ttl_extend_ledgers(expires_at, now);
+    assert!(ttl <= lease_ttl_extend_ledgers(expires_at.saturating_add(1), now));
+    assert!(ttl <= lease_ttl_extend_ledgers(expires_at, now.saturating_sub(1)));
+}
+
+#[test]
+fn test_lease_ttl_extend_properties() {
+    const BOUNDARIES: [u64; 6] = [0, 1, GRACE, MAX_LEASE_DURATION_SECS, u64::MAX - 1, u64::MAX];
+    let mut rng = Rng(0x6A09_E667_F3BC_C909);
+
+    // Arbitrary expiry and ledger timestamps: only saturation-safe properties
+    // are guaranteed here, because a lease term beyond the documented maximum
+    // is clamped to u32::MAX ledgers.
+    for &now in BOUNDARIES.iter() {
+        for &expires_at in BOUNDARIES.iter() {
+            assert_ttl_monotonic(expires_at, now);
+            if expires_at.saturating_sub(now) <= MAX_LEASE_DURATION_SECS {
+                assert!(lease_ttl_extend_ledgers(expires_at, now) <= MAX_LEASE_TTL_EXTEND_LEDGERS);
+            }
+        }
+    }
+    for _ in 0..10_000 {
+        let now = rng.next();
+        let expires_at = rng.next();
+        assert_ttl_monotonic(expires_at, now);
+    }
+
+    // Arbitrary *valid* leases: the policy must cover the remaining term, the
+    // full grace window and the read buffer, and stay under the documented
+    // maximum so no lease can outlive its storage entry.
+    for _ in 0..10_000 {
+        let now = rng.next();
+        let remaining = rng.next() % (MAX_LEASE_DURATION_SECS + 1);
+        let expires_at = now.saturating_add(remaining);
+        assert_ttl_monotonic(expires_at, now);
+
+        // `expires_at` may saturate at u64::MAX, so use the remaining time the
+        // contract actually observes rather than the requested amount.
+        let actual_remaining = expires_at.saturating_sub(now);
+        let ledgers = lease_ttl_extend_ledgers(expires_at, now) as u64;
+        let covered_secs = actual_remaining.saturating_add(GRACE);
+        assert!(
+            ledgers * LEDGER_CLOSE_SECS >= covered_secs,
+            "TTL must cover expiry plus the grace window"
+        );
+        assert!(
+            ledgers * LEDGER_CLOSE_SECS
+                >= covered_secs + LEDGER_BUMP_THRESHOLD as u64 * LEDGER_CLOSE_SECS
+                    - (LEDGER_CLOSE_SECS - 1),
+            "TTL must include the one-day read buffer"
+        );
+        assert!(
+            ledgers <= MAX_LEASE_TTL_EXTEND_LEDGERS as u64,
+            "TTL must never exceed the documented maximum"
+        );
+    }
 }

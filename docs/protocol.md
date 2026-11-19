@@ -4,7 +4,7 @@
 
 | Actor | Address | Can do |
 | --- | --- | --- |
-| **Admin** | one Stellar account | `init` once, `set_token`, `upgrade`. Cannot move escrowed funds. |
+| **Admin** | one Stellar account | `init` once, `set_token`, `propose_upgrade`/`execute_upgrade`/`cancel_upgrade` (24h delay). Cannot move escrowed funds. |
 | **Provider** | per service (account or contract address) | Register/pause services, settle leases it owns. |
 | **Consumer** | per lease (account or contract address) | Create leases, revoke expired unsettled leases. |
 
@@ -117,7 +117,9 @@ remaining fields.
 | `lease_created` | `lease_id` | `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
 | `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `consumer`, `refund` |
-| `contract_upgraded` | — | `admin`, `new_wasm_hash` |
+| `upgrade_proposed` | — | `admin`, `new_wasm_hash`, `execute_after` |
+| `upgrade_cancelled` | — | `admin`, `new_wasm_hash` |
+| `contract_upgraded` | — | `admin`, `new_wasm_hash`, `execute_after` |
 
 Events are the indexing contract between on-chain state and off-chain systems: a
 provider can settle from a projection built by subscribing to `lease_created`,

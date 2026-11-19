@@ -10,7 +10,7 @@ reporting a vulnerability, see
 | Assumption | Consequence if violated |
 | --- | --- |
 | The admin configures a well-behaved SEP-41 token. | A malicious token contract could revert transfers and stall settlement. It cannot be paid twice: `settled` is persisted before the transfer, and a re-entrant token is rejected (`LeaseAlreadySettled`). |
-| The admin does not upgrade to a malicious Wasm. | An upgrade can change the contract logic. The admin key should be cold or multisig; upgrades emit `contract_upgraded`. |
+| The admin does not upgrade to a malicious Wasm. | An upgrade can change the contract logic. The admin key should be cold or multisig. Upgrades now require a 24h on-ledger delay and emit `upgrade_proposed` with the hash and execution ledger, so consumers can exit; execution emits `contract_upgraded`. |
 | The provider reports `verified_calls` honestly. | It can under-report (it gets paid less) but never over-report past `allocated_calls`. |
 | Soroban ledger time is monotonic and honest. | Validity windows would be unreliable. |
 | Consumers keep their own key safe. | Anyone with the consumer key can create leases that spend its balance. |
@@ -39,8 +39,8 @@ take more than it is owed, and it cannot prevent the consumer's refund.
    `MAX_LEASE_DURATION_SECS` (30 days) revert with `DurationTooLong`, and the
    persistent entry is extended for the term plus the grace window, so escrow
    cannot be evicted while it is claimable.
-7. **The admin cannot touch user funds.** It can only call `set_token` and
-   `upgrade`.
+7. **The admin cannot touch user funds.** It can only call `set_token` and manage
+   upgrades, which are time-locked for 24h and cancellable.
 8. **Every mutation is authenticated.** No state-changing entry point trusts its
    caller without `require_auth()`.
 9. **Every mutation is observable.** Each transition emits a typed Soroban event
@@ -73,7 +73,7 @@ violation.
 | Duration overflow wraps expiry | `checked_add` → `Overflow` |
 | Long lease is evicted from storage | `DurationTooLong` + duration-aware TTL extension |
 | Fake "KeyLease" contract id | Only ids in [Deployments](deployments.md) are ours |
-| Silent logic change on upgrade | Admin-only, emits `contract_upgraded`, `contractmeta!` exposes the version |
+| Silent logic change on upgrade | 24h delay + admin-only execution, emits `upgrade_proposed`/`contract_upgraded`, `contractmeta!` exposes the version |
 
 ## Known limitations
 
@@ -96,7 +96,7 @@ These are real and tracked as Drips Wave issues rather than hidden.
 
 - Only trust contract ids in [`docs/deployments.md`](deployments.md).
 - The admin key should be a cold or multisig Stellar account. It can change the
-  escrow token and upgrade the contract.
+  escrow token and propose/cancel upgrades, but execution waits 24h on-ledger.
 - Verify the deployed metadata and configuration after deploy:
 
 ```bash

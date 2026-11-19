@@ -111,7 +111,9 @@ The contract id itself is in the registry: see
 ## Upgrading
 
 The contract is upgradeable in place through the Soroban deployer; the contract
-id, storage and balances are preserved.
+id, storage and balances are preserved. Installation is **time-locked**: a
+proposal must sit on-ledger for 24 hours before it can be executed, so consumers
+have a window to settle or revoke before the rules change.
 
 ```bash
 # 1. upload the new Wasm and print its hash
@@ -119,26 +121,43 @@ WASM_HASH=$(stellar contract upload \
   --wasm target/wasm32v1-none/release/keylease_registry.wasm \
   --source-account keylease-admin --network testnet)
 
-# 2. install it (admin auth)
+# 2. propose the upgrade (admin auth); read back the hash and execution ledger
 stellar contract invoke --id $REGISTRY --source-account keylease-admin \
-  --network testnet --send=yes -- upgrade \
+  --network testnet --send=yes -- propose_upgrade \
     --admin $ADMIN --new_wasm_hash "$WASM_HASH"
+stellar contract invoke --id $REGISTRY --network testnet -- get_pending_upgrade
 
-# 3. confirm the new version and watch the event
+# 3. wait until ledger.timestamp() >= execute_after (24h), then install
+stellar contract invoke --id $REGISTRY --source-account keylease-admin \
+  --network testnet --send=yes -- execute_upgrade --admin $ADMIN
+
+# 4. confirm the new version and watch the event
 stellar contract invoke --id $REGISTRY --source-account keylease-admin --network testnet -- version
 stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 ```
 
-Or use the script:
+If the proposal must be abandoned at any point before execution:
+
+```bash
+stellar contract invoke --id $REGISTRY --source-account keylease-admin \
+  --network testnet --send=yes -- cancel_upgrade --admin $ADMIN
+```
+
+Or use the script (propose now, execute in a separate run after the delay):
 
 ```bash
 REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --upgrade
+# ... 24 hours later ...
+REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --execute-upgrade
 ```
 
 Guard rails for an upgrade: keep the storage layout unchanged, append error
 codes instead of renumbering, and keep event names and payload fields
-backwards-compatible. Settle or revoke in-flight leases before changing token
-semantics. See [Security](security.md#known-limitations).
+backwards-compatible. The `execute_after` timestamp and proposed hash are
+public via `get_pending_upgrade` and `upgrade_proposed`; announce them so clients
+can exit in time. Settle or revoke in-flight leases before changing token
+semantics. See [Security](security.md#known-limitations) and the
+[design note](design/upgrade-timelock.md).
 
 ## Post-deploy
 

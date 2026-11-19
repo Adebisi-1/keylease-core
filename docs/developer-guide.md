@@ -138,7 +138,16 @@ stellar contract upload \
   --source-account admin --network testnet
 
 stellar contract invoke --id $REGISTRY --source-account admin --network testnet \
-  --send=yes -- upgrade --admin $ADMIN --new_wasm_hash <hash-from-upload>
+  --send=yes -- propose_upgrade --admin $ADMIN --new_wasm_hash <hash-from-upload>
+
+# inspect the recorded hash and execution ledger timestamp
+stellar contract invoke --id $REGISTRY --network testnet -- get_pending_upgrade
+
+# after the 24h delay has elapsed (the contract rejects earlier calls)
+stellar contract invoke --id $REGISTRY --source-account admin --network testnet \
+  --send=yes -- execute_upgrade --admin $ADMIN
+
+# or abandon the proposal: -- cancel_upgrade --admin $ADMIN
 ```
 
 Rules for upgrades:

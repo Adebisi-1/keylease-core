@@ -1,8 +1,8 @@
 use soroban_sdk::{contracttype, Address, Env};
 
 use crate::errors::Error;
-use crate::types::{Lease, Service};
-use crate::SETTLE_GRACE_PERIOD_SECS;
+use crate::types::{Lease, PendingUpgrade, Service};
+use crate::{MAX_LEASE_DURATION_SECS, SETTLE_GRACE_PERIOD_SECS};
 
 /// Expected Stellar ledger close time, used to translate lease durations into
 /// ledger counts for TTL extension.
@@ -12,6 +12,15 @@ pub const LEDGER_CLOSE_SECS: u64 = 5;
 pub const LEDGER_BUMP_THRESHOLD: u32 = 17_280;
 /// Ledger count that persistent entries are extended to (~30 days @ 5s ledgers).
 pub const LEDGER_BUMP_EXTEND: u32 = 518_400;
+
+/// Upper bound of [`lease_ttl_extend_ledgers`] for a valid lease.
+///
+/// A lease can live at most `MAX_LEASE_DURATION_SECS` past ledger time, so the
+/// policy can never ask for more than the full term, the 24-hour grace window
+/// and the one-day read buffer, expressed in ledgers.
+pub const MAX_LEASE_TTL_EXTEND_LEDGERS: u32 = ((MAX_LEASE_DURATION_SECS + SETTLE_GRACE_PERIOD_SECS)
+    / LEDGER_CLOSE_SECS) as u32
+    + LEDGER_BUMP_THRESHOLD;
 
 /// Storage keys for the registry.
 #[contracttype]
@@ -29,6 +38,9 @@ pub enum DataKey {
     Service(u64),
     /// `Lease` by id (persistent storage).
     Lease(u64),
+    /// Pending, time-locked Wasm upgrade (instance storage). Append-only:
+    /// existing keys keep their wire encoding.
+    PendingUpgrade,
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +65,23 @@ pub fn set_token(env: &Env, token: &Address) {
 
 pub fn get_token(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Token)
+}
+
+/// Store a pending upgrade, replacing any previous proposal.
+pub fn set_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingUpgrade, pending);
+}
+
+/// Return the pending upgrade, if one is queued.
+pub fn get_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+/// Drop a pending upgrade after execution or cancellation.
+pub fn remove_pending_upgrade(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 /// Bump the TTL of the instance (configuration) storage entry.
@@ -142,9 +171,16 @@ pub fn save_lease(env: &Env, lease: &Lease) {
 /// `create_lease` caps `duration_secs` at `MAX_LEASE_DURATION_SECS`, so this is
 /// always bounded and a locked deposit can never outlive its lease entry.
 fn lease_ttl_extend(env: &Env, lease: &Lease) -> u32 {
-    let now = env.ledger().timestamp();
-    let remaining_secs = lease
-        .expires_at
+    lease_ttl_extend_ledgers(lease.expires_at, env.ledger().timestamp())
+}
+
+/// Pure form of the lease TTL policy, so its arithmetic can be property-tested
+/// over arbitrary expiry and ledger timestamps.
+///
+/// All arithmetic saturates: an expiry far beyond the ledger clock asks for a
+/// very large TTL, which is clamped to `u32::MAX` ledgers rather than wrapping.
+pub(crate) fn lease_ttl_extend_ledgers(expires_at: u64, now: u64) -> u32 {
+    let remaining_secs = expires_at
         .saturating_sub(now)
         .saturating_add(SETTLE_GRACE_PERIOD_SECS);
     let ledgers = remaining_secs / LEDGER_CLOSE_SECS;

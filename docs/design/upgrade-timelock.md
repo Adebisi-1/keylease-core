@@ -88,10 +88,10 @@ of the protocol is built around.
 * Non-admins cannot propose, execute or cancel.
 * A proposal replaces a previous one and resets the clock.
 * Execution at/after the boundary installs the Wasm and publishes
-  `contract_upgraded` with the hash and ledger. The success path needs a valid
-  Soroban Wasm on the test host; where the host cannot fabricate one, the
-  on-ledger sequencing is still pinned by the early-execution and event tests
-  and the Testnet deploy script covers the real install.
+  `contract_upgraded` with the hash and ledger. A 40-byte, hand-built module
+  with a `contractenvmetav0` metadata section is uploaded to the test host so
+  the real `update_current_contract_wasm` primitive is exercised without a
+  build-time Wasm dependency or third-party fixture.
 * Full CI gate: `cargo fmt --all -- --check`, `cargo clippy --all-targets --
   -D warnings`, `cargo test --all`, and
   `cargo build --target wasm32v1-none --release --all`.
