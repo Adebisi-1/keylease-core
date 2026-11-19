@@ -422,6 +422,109 @@ pub enum DataKey {
 `Vec[Symbol("Lease"), u64(7)]`. This matters if you read contract data directly
 with `getContractData`; see the [developer guide](developer-guide.md#reading-contract-state-and-events).
 
+### Storage classes and TTL policies
+
+Soroban expires storage: every key below has a lifetime, and when it runs out the
+host deletes the entry. Two operations keep an entry alive — a **save** on a
+write path (`save_service`, `save_lease`, the instance writes) and an **explicit
+bump** (`bump_service`, `bump_lease`, documented under
+[Storage maintenance](#storage-maintenance)). Reads do neither. That split is
+deliberate and it is priced: an extension bills the caller for rent across the
+whole extended horizon, so a view that bumped what it read would turn a free
+lookup into a large fee. `test_bump_lease_is_where_the_rent_lives` pins the
+difference — the pure read costs 113 stroops, `bump_lease` costs 48,798, of
+which 48,684 is the rent for the horizon it just bought.
+
+The numbers come from `contracts/registry/src/storage.rs`:
+
+| Constant | Ledgers | Wall clock at 5s blocks |
+| --- | --- | --- |
+| `LEDGER_CLOSE_SECS` | — | 5 seconds |
+| `LEDGER_BUMP_THRESHOLD` | `17_280` | 1 day — below this remaining life, a save or a bump extends the entry |
+| `LEDGER_BUMP_EXTEND` | `518_400` | 30 days — the horizon instance and `Service` entries are extended to |
+| `MAX_ENTRY_TTL_LEDGERS` | `1_555_200` | 90 days — the ceiling every extension in this module is clamped to |
+
+The last row is a policy bound rather than a network constant. `ttl_ceiling`
+returns `min(MAX_ENTRY_TTL_LEDGERS, env.storage().max_ttl())`, so no call can ask
+for more than 90 days of lifetime and no call can contradict a network that
+publishes a smaller `maxEntryTtl` (6,312,000 ledgers on Pubnet and Testnet).
+Because `create_lease` caps a lease at 30 days, the clamp never truncates a
+well-formed lease; what it bounds is an entry whose `expires_at` says something
+else — one migrated in by an upgrade, or created after a future raise of
+`MAX_LEASE_DURATION_SECS`.
+
+| Key | Class | Holds | Extended by | TTL policy | If it is never extended |
+| --- | --- | --- | --- | --- | --- |
+| `Admin` | Instance | `Address` of the protocol admin | `init`, `set_token` (only when the token actually changes; a repeat call is a no-op), `register_service`, `create_lease` — each via `extend_instance_ttl` | extend to 30 days, clamped, when less than 1 day is left | The whole contract instance entry is evicted: the id stops resolving, and admin, token and both counters are gone with it. |
+| `Token` | Instance | SEP-41 escrow token `Address` | as `Admin` | as `Admin` | as `Admin`. Reads answer `TokenNotSet`, writes answer `NotInitialized` long before eviction, so a missing value is a bug report, not a normal state. |
+| `ServiceCount` | Instance | `u64`, next service id | as `Admin` | as `Admin` | as `Admin`. It resets to `0` on a fresh instance, which is why id monotonicity is only guaranteed within one live instance. |
+| `LeaseCount` | Instance | `u64`, next lease id | as `Admin` | as `Admin` | as `ServiceCount`. |
+| `Service(u64)` | Persistent | `Service` struct (provider, rate, endpoint hash, active) | `save_service` — so `register_service` and `set_service_active`; `create_lease` via `extend_service_ttl`; and `bump_service`. **Not** `get_service`, `settle_lease` (which reads the service), or any view | extend to 30 days, clamped, when less than 1 day is left | The entry is dropped and every call naming that id answers `ServiceNotFound` (4) — including `settle_lease` on leases that are still live. Nothing resurrects it: re-registering mints a **new** id, so the old leases are orphaned. The defence is `bump_service`, which needs no authorisation and is paid for by whoever calls it. |
+| `Lease(u64)` | Persistent | `Lease` struct (allotted and used calls, `expires_at`, `locked_deposit`, `settled`) | `save_lease` — so `create_lease`, `settle_lease`, `revoke_expired_lease`; and `bump_lease`. **Not** the `get_lease`, `lease_status`, `remaining_calls`, `locked_balance` views | lease-specific: see the next section | The entry is dropped and `get_lease` answers `LeaseNotFound` (6). Settlement and the consumer's refund path both begin by reading the lease, so an evicted lease can be neither settled nor refunded. `bump_lease` prevents that while the entry still exists and can do nothing after it is gone. |
+
+A registry that is deployed and then left unused is not kept alive by reads:
+`settle_lease`, `revoke_expired_lease`, `upgrade`, `bump_service`, `bump_lease`
+and every view leave the instance horizon alone. Instance eviction is a redeploy
+event, and [Networks](networks.md#after-a-testnet-reset) treats it as one.
+
+### The lease-specific extension
+
+`save_lease` and `extend_lease_ttl` (the body of `bump_lease`) do not use the
+generic 30-day horizon. Both call `storage::lease_ttl_extend`, which sizes the
+entry to the time the lease can actually be acted on:
+
+```text
+ledgers = (remaining_term_secs + SETTLE_GRACE_PERIOD_SECS) / LEDGER_CLOSE_SECS
+          + LEDGER_BUMP_THRESHOLD
+          then clamped to ttl_ceiling
+```
+
+`remaining_term_secs` is `expires_at - now`, saturating at zero, so the result
+covers the lease term, then the 24-hour provider settlement window, then one
+extra day of buffer for the consumer's `revoke_expired_lease` call. Worked
+examples:
+
+| Lease | Extension | Entry lives |
+| --- | --- | --- |
+| 1 hour, fresh | `35_280` ledgers | ~2 days |
+| 7 days, fresh | `155_520` ledgers | ~9 days |
+| 30 days (`MAX_LEASE_DURATION_SECS`), fresh | `552_960` ledgers | ~32 days |
+| already expired | `34_560` ledgers | 2 days — the grace window plus the buffer |
+| `expires_at` far past any legitimate term | `1_555_200` ledgers | 90 days — the clamp, not the term |
+
+The fourth row is why `bump_lease` is safe to expose permissionlessly: once a
+lease's horizon is in the past the ask stops shrinking. An expired lease is
+extended about two days at a time, never by its original term, so bumping the
+tail of a lease is a small explicit payment rather than an accidental re-buy of
+months of rent.
+
+Three properties make this safe rather than merely cheap:
+
+- **Bounded.** `create_lease` rejects durations above
+  `MAX_LEASE_DURATION_SECS` (`DurationTooLong`, 16) and every ask passes through
+  `ttl_ceiling`, so a caller cannot inflate the extension and rent stays
+  predictable. `bump_lease` takes only a `lease_id`: the horizon comes from the
+  lease's own `expires_at`, never from the caller.
+- **Never shorter than the money is locked.** The entry outlives
+  `expires_at + SETTLE_GRACE_PERIOD_SECS`, which is the last moment anyone can
+  claim against the lease. A deposit cannot outlive the record that authorises
+  paying it — the invariant `docs/security.md` states as "every lease has a
+  consumer path to a full refund, for its entire TTL".
+- **Only ever forward.** Soroban's `extend_ttl` raises `liveUntilLedgerSeq` and
+  cannot lower it, so a bump can never shorten a lease somebody already paid for
+  (`test_bump_lease_cannot_shorten_a_live_lease`).
+
+One asymmetry is worth stating plainly: keeping an entry alive is not the same as
+being able to read it. `bump_lease` refuses a settled lease with
+`LeaseAlreadySettled` (7) because its funds have already moved and extending it
+would only grow state, and `bump_service` answers `ServiceNotFound` (4) for an
+unknown id so that nobody pays rent for an entry that was never there.
+
+The old behaviour — extending every lease to the generic 30-day horizon on every
+read — charged a one-hour lease thirty days of Soroban rent, and made the read
+path expensive. That is why the calculation is per-lease, and why reads no longer
+do it.
+
 ## Error codes
 
 Codes are part of the ABI. New variants are **appended**; existing numbers are
