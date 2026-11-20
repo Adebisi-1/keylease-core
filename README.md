@@ -88,6 +88,7 @@ keylease-core/
 │   └── mock_token/        # minimal SEP-41 token for tests & local sandboxes
 ├── scripts/
 │   ├── deploy-testnet.sh  # sequential testnet deploy / upgrade
+│   ├── check-no-std.sh    # CI guard: release Wasm has no std, crates forbid unsafe
 │   ├── create-issues.sh   # batch Wave backlog creation (templates + 130-issue PSV)
 │   └── setup-repo.sh      # topics, labels, branch protection
 ├── docs/                  # Stellar-native protocol docs, guides and references
