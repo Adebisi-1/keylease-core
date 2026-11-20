@@ -106,6 +106,44 @@ pub struct ServiceStatusChanged {
     pub is_active: bool,
 }
 
+/// Emitted when a provider updates the rate_per_call and/or endpoint_hash of a service.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRateUpdated {
+    /// Service whose rate/endpoint was updated.
+    #[topic]
+    pub service_id: u64,
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
+    /// Provider that owns the service.
+    pub provider: Address,
+    /// New per-call rate in the escrow token's smallest unit.
+    pub rate_per_call: i128,
+    /// New commitment to the off-chain endpoint descriptor.
+    pub endpoint_hash: BytesN<32>,
+}
+
+/// Emitted when a provider opts a service into or out of settlement
+/// attestation.
+///
+/// `attestor` is the ed25519 key a settlement of this service's leases must be
+/// signed with, or `None` when the service opted back out. A new event shape
+/// does not bump `EVENT_SCHEMA_VERSION`: the version tracks fields of an
+/// existing payload, and no existing payload changed here.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAttestorSet {
+    /// Service whose attestation policy changed.
+    #[topic]
+    pub service_id: u64,
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
+    /// Provider that owns the service.
+    pub provider: Address,
+    /// The attestor key now required for settlement, or `None` when disabled.
+    pub attestor: Option<BytesN<32>>,
+}
+
 /// Emitted when a consumer escrows a deposit and a lease is minted.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
