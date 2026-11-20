@@ -163,6 +163,13 @@ pub struct LeaseCreated {
     pub expires_at: u64,
     /// Deposit held in escrow: `rate_per_call * allocated_calls`.
     pub locked_deposit: i128,
+    /// Service rate per metered call, in the escrow token's smallest unit.
+    ///
+    /// This is a snapshot taken when the lease is created, so an indexer can
+    /// interpret `locked_deposit` without reading the service at the event's
+    /// ledger. Later changes to the service rate do not affect this value or
+    /// the lease's settlement math.
+    pub rate_per_call: i128,
 }
 
 /// Emitted when a provider settles a lease from escrow.
