@@ -37,9 +37,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+      # The host run above lints tests and the std/testutils build. This one
+      # lints the artifact that is actually deployed: the contracts compiled
+      # no_std for the Soroban target in release, against the SDK's guest
+      # environment instead of the host one. It stays in this job so the
+      # "Clippy" required check name in branch protection does not change.
+      - name: cargo clippy (wasm32v1-none)
+        run: cargo clippy --target wasm32v1-none --release --all -- -D warnings
 
   test:
     name: Test
