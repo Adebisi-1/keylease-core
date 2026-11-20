@@ -57,7 +57,8 @@ stellar contract invoke \
 
 This escrows `rate_per_call × 500` and prints the new `lease_id`. The transaction
 emits `lease_created { lease_id, service_id, consumer, allocated_calls,
-expires_at, locked_deposit }`; keep the transaction hash as proof of purchase.
+expires_at, locked_deposit, rate_per_call }`; keep the transaction hash as
+proof of purchase.
 
 **Choose your numbers deliberately.** If your lease expires while you still have
 unused calls, those calls are not usable — `remaining_calls` drops to `0` at
