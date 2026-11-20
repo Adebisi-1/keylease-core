@@ -25,11 +25,12 @@ cargo test --all
 
 ## The commands CI runs
 
-These four are the definition of "green". Run all four before opening a PR.
+These five are the definition of "green". Run all five before opening a PR.
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 cargo test --all
 cargo build --target wasm32v1-none --release --all
 ```
@@ -51,6 +52,7 @@ malware scan over the checkout and the built Wasm artifacts. CI job names are
 | `contracts/registry/src/test.rs` | Lifecycle, SAC, events, upgrade and re-entrancy tests. |
 | `contracts/mock_token/` | Test/sandbox SEP-41 token. |
 | `scripts/deploy-testnet.sh` | Sequential testnet deploy and upgrade. |
+| `scripts/check-no-std.sh` | Checks the release Wasm is built without `std` and crates forbid `unsafe`. |
 | `scripts/create-issues.sh` | Batch Wave backlog creation. |
 | `scripts/setup-repo.sh` | Topics, labels, branch protection. |
 
@@ -210,14 +212,17 @@ deployer's secret key. Addresses and ledger numbers are fine and useful.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 cargo test --all
 cargo build --target wasm32v1-none --release --all
+./scripts/check-no-std.sh --no-build
 cargo deny check
 ./scripts/scan-malware.sh
 pip install -r requirements-docs.txt && mkdocs build --strict
 ```
 
-The first four are the CI jobs every commit must pass; `cargo deny check` and
+The first four are the CI jobs every commit must pass, and
+`check-no-std.sh` runs inside the `Build (wasm32v1-none)` job; `cargo deny check` and
 `./scripts/scan-malware.sh` are the Dependency Policy and Malware Scan jobs run
 locally. `mkdocs build --strict` is the one that bites at release time: the docs
 workflow only runs on `main`, so a notes page missing from `nav:` or a dangling
@@ -271,7 +276,16 @@ stellar contract upload \
   --source-account admin --network testnet
 
 stellar contract invoke --id $REGISTRY --source-account admin --network testnet \
-  --send=yes -- upgrade --admin $ADMIN --new_wasm_hash <hash-from-upload>
+  --send=yes -- propose_upgrade --admin $ADMIN --new_wasm_hash <hash-from-upload>
+
+# inspect the recorded hash and execution ledger timestamp
+stellar contract invoke --id $REGISTRY --network testnet -- get_pending_upgrade
+
+# after the 24h delay has elapsed (the contract rejects earlier calls)
+stellar contract invoke --id $REGISTRY --source-account admin --network testnet \
+  --send=yes -- execute_upgrade --admin $ADMIN
+
+# or abandon the proposal: -- cancel_upgrade --admin $ADMIN
 ```
 
 Rules for upgrades:

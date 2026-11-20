@@ -7,13 +7,15 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
-    ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
+    RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
+    UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{self, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
+use crate::test_wasm::UPGRADE_TEST_WASM;
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS,
+    MAX_LEASE_DURATION_SECS, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -62,6 +64,19 @@ fn setup(env: &Env) -> Ctx<'_> {
         provider,
         consumer,
     }
+}
+
+/// Ready-to-use registry: initialized, token configured, consumer funded and
+/// one active service registered.
+///
+/// Ledger time is deliberately *not* touched here. Every test sets its own
+/// timestamp so timing assumptions stay visible at the call site.
+fn setup_with_service(env: &Env) -> (Ctx<'_>, u64) {
+    let ctx = setup(env);
+    let service_id = ctx
+        .registry
+        .register_service(&ctx.provider, &RATE, &endpoint_hash(env));
+    (ctx, service_id)
 }
 
 fn endpoint_hash(env: &Env) -> BytesN<32> {
@@ -265,6 +280,114 @@ fn test_set_service_active_is_provider_only() {
     );
 }
 
+#[test]
+fn test_update_service_is_provider_only() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let impostor = Address::generate(&env);
+
+    assert_eq!(
+        ctx.registry
+            .try_update_service(&impostor, &service_id, &100, &endpoint_hash(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_update_service_rejects_non_positive_rate() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    assert_eq!(
+        ctx.registry
+            .try_update_service(&ctx.provider, &service_id, &0, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_update_service(&ctx.provider, &service_id, &-1, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(ctx.registry.get_service(&service_id).rate_per_call, RATE);
+}
+
+#[test]
+fn test_update_service_preserves_existing_lease_rate() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    // Update the rate to a new value.
+    ctx.registry
+        .update_service(&ctx.provider, &service_id, &200, &endpoint_hash(&env));
+
+    // The existing lease still uses the old rate.
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert_eq!(
+        lease.locked_deposit,
+        RATE * 10,
+        "existing lease keeps old rate"
+    );
+
+    // A new lease uses the new rate.
+    let new_lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let new_lease = ctx.registry.get_lease(&new_lease_id);
+    assert_eq!(
+        new_lease.locked_deposit,
+        200 * 10,
+        "new lease uses new rate"
+    );
+}
+
+#[test]
+fn test_update_service_updates_rate_and_endpoint() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Update both rate and endpoint hash.
+    ctx.registry
+        .update_service(&ctx.provider, &service_id, &150, &endpoint_hash(&env));
+
+    let service = ctx.registry.get_service(&service_id);
+    assert_eq!(service.rate_per_call, 150, "rate was updated");
+    assert_eq!(
+        service.endpoint_hash,
+        endpoint_hash(&env),
+        "endpoint_hash was updated"
+    );
+}
+
+#[test]
+fn test_update_service_emits_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    ctx.registry
+        .update_service(&ctx.provider, &service_id, &200, &endpoint_hash(&env));
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &ServiceRateUpdated {
+            schema_version: EVENT_SCHEMA_VERSION,
+            service_id,
+            provider: ctx.provider.clone(),
+            rate_per_call: 200,
+            endpoint_hash: endpoint_hash(&env),
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Lease creation
 // ---------------------------------------------------------------------------
@@ -273,8 +396,7 @@ fn test_set_service_active_is_provider_only() {
 fn test_create_lease_locks_deposit_and_records_terms() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
 
     let lease_id = ctx
         .registry
@@ -370,8 +492,7 @@ fn test_create_lease_requires_configured_token() {
 fn test_full_usage_can_settle_before_expiry() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
@@ -393,8 +514,7 @@ fn test_full_usage_can_settle_before_expiry() {
 fn test_partial_settle_after_expiry_refunds_remainder() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
@@ -496,8 +616,7 @@ fn test_provider_cannot_over_claim_calls() {
 fn test_expired_unsettled_lease_is_fully_reclaimed() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &100);
@@ -722,8 +841,221 @@ fn test_lease_status_unknown_lease() {
 }
 
 // ---------------------------------------------------------------------------
+// Derived views across every lease state
+//
+// `remaining_calls` and `locked_balance` encode protocol semantics (what a
+// consumer may still use, what is still owed), so they are pinned here for each
+// state instead of only being read incidentally by the lifecycle tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_remaining_calls_equals_allocated_calls_immediately_after_create_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Two leases on the same service: the view is per lease, not per service.
+    let first = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &7, &3_600);
+    let second = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &25, &3_600);
+
+    assert_eq!(ctx.registry.remaining_calls(&first), 7);
+    assert_eq!(ctx.registry.remaining_calls(&second), 25);
+    assert_eq!(ctx.registry.lease_status(&first), LeaseStatus::Active);
+    assert_eq!(ctx.registry.lease_status(&second), LeaseStatus::Active);
+
+    // Nothing has been consumed or settled, so the full deposit is still locked.
+    let lease = ctx.registry.get_lease(&first);
+    assert_eq!(lease.used_calls, 0);
+    assert_eq!(ctx.registry.locked_balance(&first), lease.locked_deposit);
+}
+
+#[test]
+fn test_remaining_calls_is_zero_at_and_after_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    // One second before expiry the full allotment is still usable.
+    env.ledger().set_timestamp(1_099);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 10);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+
+    // Expiry is inclusive: at `expires_at` nothing remains.
+    env.ledger().set_timestamp(1_100);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Expired);
+
+    // And it stays zero afterwards.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+
+    // Expiry does not release escrow: an unsettled lease still owes its deposit
+    // until the provider settles or the consumer revokes.
+    assert_eq!(
+        ctx.registry.locked_balance(&lease_id),
+        RATE * 10,
+        "expired but unsettled leases still hold the deposit"
+    );
+}
+
+#[test]
+fn test_remaining_calls_and_locked_balance_are_zero_after_settle_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    // Expired, partially consumed settlement: 6 paid, 4 refunded.
+    env.ledger().set_timestamp(1_100);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
+
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_remaining_calls_and_locked_balance_are_zero_after_revoke_expired_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &lease_id);
+
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+}
+
+#[test]
+fn test_derived_lease_views_report_unknown_lease() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(
+        ctx.registry.try_remaining_calls(&42),
+        Err(Ok(Error::LeaseNotFound))
+    );
+    assert_eq!(
+        ctx.registry.try_locked_balance(&42),
+        Err(Ok(Error::LeaseNotFound))
+    );
+}
+
+#[test]
+fn test_service_count_after_each_kind_of_mutation() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(ctx.registry.service_count(), 0);
+
+    let first = register_default_service(&env, &ctx);
+    assert_eq!(ctx.registry.service_count(), 1);
+
+    let second = register_default_service(&env, &ctx);
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    // Mutating an existing service is not a registration.
+    ctx.registry
+        .set_service_active(&ctx.provider, &first, &false);
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    ctx.registry
+        .update_service(&ctx.provider, &first, &150, &endpoint_hash(&env));
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    ctx.registry
+        .set_service_active(&ctx.provider, &first, &true);
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    // A rejected registration allocates no id.
+    assert_eq!(
+        ctx.registry
+            .try_register_service(&ctx.provider, &0, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(ctx.registry.service_count(), 2);
+    assert_eq!(ctx.registry.get_service(&second).service_id, second);
+}
+
+#[test]
+fn test_lease_count_after_each_kind_of_mutation() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    let first = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    assert_eq!(ctx.registry.lease_count(), 1);
+
+    let second = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &5, &100);
+    assert_eq!(ctx.registry.lease_count(), 2);
+
+    // Settlement is a lease mutation, not a creation.
+    ctx.registry.settle_lease(&ctx.provider, &first, &10);
+    assert_eq!(ctx.registry.lease_count(), 2);
+
+    // Neither is a revoke.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &second);
+    assert_eq!(ctx.registry.lease_count(), 2);
+
+    // A rejected create allocates no id either.
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &0, &3_600),
+        Err(Ok(Error::InvalidCalls))
+    );
+    assert_eq!(ctx.registry.lease_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
 // Soroban contract events
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_init_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let registry_id = env.register(KeyLeaseRegistry, ());
+    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
+
+    registry.init(&admin);
+
+    assert_single_event(
+        &env,
+        &registry_id,
+        &RegistryInitialized {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin,
+        },
+    );
+}
 
 #[test]
 fn test_set_token_emits_event() {
@@ -786,8 +1118,7 @@ fn test_service_status_change_emits_event() {
 fn test_lease_lifecycle_emits_events() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
 
     let lease_id = ctx
         .registry
@@ -804,6 +1135,7 @@ fn test_lease_lifecycle_emits_events() {
             allocated_calls: 10,
             expires_at: 4_600,
             locked_deposit: RATE * 10,
+            rate_per_call: RATE,
         },
     );
 
@@ -865,22 +1197,154 @@ fn test_version_matches_contract_metadata() {
 }
 
 #[test]
-fn test_upgrade_is_admin_only() {
+fn test_propose_upgrade_records_hash_and_execution_ledger() {
     let env = Env::default();
-    let ctx = setup(&env);
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    // Read events before any further invocation: the host resets them per call.
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &UpgradeProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            new_wasm_hash: new_wasm_hash.clone(),
+            execute_after: 1_000 + UPGRADE_DELAY_SECS,
+        },
+    );
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.execute_after, 1_000 + UPGRADE_DELAY_SECS);
+}
+
+#[test]
+fn test_execute_upgrade_before_delay_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    // One second short of the recorded execution ledger.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS - 1);
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::UpgradeDelayNotElapsed))
+    );
+    // A failed execution must not consume the proposal.
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.execute_after, 1_000 + UPGRADE_DELAY_SECS);
+}
+
+#[test]
+fn test_execute_upgrade_after_delay_reports_hash_and_ledger() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let wasm_hash = env.deployer().upload_contract_wasm(UPGRADE_TEST_WASM);
+    ctx.registry.propose_upgrade(&ctx.admin, &wasm_hash);
+
+    // At the recorded ledger, execution becomes legal.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    ctx.registry.execute_upgrade(&ctx.admin);
+
+    // The install swaps the contract code, so all registry reads happen before
+    // execution. Host-level events remain readable afterwards.
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &ContractUpgraded {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            new_wasm_hash: wasm_hash,
+            execute_after: 1_000 + UPGRADE_DELAY_SECS,
+        },
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_prevents_execution() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    ctx.registry.cancel_upgrade(&ctx.admin);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &UpgradeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            new_wasm_hash: new_wasm_hash.clone(),
+        },
+    );
+    assert!(ctx.registry.get_pending_upgrade().is_none());
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::NoPendingUpgrade))
+    );
+}
+
+#[test]
+fn test_upgrade_entry_points_are_admin_only() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
     let impostor = Address::generate(&env);
     let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
 
     assert_eq!(
-        ctx.registry.try_upgrade(&impostor, &new_wasm_hash),
+        ctx.registry.try_propose_upgrade(&impostor, &new_wasm_hash),
         Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_cancel_upgrade(&impostor),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&impostor),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(ctx.registry.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn test_reproposal_restarts_the_delay() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let first_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let second_hash = BytesN::from_array(&env, &[2u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &first_hash);
+
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS - 1);
+    ctx.registry.propose_upgrade(&ctx.admin, &second_hash);
+
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_eq!(
+        pending.execute_after,
+        1_000 + UPGRADE_DELAY_SECS - 1 + UPGRADE_DELAY_SECS
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::UpgradeDelayNotElapsed))
     );
 }
 
 // A successful upgrade installs a real Wasm uploaded with
 // `stellar contract upload`, which the unit-test host cannot fabricate (it
 // requires a valid `contractspecv0` metadata section). The success path is
-// exercised end to end by `scripts/deploy-testnet.sh --upgrade` against
+// exercised end to end by `scripts/upgrade.sh` against
 // Testnet; here we pin the authorization guard.
 
 #[test]

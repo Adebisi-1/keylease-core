@@ -44,6 +44,35 @@ Any SEP-41 token can be configured instead with `set_token`; the derive command
 above is only for the native asset. The admin must call `set_token` before any
 lease can be created (`TokenNotSet` otherwise).
 
+## Native SAC vs. Custom SEP-41 Token
+
+KeyLease accepts any contract implementing the SEP-41 token standard. Operators
+evaluating which asset to configure should consider the architectural and
+operational trade-offs:
+
+| Characteristic | Native SAC (XLM) | Custom SEP-41 Token / Classic SAC |
+| --- | --- | --- |
+| **Issuance** | Native protocol asset built into the Stellar consensus layer | Minted by an issuer account (classic asset wrapper) or custom token contract |
+| **Trustlines** | None required; every funded Stellar account natively holds XLM | Classic assets require explicit trustlines (`ChangeTrust`); contract-native tokens manage balances internally |
+| **Decimals** | Fixed at 7 decimals (`1 stroop = 0.0000001 XLM`) | Configurable (commonly 7 for classic wrapped assets, 6 for USDC, or 18 for EVM-style tokens) |
+| **Admin controls** | None. No freeze, no clawback, no issuer key, no upgradeability | Issuer may configure clawback, authorization flags (`auth_required`), pausing, or contract upgradeability |
+| **Escrow guarantees** | Escrow lock and transfer are guaranteed by host runtime; zero re-entrancy or transfer-failure risk | Follows identical SEP-41 contract interface, but subject to issuer freeze, clawback, or contract bugs |
+
+### Escrow guarantees and risk profile
+
+From KeyLease's perspective, both token types interact through the same standard
+interface (`token::Client`). Escrow invariants (`payout + refund == locked_deposit`)
+hold equally across both.
+
+However, external contract risk differs:
+- **Native SAC**: The transfer cannot be blocked, paused, or redirected by any third party.
+- **Custom Token**: If a custom token contract fails, pauses, or blacklists a participant, calls to `settle_lease` or `revoke_expired_lease` will revert. KeyLease uses checks-effects-interactions (`lease.settled = true` persisted *before* transfer) to prevent double-spend or re-entrancy attacks, but cannot force a failing external token to execute transfers.
+
+### Deployment recommendations
+
+- **Testnet**: Use the **Native SAC (XLM)**. It requires zero setup, is automatically derived from the network passphrase, and accounts can be funded immediately via Friendbot.
+- **Mainnet**: Use **USDC via SAC** for commercial API and RPC leases where price volatility between fiat costs and crypto balances is undesirable. Use **Native SAC (XLM)** for network infrastructure services, peer-to-peer compute, or micro-metered telemetry where native settlement is preferred.
+
 ## Funding accounts
 
 Friendbot funds accounts and contracts with **10,000 fake XLM** on Testnet:

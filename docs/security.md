@@ -10,7 +10,7 @@ reporting a vulnerability, see
 | Assumption | Consequence if violated |
 | --- | --- |
 | The admin configures a well-behaved SEP-41 token. | A malicious token contract could revert transfers and stall settlement. It cannot be paid twice: `settled` is persisted before the transfer, and a re-entrant token is rejected (`LeaseAlreadySettled`). |
-| The admin does not upgrade to a malicious Wasm. | An upgrade can change the contract logic. The admin key should be cold or multisig; upgrades emit `contract_upgraded`. |
+| The admin does not upgrade to a malicious Wasm. | An upgrade can change the contract logic. The admin key should be cold or multisig. Upgrades now require a 24h on-ledger delay and emit `upgrade_proposed` with the hash and execution ledger, so consumers can exit; execution emits `contract_upgraded`. |
 | The provider reports `verified_calls` honestly. | It can under-report (it gets paid less) but never over-report past `allocated_calls`. |
 | Soroban ledger time is monotonic and honest. | Validity windows would be unreliable. |
 | Consumers keep their own key safe. | Anyone with the consumer key can create leases that spend its balance. |
@@ -80,7 +80,33 @@ violation.
 | Duration overflow wraps expiry | `checked_add` → `Overflow` |
 | Long lease is evicted from storage | `DurationTooLong` + duration-aware TTL extension |
 | Fake "KeyLease" contract id | Only ids in [Deployments](deployments.md) are ours |
-| Silent logic change on upgrade | Admin-only, emits `contract_upgraded`, `contractmeta!` exposes the version |
+| Silent logic change on upgrade | 24h delay + admin-only execution, emits `upgrade_proposed`/`contract_upgraded`, `contractmeta!` exposes the version |
+
+## Running with a multisig admin
+
+KeyLease stores the admin as a standard Soroban `Address`. In production, operators
+should avoid using a single hot keypair for the admin role. Instead, the admin
+can be a native Stellar multi-signature account (`G...`) or a multisig smart contract.
+
+### Host-enforced authentication
+
+When `admin.require_auth()` is called inside `set_token` or `upgrade`:
+- If `admin` is a Stellar account, Soroban's runtime delegates authentication to
+  Stellar's native account signing engine.
+- If the account is configured with multi-signature weights and operation thresholds
+  (e.g., medium threshold for contract invocations), the Stellar host requires
+  signatures that satisfy the threshold before the invocation transaction can execute.
+- The contract does not need special multisig code; multi-signature security is
+  enforced natively at the protocol host layer.
+
+### What the contract can and cannot enforce
+
+| Scope | Contract capability | Details |
+| --- | --- | --- |
+| **Can enforce** | Execution authority (`require_auth`) | Ensures that the admin account legitimately approved the call based on Stellar's consensus rules |
+| **Cannot enforce** | Signer composition | The contract cannot inspect individual signers, public keys, or individual weights |
+| **Cannot enforce** | Minimum threshold | The contract cannot verify whether the admin account is 1-of-1, 2-of-3, or 3-of-5 |
+| **Cannot enforce** | Signer set immutability | Signers and thresholds can be modified on the Stellar account via standard `SetOptions` operations without contract interaction |
 
 ## Audit status
 
@@ -186,9 +212,9 @@ fake XLM; on Mainnet it costs someone's deposit.
 
 These are real and tracked as Drips Wave issues rather than hidden.
 
-- **Upgrade trust.** The admin can replace the contract Wasm. This is a
-  deliberate operational capability, but it means a compromised admin key can
-  change protocol rules. A timelock or multisig requirement is future work.
+- **Upgrade trust.** The admin can replace the contract Wasm. While using a multisig
+  admin prevents a single compromised key from executing an unauthorized upgrade,
+  adding an on-chain timelock to upgrades remains future work.
 - **No provider key rotation.** A service is bound to the address that registered
   it. Transferring a service is a `wave-medium` issue.
 - **No rate updates.** Changing `rate_per_call` requires registering a new
@@ -204,7 +230,7 @@ These are real and tracked as Drips Wave issues rather than hidden.
 
 - Only trust contract ids in [`docs/deployments.md`](deployments.md).
 - The admin key should be a cold or multisig Stellar account. It can change the
-  escrow token and upgrade the contract.
+  escrow token and propose/cancel upgrades, but execution waits 24h on-ledger.
 - Verify the deployed metadata and configuration after deploy:
 
 ```bash
