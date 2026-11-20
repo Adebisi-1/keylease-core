@@ -15,6 +15,8 @@
 //! | `init`, `upgrade`, `register_service` | extend | — | — |
 //! | `set_token` | extend, unless the token is unchanged | — | — |
 //! | `set_service_active` | — | extend (save) | — |
+//! | `set_service_attestor` | — | attestor entry extends when set, is removed when cleared | — |
+//! | `set_service_attestor` | — | attestor entry extends when set, is removed when cleared | — |
 //! | `create_lease` | extend | extend | extend (save) |
 //! | `settle_lease`, `revoke_expired_lease` | — | — | extend (save) |
 //! | [`crate::KeyLeaseRegistry::bump_service`] | — | extend | — |
@@ -26,7 +28,7 @@
 //! merely *read* for months has to be bumped explicitly, which is what the two
 //! `bump_*` entry points are for.
 
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 use crate::errors::Error;
 use crate::types::{Lease, PendingUpgrade, Service};
@@ -94,9 +96,12 @@ pub enum DataKey {
     Service(u64),
     /// `Lease` by id (persistent storage).
     Lease(u64),
-    /// Pending, time-locked Wasm upgrade (instance storage). Append-only:
-    /// existing keys keep their wire encoding.
-    PendingUpgrade,
+    /// Optional ed25519 attestor key for a service (persistent storage).
+    ///
+    /// Kept out of [`Service`] on purpose: `Service` is a stored struct, so a
+    /// new field would change the encoding of every existing service entry. A
+    /// new key is invisible until the provider opts the service in.
+    ServiceAttestor(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -198,13 +203,55 @@ pub fn save_service(env: &Env, service: &Service) {
 /// Bump a service entry's TTL without reading it back to the caller.
 ///
 /// This is the only path that extends a service's lifetime other than saving
-/// it; [`get_service`] is a pure lookup.
+/// it; [`get_service`] is a pure lookup. The service's attestor entry, when it
+/// has one, is carried along: a lease keeps the service it leases from alive,
+/// and the attestor key decides whether a settlement needs a signature, so the
+/// two must not drift apart on the same call.
 pub fn extend_service_ttl(env: &Env, service_id: u64) {
-    let key = DataKey::Service(service_id);
     let extend_to = LEDGER_BUMP_EXTEND.min(ttl_ceiling(env));
+    env.storage().persistent().extend_ttl(
+        &DataKey::Service(service_id),
+        LEDGER_BUMP_THRESHOLD,
+        extend_to,
+    );
+
+    let attestor_key = DataKey::ServiceAttestor(service_id);
+    if env.storage().persistent().has(&attestor_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&attestor_key, LEDGER_BUMP_THRESHOLD, extend_to);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optional attestor
+// ---------------------------------------------------------------------------
+
+/// Register, replace or clear the ed25519 attestor key of a service.
+///
+/// `None` removes the entry, which is also how a service opts back out: no
+/// attestor key means `settle_lease` needs no signature, exactly as before this
+/// feature existed.
+pub fn set_service_attestor(env: &Env, service_id: u64, attestor: Option<&BytesN<32>>) {
+    let key = DataKey::ServiceAttestor(service_id);
+    match attestor {
+        Some(attestor) => {
+            env.storage().persistent().set(&key, attestor);
+            let extend_to = LEDGER_BUMP_EXTEND.min(ttl_ceiling(env));
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, extend_to);
+        }
+        None => env.storage().persistent().remove(&key),
+    }
+}
+
+/// Pure lookup for a service's attestor key. An absent entry means the service
+/// has not opted in to attestation.
+pub fn get_service_attestor(env: &Env, service_id: u64) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
-        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, extend_to);
+        .get(&DataKey::ServiceAttestor(service_id))
 }
 
 /// Pure lookup: reads a service and touches no storage metadata.
