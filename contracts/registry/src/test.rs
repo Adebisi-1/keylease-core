@@ -830,6 +830,199 @@ fn test_lease_status_unknown_lease() {
 }
 
 // ---------------------------------------------------------------------------
+// Derived views across every lease state
+//
+// `remaining_calls` and `locked_balance` encode protocol semantics (what a
+// consumer may still use, what is still owed), so they are pinned here for each
+// state instead of only being read incidentally by the lifecycle tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_remaining_calls_equals_allocated_calls_immediately_after_create_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Two leases on the same service: the view is per lease, not per service.
+    let first = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &7, &3_600);
+    let second = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &25, &3_600);
+
+    assert_eq!(ctx.registry.remaining_calls(&first), 7);
+    assert_eq!(ctx.registry.remaining_calls(&second), 25);
+    assert_eq!(ctx.registry.lease_status(&first), LeaseStatus::Active);
+    assert_eq!(ctx.registry.lease_status(&second), LeaseStatus::Active);
+
+    // Nothing has been consumed or settled, so the full deposit is still locked.
+    let lease = ctx.registry.get_lease(&first);
+    assert_eq!(lease.used_calls, 0);
+    assert_eq!(ctx.registry.locked_balance(&first), lease.locked_deposit);
+}
+
+#[test]
+fn test_remaining_calls_is_zero_at_and_after_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    // One second before expiry the full allotment is still usable.
+    env.ledger().set_timestamp(1_099);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 10);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+
+    // Expiry is inclusive: at `expires_at` nothing remains.
+    env.ledger().set_timestamp(1_100);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Expired);
+
+    // And it stays zero afterwards.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+
+    // Expiry does not release escrow: an unsettled lease still owes its deposit
+    // until the provider settles or the consumer revokes.
+    assert_eq!(
+        ctx.registry.locked_balance(&lease_id),
+        RATE * 10,
+        "expired but unsettled leases still hold the deposit"
+    );
+}
+
+#[test]
+fn test_remaining_calls_and_locked_balance_are_zero_after_settle_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    // Expired, partially consumed settlement: 6 paid, 4 refunded.
+    env.ledger().set_timestamp(1_100);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
+
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_remaining_calls_and_locked_balance_are_zero_after_revoke_expired_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &lease_id);
+
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+}
+
+#[test]
+fn test_derived_lease_views_report_unknown_lease() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(
+        ctx.registry.try_remaining_calls(&42),
+        Err(Ok(Error::LeaseNotFound))
+    );
+    assert_eq!(
+        ctx.registry.try_locked_balance(&42),
+        Err(Ok(Error::LeaseNotFound))
+    );
+}
+
+#[test]
+fn test_service_count_after_each_kind_of_mutation() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(ctx.registry.service_count(), 0);
+
+    let first = register_default_service(&env, &ctx);
+    assert_eq!(ctx.registry.service_count(), 1);
+
+    let second = register_default_service(&env, &ctx);
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    // Mutating an existing service is not a registration.
+    ctx.registry
+        .set_service_active(&ctx.provider, &first, &false);
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    ctx.registry
+        .update_service(&ctx.provider, &first, &150, &endpoint_hash(&env));
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    ctx.registry
+        .set_service_active(&ctx.provider, &first, &true);
+    assert_eq!(ctx.registry.service_count(), 2);
+
+    // A rejected registration allocates no id.
+    assert_eq!(
+        ctx.registry
+            .try_register_service(&ctx.provider, &0, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(ctx.registry.service_count(), 2);
+    assert_eq!(ctx.registry.get_service(&second).service_id, second);
+}
+
+#[test]
+fn test_lease_count_after_each_kind_of_mutation() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    let first = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    assert_eq!(ctx.registry.lease_count(), 1);
+
+    let second = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &5, &100);
+    assert_eq!(ctx.registry.lease_count(), 2);
+
+    // Settlement is a lease mutation, not a creation.
+    ctx.registry.settle_lease(&ctx.provider, &first, &10);
+    assert_eq!(ctx.registry.lease_count(), 2);
+
+    // Neither is a revoke.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &second);
+    assert_eq!(ctx.registry.lease_count(), 2);
+
+    // A rejected create allocates no id either.
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &0, &3_600),
+        Err(Ok(Error::InvalidCalls))
+    );
+    assert_eq!(ctx.registry.lease_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
 // Soroban contract events
 // ---------------------------------------------------------------------------
 
