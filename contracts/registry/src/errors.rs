@@ -44,4 +44,15 @@ pub enum Error {
     /// multiplication fit in `i128`, the amount is simply too large to escrow
     /// in a single lease.
     DepositTooLarge = 17,
+    /// The service has no attestor configured, so `settle_lease_attested` is the
+    /// wrong entry point for it. Plain `settle_lease` is.
+    AttestorNotConfigured = 18,
+    /// The service requires an attestation, and plain `settle_lease` cannot
+    /// supply one.
+    AttestationRequired = 19,
+    /// The attestation is for a different lease, service or call count than the
+    /// settlement it is presented with.
+    AttestationMismatch = 20,
+    /// The attestation's `valid_until` has already passed.
+    AttestationStale = 21,
 }

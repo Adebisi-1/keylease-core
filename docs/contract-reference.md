@@ -162,7 +162,10 @@ Lock a deposit and mint a time-bound lease.
 - **Returns:** the new `lease_id` (monotonic, starts at `1`).
 - **State:** writes `Lease(lease_id)` with `expires_at = ledger.timestamp() +
   duration_secs` and a TTL covering the term plus grace; increments `LeaseCount`.
-- **Events:** `lease_created { lease_id, service_id, consumer, allocated_calls, expires_at, locked_deposit }`.
+- **Events:** `lease_created { lease_id, service_id, consumer, allocated_calls,
+  expires_at, locked_deposit, rate_per_call }`. `rate_per_call` is a snapshot
+  taken at creation, so indexers can interpret `locked_deposit` without reading
+  the service at the event's ledger.
 - **Errors:** `InvalidCalls`, `InvalidDuration`, `DurationTooLong`,
   `ServiceNotFound`, `ServiceInactive`, `InvalidRate`, `TokenNotSet`, `Overflow`,
   `DepositTooLarge`.
