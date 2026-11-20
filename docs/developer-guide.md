@@ -50,7 +50,8 @@ malware scan over the checkout and the built Wasm artifacts. CI job names are
 | `contracts/registry/src/errors.rs` | Stable `Error` codes (never reuse a number). |
 | `contracts/registry/src/test.rs` | Lifecycle, SAC, events, upgrade and re-entrancy tests. |
 | `contracts/mock_token/` | Test/sandbox SEP-41 token. |
-| `scripts/deploy-testnet.sh` | Sequential testnet deploy and upgrade. |
+| `scripts/deploy-testnet.sh` | Sequential testnet deploy. |
+| `scripts/upgrade.sh` | Build, upload, upgrade and verify `version()` of a deployed registry. |
 | `scripts/create-issues.sh` | Batch Wave backlog creation. |
 | `scripts/setup-repo.sh` | Topics, labels, branch protection. |
 

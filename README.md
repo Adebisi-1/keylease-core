@@ -87,7 +87,8 @@ keylease-core/
 │   │   └── Cargo.toml
 │   └── mock_token/        # minimal SEP-41 token for tests & local sandboxes
 ├── scripts/
-│   ├── deploy-testnet.sh  # sequential testnet deploy / upgrade
+│   ├── deploy-testnet.sh  # sequential testnet deploy
+│   ├── upgrade.sh         # build, upload, upgrade, verify version()
 │   ├── create-issues.sh   # batch Wave backlog creation (templates + 130-issue PSV)
 │   └── setup-repo.sh      # topics, labels, branch protection
 ├── docs/                  # Stellar-native protocol docs, guides and references
@@ -209,6 +210,13 @@ stellar contract invoke --id $REGISTRY --network testnet --source-account keylea
 stellar contract invoke --id $REGISTRY --network testnet --source-account keylease-admin \
   --send=yes -- register_service \
      --provider $PROVIDER --rate_per_call 1000000 --endpoint_hash <64_HEX_CHARS>
+```
+
+Upgrade an existing deployment in place (build → upload → `upgrade` → check
+`version()` against the workspace version):
+
+```bash
+./scripts/upgrade.sh --contract-id C... --admin keylease-admin
 ```
 
 `--send=yes` is required for state-changing calls. Deployed addresses are
