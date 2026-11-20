@@ -40,4 +40,8 @@ pub enum Error {
     /// Lease duration exceeds `MAX_LEASE_DURATION_SECS`, so its storage entry
     /// could not be kept alive for the whole term.
     DurationTooLong = 16,
+    /// Deposit exceeds `MAX_LEASE_DEPOSIT`. Distinct from `Overflow`: the
+    /// multiplication fit in `i128`, the amount is simply too large to escrow
+    /// in a single lease.
+    DepositTooLarge = 17,
 }
