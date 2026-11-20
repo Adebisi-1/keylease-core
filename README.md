@@ -88,6 +88,7 @@ keylease-core/
 │   └── mock_token/        # minimal SEP-41 token for tests & local sandboxes
 ├── scripts/
 │   ├── deploy-testnet.sh  # sequential testnet deploy / upgrade
+│   ├── check-no-std.sh    # CI guard: release Wasm has no std, crates forbid unsafe
 │   ├── create-issues.sh   # batch Wave backlog creation (templates + 130-issue PSV)
 │   └── setup-repo.sh      # topics, labels, branch protection
 ├── docs/                  # Stellar-native protocol docs, guides and references
@@ -108,6 +109,7 @@ keylease-core/
 | `upgrade(admin, new_wasm_hash)` | `admin` | Install a new Wasm through the Soroban deployer. Emits `contract_upgraded`. |
 | `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. Returns `service_id`. Emits `service_registered`. |
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
+| `update_service(provider, service_id, rate_per_call, endpoint_hash) -> service_id` | `provider` | Update rate and endpoint hash for a service. Emits `service_rate_updated`. Only the owning provider may call this. Existing leases keep their original rate. |
 | `create_lease(consumer, service_id, requested_calls, duration_secs) -> u64` | `consumer` | Lock `rate × calls` and mint a lease. Emits `lease_created`. |
 | `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder. Emits `lease_settled`. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
@@ -171,6 +173,7 @@ cargo test --all
 # 3. Lint the way CI does
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 
 # 4. Produce deployable Soroban WASM
 cargo build --target wasm32v1-none --release --all
@@ -209,6 +212,13 @@ stellar contract invoke --id $REGISTRY --network testnet --source-account keylea
 stellar contract invoke --id $REGISTRY --network testnet --source-account keylease-admin \
   --send=yes -- register_service \
      --provider $PROVIDER --rate_per_call 1000000 --endpoint_hash <64_HEX_CHARS>
+```
+
+Upgrade an existing deployment in place (build → upload → `upgrade` → check
+`version()` against the workspace version):
+
+```bash
+./scripts/upgrade.sh --contract-id C... --admin keylease-admin
 ```
 
 `--send=yes` is required for state-changing calls. Deployed addresses are
