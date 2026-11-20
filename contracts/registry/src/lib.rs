@@ -50,8 +50,9 @@
 //!   duration plus the grace period whenever it is written, so escrow cannot
 //!   fall off the ledger. Reads never extend: `bump_lease` and `bump_service`
 //!   keep an entry alive on their own terms (see [`storage`]).
-//! * **Wasm upgrades** — the admin can install a new Wasm through the Soroban
-//!   deployer, and `contractmeta!` identifies the running version on-chain.
+//! * **Wasm upgrades** — the admin proposes a new Wasm through the Soroban
+//!   deployer and may only execute it after a 24-hour on-ledger delay, giving
+//!   consumers time to exit; `contractmeta!` identifies the running version.
 
 mod errors;
 mod events;
@@ -61,15 +62,18 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod test_wasm;
+
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String};
 
 pub use crate::errors::Error;
 pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
     RegistryInitialized, ServiceAttestorSet, ServiceRateUpdated, ServiceRegistered,
-    ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
-pub use crate::types::{Lease, LeaseStatus, Service, UsageAttestation};
+pub use crate::types::{Lease, LeaseStatus, PendingUpgrade, Service, UsageAttestation};
 
 // On-chain contract metadata, readable from the ledger without the source.
 soroban_sdk::contractmeta!(key = "name", val = "KeyLeaseRegistry");
@@ -89,6 +93,13 @@ soroban_sdk::contractmeta!(
 /// Grace period after lease expiry during which the provider may still settle.
 /// After this window elapses, the consumer may reclaim the full deposit.
 pub const SETTLE_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60;
+
+/// Mandatory wait between proposing and executing a Wasm upgrade.
+///
+/// The delay is the consumers' exit window: a proposal is public for 24 hours
+/// on-ledger before any new rules can take effect, so a lease created under the
+/// current code can be settled before the contract changes underneath it.
+pub const UPGRADE_DELAY_SECS: u64 = 24 * 60 * 60;
 
 /// Longest lease the TTL policy is guaranteed to keep alive.
 ///
@@ -246,9 +257,21 @@ impl KeyLeaseRegistry {
     ) -> Result<(), Error> {
         admin.require_auth();
         require_admin(&env, &admin)?;
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-        ContractUpgraded {
+
+        let execute_after = env
+            .ledger()
+            .timestamp()
+            .checked_add(UPGRADE_DELAY_SECS)
+            .ok_or(Error::Overflow)?;
+        storage::set_pending_upgrade(
+            &env,
+            &PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                execute_after,
+            },
+        );
+        storage::extend_instance_ttl(&env);
+        UpgradeProposed {
             schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             new_wasm_hash,
@@ -270,6 +293,7 @@ impl KeyLeaseRegistry {
         storage::remove_pending_upgrade(&env);
         storage::extend_instance_ttl(&env);
         UpgradeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             new_wasm_hash: pending.new_wasm_hash,
         }
@@ -302,6 +326,7 @@ impl KeyLeaseRegistry {
         storage::remove_pending_upgrade(&env);
         storage::extend_instance_ttl(&env);
         ContractUpgraded {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             new_wasm_hash: pending.new_wasm_hash.clone(),
             execute_after: pending.execute_after,

@@ -213,6 +213,8 @@ pub struct LeaseRevoked {
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeProposed {
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
     /// Admin that proposed the upgrade.
     pub admin: Address,
     /// Hash of the Wasm that will be installed.
@@ -225,6 +227,8 @@ pub struct UpgradeProposed {
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeCancelled {
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
     /// Admin that cancelled the upgrade.
     pub admin: Address,
     /// Hash of the Wasm that will no longer be installed.

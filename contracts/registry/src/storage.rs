@@ -32,7 +32,7 @@ use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 use crate::errors::Error;
 use crate::types::{Lease, PendingUpgrade, Service};
-use crate::{MAX_LEASE_DURATION_SECS, SETTLE_GRACE_PERIOD_SECS};
+use crate::SETTLE_GRACE_PERIOD_SECS;
 
 /// Expected Stellar ledger close time, used to translate lease durations into
 /// ledger counts for TTL extension.
@@ -102,6 +102,9 @@ pub enum DataKey {
     /// new field would change the encoding of every existing service entry. A
     /// new key is invisible until the provider opts the service in.
     ServiceAttestor(u64),
+    /// Pending, time-locked Wasm upgrade (instance storage). Append-only:
+    /// existing keys keep their wire encoding.
+    PendingUpgrade,
 }
 
 // ---------------------------------------------------------------------------

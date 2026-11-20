@@ -7,13 +7,15 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, RegistryInitialized,
-    ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
+    RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
+    UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{self, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
+use crate::test_wasm::UPGRADE_TEST_WASM;
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS,
+    MAX_LEASE_DURATION_SECS, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -1208,6 +1210,7 @@ fn test_propose_upgrade_records_hash_and_execution_ledger() {
         &env,
         &ctx.registry_id(),
         &UpgradeProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: ctx.admin.clone(),
             new_wasm_hash: new_wasm_hash.clone(),
             execute_after: 1_000 + UPGRADE_DELAY_SECS,
@@ -1256,6 +1259,7 @@ fn test_execute_upgrade_after_delay_reports_hash_and_ledger() {
         &env,
         &ctx.registry_id(),
         &ContractUpgraded {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: ctx.admin.clone(),
             new_wasm_hash: wasm_hash,
             execute_after: 1_000 + UPGRADE_DELAY_SECS,
@@ -1277,6 +1281,7 @@ fn test_cancel_upgrade_prevents_execution() {
         &env,
         &ctx.registry_id(),
         &UpgradeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
             admin: ctx.admin.clone(),
             new_wasm_hash: new_wasm_hash.clone(),
         },

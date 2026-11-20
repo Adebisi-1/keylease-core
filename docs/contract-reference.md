@@ -84,7 +84,7 @@ Queue a Wasm upgrade behind the mandatory `UPGRADE_DELAY_SECS` (24h) delay.
   `stellar contract upload`.
 - **State:** writes `PendingUpgrade { new_wasm_hash, execute_after }`; a new
   proposal replaces the old one and restarts the delay.
-- **Events:** `upgrade_proposed { admin, new_wasm_hash, execute_after }`.
+- **Events:** `upgrade_proposed { schema_version, admin, new_wasm_hash, execute_after }`.
 - **Errors:** `NotInitialized`, `Unauthorized`, `Overflow`.
 - **Notes:** `execute_after` is a ledger timestamp. Consumers can read it with
   `get_pending_upgrade` and exit before it is reached.
@@ -99,7 +99,7 @@ Drop a pending proposal without installing any code.
 
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
 - **Effects:** removes `PendingUpgrade`.
-- **Events:** `upgrade_cancelled { admin, new_wasm_hash }`.
+- **Events:** `upgrade_cancelled { schema_version, admin, new_wasm_hash }`.
 - **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`.
 
 ### `execute_upgrade`
@@ -113,7 +113,7 @@ Install the proposed Wasm through `env.deployer().update_current_contract_wasm`.
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
 - **Preconditions:** a proposal exists and `ledger.timestamp() >= execute_after`.
 - **Effects:** removes `PendingUpgrade` and installs the proposed hash.
-- **Events:** `contract_upgraded { admin, new_wasm_hash, execute_after }`.
+- **Events:** `contract_upgraded { schema_version, admin, new_wasm_hash, execute_after }`.
 - **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`,
   `UpgradeDelayNotElapsed`.
 - **Notes:** the contract id, storage and balances are preserved, so an upgrade
@@ -491,6 +491,12 @@ never reused.
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
 | 17 | `DepositTooLarge` | deposit above `MAX_LEASE_DEPOSIT` |
+| 18 | `AttestorNotConfigured` | `settle_lease_attested` on a service with no attestor |
+| 19 | `AttestationRequired` | plain `settle_lease` on a service that requires one |
+| 20 | `AttestationMismatch` | attestation does not match the lease, service or calls |
+| 21 | `AttestationStale` | attestation's `valid_until` has passed |
+| 22 | `NoPendingUpgrade` | `cancel_upgrade`/`execute_upgrade` with no proposal |
+| 23 | `UpgradeDelayNotElapsed` | `execute_upgrade` before `execute_after` |
 
 ## Invoking with the Stellar CLI
 
