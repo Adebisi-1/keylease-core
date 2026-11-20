@@ -55,4 +55,8 @@ pub enum Error {
     AttestationMismatch = 20,
     /// The attestation's `valid_until` has already passed.
     AttestationStale = 21,
+    /// There is no pending upgrade to execute or cancel.
+    NoPendingUpgrade = 22,
+    /// The proposed upgrade is still inside its mandatory delay window.
+    UpgradeDelayNotElapsed = 23,
 }

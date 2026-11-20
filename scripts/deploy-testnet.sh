@@ -61,8 +61,10 @@ KEYLEASE_GENERATE_KEY="${KEYLEASE_GENERATE_KEY:-}"
 MODE="deploy"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --upgrade) MODE="upgrade" ;;
-    --deploy)  MODE="deploy" ;;
+    --upgrade)         MODE="upgrade" ;;
+    --execute-upgrade) MODE="execute-upgrade" ;;
+    --cancel-upgrade)  MODE="cancel-upgrade" ;;
+    --deploy)          MODE="deploy" ;;
     -h|--help)
       sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
@@ -110,9 +112,58 @@ ADMIN="${ADMIN:-$(stellar keys address "$SOURCE_ACCOUNT")}"
 PROVIDER="${PROVIDER:-$ADMIN}"
 
 # ---------------------------------------------------------------------------
-# Upgrade mode: build -> upload -> upgrade an existing contract id
+# Upgrade modes: propose -> wait 24h -> execute (or cancel)
 # ---------------------------------------------------------------------------
 
+ KeyLeaseRegistry upgrade proposed on $NETWORK
+ KEYLEASE_CONTRACT_ID=$REGISTRY
+ wasm hash            = $WASM_HASH
+ The Wasm is NOT installed yet. Execution is legal only at/after the
+ execute_after ledger timestamp printed above (24h after this proposal).
+ Consumers can watch upgrade_proposed / get_pending_upgrade and settle or
+ revoke in-flight leases during that window.
+ Next steps
+   - Execute after the delay:
+       REGISTRY=$REGISTRY $0 --execute-upgrade
+   - Cancel the proposal instead:
+       REGISTRY=$REGISTRY $0 --cancel-upgrade
+EOF
+  exit 0
+fi
+
+if [ "$MODE" = "execute-upgrade" ]; then
+  require_registry
+
+  step "Executing pending upgrade on $REGISTRY"
+  stellar contract invoke \
+    --id "$REGISTRY" \
+    --source-account "$SOURCE_ACCOUNT" \
+    --network "$NETWORK" \
+    --send=yes \
+    -- execute_upgrade --admin "$ADMIN"
+
+  step "Verifying on-chain version"
+  VERSION="$(stellar contract invoke \
+    --id "$REGISTRY" \
+    --source-account "$SOURCE_ACCOUNT" \
+    --network "$NETWORK" \
+    -- version | tail -n1)"
+
+  cat <<EOF
+
+ KeyLeaseRegistry upgraded on $NETWORK
+ KEYLEASE_CONTRACT_ID=$REGISTRY
+ KEYLEASE_NETWORK=$NETWORK
+ version()            = $VERSION
+ Next steps
+   - Watch the upgrade event:
+       stellar events --id $REGISTRY --network $NETWORK --start-ledger <ledger>
+   - Verify storage and balances are intact:
+       stellar contract invoke --id $REGISTRY --source-account $SOURCE_ACCOUNT \
+         --network $NETWORK -- get_service --service_id 1
+   - Explorer: https://stellar.expert/explorer/$NETWORK/contract/$REGISTRY
+EOF
+  exit 0
 if [ "$MODE" = "upgrade" ]; then
   [ -n "${REGISTRY:-}" ] || die "REGISTRY=<contract id> is required with --upgrade"
   # scripts/upgrade.sh owns the upgrade sequence: build, upload, upgrade, and a
@@ -122,6 +173,21 @@ if [ "$MODE" = "upgrade" ]; then
     --contract-id "$REGISTRY" \
     --admin "$SOURCE_ACCOUNT" \
     --network "$NETWORK"
+fi
+
+if [ "$MODE" = "cancel-upgrade" ]; then
+  require_registry
+
+  step "Cancelling pending upgrade on $REGISTRY"
+  stellar contract invoke \
+    --id "$REGISTRY" \
+    --source-account "$SOURCE_ACCOUNT" \
+    --network "$NETWORK" \
+    --send=yes \
+    -- cancel_upgrade --admin "$ADMIN"
+
+  info "pending upgrade removed; the running Wasm was not changed"
+  exit 0
 fi
 
 if [ -z "${TOKEN:-}" ]; then

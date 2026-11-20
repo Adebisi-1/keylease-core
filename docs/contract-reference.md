@@ -42,8 +42,8 @@ Initialize the registry and appoint `admin`.
 - **State:** sets `Admin`; extends instance TTL.
 - **Events:** `registry_initialized { admin }`.
 - **Errors:** `AlreadyInitialized`.
-- **Notes:** the admin can only call `set_token` and `upgrade`. It cannot move
-  user funds.
+- **Notes:** the admin can only call `set_token` and manage upgrades through the
+  propose/execute/cancel flow below. It cannot move user funds.
 
 ### `set_token`
 
@@ -67,20 +67,55 @@ Point the registry at the SEP-41 token used for every deposit and payout.
   stored-admin check still run first, so an unauthorized caller receives
   `Unauthorized` either way.
 
-### `upgrade`
+### `propose_upgrade`
 
 ```rust
-pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error>
+pub fn propose_upgrade(
+    env: Env,
+    admin: Address,
+    new_wasm_hash: BytesN<32>,
+) -> Result<(), Error>
 ```
 
-Install a new registry Wasm through the Soroban deployer.
+Queue a Wasm upgrade behind the mandatory `UPGRADE_DELAY_SECS` (24h) delay.
 
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
 - **Trigger:** a released bug fix or feature, after uploading the Wasm with
   `stellar contract upload`.
-- **Effects:** `env.deployer().update_current_contract_wasm(new_wasm_hash)`.
-- **Events:** `contract_upgraded { admin, new_wasm_hash }`.
-- **Errors:** `NotInitialized`, `Unauthorized`.
+- **State:** writes `PendingUpgrade { new_wasm_hash, execute_after }`; a new
+  proposal replaces the old one and restarts the delay.
+- **Events:** `upgrade_proposed { schema_version, admin, new_wasm_hash, execute_after }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `Overflow`.
+- **Notes:** `execute_after` is a ledger timestamp. Consumers can read it with
+  `get_pending_upgrade` and exit before it is reached.
+
+### `cancel_upgrade`
+
+```rust
+pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), Error>
+```
+
+Drop a pending proposal without installing any code.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **Effects:** removes `PendingUpgrade`.
+- **Events:** `upgrade_cancelled { schema_version, admin, new_wasm_hash }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`.
+
+### `execute_upgrade`
+
+```rust
+pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), Error>
+```
+
+Install the proposed Wasm through `env.deployer().update_current_contract_wasm`.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **Preconditions:** a proposal exists and `ledger.timestamp() >= execute_after`.
+- **Effects:** removes `PendingUpgrade` and installs the proposed hash.
+- **Events:** `contract_upgraded { schema_version, admin, new_wasm_hash, execute_after }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`,
+  `UpgradeDelayNotElapsed`.
 - **Notes:** the contract id, storage and balances are preserved, so an upgrade
   must never change the `DataKey` layout or the meaning of stored values. See
   [Deployment](deployment.md#upgrading).
@@ -342,6 +377,7 @@ performed one could not be used to price a read.
 | --- | --- | --- |
 | `get_admin` | `(env) -> Result<Address, Error>` | stored admin, else `NotInitialized` |
 | `get_token` | `(env) -> Result<Address, Error>` | escrow token, else `TokenNotSet` |
+| `get_pending_upgrade` | `(env) -> Option<PendingUpgrade>` | queued hash and execution ledger, if any |
 | `version` | `(env) -> String` | version embedded by `contractmeta!` |
 | `service_count` | `(env) -> u64` | total services ever registered |
 | `lease_count` | `(env) -> u64` | total leases ever created |
@@ -393,6 +429,11 @@ pub struct Service {
     pub endpoint_hash: BytesN<32>,
 }
 
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub execute_after: u64, // ledger timestamp
+}
+
 pub struct Lease {
     pub lease_id: u64,
     pub service_id: u64,
@@ -411,12 +452,13 @@ pub enum LeaseStatus { Active = 0, Expired = 1, Settled = 2 }
 
 ```rust
 pub enum DataKey {
-    Admin,        // instance
-    Token,        // instance
-    ServiceCount, // instance
-    LeaseCount,   // instance
-    Service(u64), // persistent
-    Lease(u64),   // persistent
+    Admin,          // instance
+    Token,          // instance
+    ServiceCount,   // instance
+    LeaseCount,     // instance
+    Service(u64),   // persistent
+    Lease(u64),     // persistent
+    PendingUpgrade, // instance (appended)
 }
 ```
 
@@ -449,6 +491,12 @@ never reused.
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
 | 17 | `DepositTooLarge` | deposit above `MAX_LEASE_DEPOSIT` |
+| 18 | `AttestorNotConfigured` | `settle_lease_attested` on a service with no attestor |
+| 19 | `AttestationRequired` | plain `settle_lease` on a service that requires one |
+| 20 | `AttestationMismatch` | attestation does not match the lease, service or calls |
+| 21 | `AttestationStale` | attestation's `valid_until` has passed |
+| 22 | `NoPendingUpgrade` | `cancel_upgrade`/`execute_upgrade` with no proposal |
+| 23 | `UpgradeDelayNotElapsed` | `execute_upgrade` before `execute_after` |
 
 ## Invoking with the Stellar CLI
 

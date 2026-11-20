@@ -83,7 +83,7 @@ keylease-core/
 │   │   │   ├── types.rs   # Service, Lease, LeaseStatus
 │   │   │   ├── storage.rs # DataKey layout + duration-aware TTL policy
 │   │   │   ├── errors.rs  # stable error codes
-│   │   │   └── test.rs    # lifecycle, SAC, events, upgrade, re-entrancy tests
+│   │   │   └── test.rs    # lifecycle, SAC, events, upgrade, TTL, re-entrancy tests
 │   │   └── Cargo.toml
 │   └── mock_token/        # minimal SEP-41 token for tests & local sandboxes
 ├── scripts/
@@ -106,7 +106,9 @@ keylease-core/
 | --- | --- | --- |
 | `init(admin)` | `admin` | One-time initialization; appoints the protocol admin. Emits `registry_initialized`. |
 | `set_token(admin, token)` | `admin` | Configure the SEP-41 escrow token (native SAC or custom). Emits `escrow_token_set`. |
-| `upgrade(admin, new_wasm_hash)` | `admin` | Install a new Wasm through the Soroban deployer. Emits `contract_upgraded`. |
+| `propose_upgrade(admin, new_wasm_hash)` | `admin` | Queue a Wasm behind the 24h delay. Emits `upgrade_proposed`. |
+| `cancel_upgrade(admin)` | `admin` | Drop a pending proposal. Emits `upgrade_cancelled`. |
+| `execute_upgrade(admin)` | `admin` | Install the proposed Wasm after the delay. Emits `contract_upgraded`. |
 | `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. Returns `service_id`. Emits `service_registered`. |
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
 | `update_service(provider, service_id, rate_per_call, endpoint_hash) -> service_id` | `provider` | Update rate and endpoint hash for a service. Emits `service_rate_updated`. Only the owning provider may call this. Existing leases keep their original rate. |
