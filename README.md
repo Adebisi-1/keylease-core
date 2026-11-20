@@ -216,6 +216,13 @@ stellar contract invoke --id $REGISTRY --network testnet --source-account keylea
      --provider $PROVIDER --rate_per_call 1000000 --endpoint_hash <64_HEX_CHARS>
 ```
 
+Upgrade an existing deployment in place (build → upload → `upgrade` → check
+`version()` against the workspace version):
+
+```bash
+./scripts/upgrade.sh --contract-id C... --admin keylease-admin
+```
+
 `--send=yes` is required for state-changing calls. Deployed addresses are
 recorded in [`docs/deployments.md`](./docs/deployments.md) — never guessed.
 Full options, upgrades and network settings are in

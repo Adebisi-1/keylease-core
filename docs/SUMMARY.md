@@ -23,6 +23,7 @@
 - [Developer guide](developer-guide.md)
 - [Deployment](deployment.md)
 - [Troubleshooting](troubleshooting.md)
+- [Protocol FAQ](faq.md)
 
 ## Project
 

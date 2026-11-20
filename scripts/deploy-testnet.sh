@@ -12,12 +12,9 @@
 #   4. stellar contract invoke -- set_token    --admin <ADMIN> --token <TOKEN>
 #   5. stellar contract invoke -- register_service --provider <P> --rate_per_call <R> --endpoint_hash <H>
 #
-# Upgrade an existing deployment in place (24h time lock):
-#   1. --upgrade          build, upload and propose (prints the execution ledger)
-#   2. wait at least 24h so consumers can settle or revoke before rules change
-#   3. --execute-upgrade  install the proposed Wasm (fails early on the contract)
-#   or --cancel-upgrade   drop the proposal before it is executed
-#   4. stellar contract invoke -- version  (verify)
+# Upgrade an existing deployment in place: use scripts/upgrade.sh, which builds,
+# uploads, invokes upgrade and checks version() against the workspace version.
+# `--upgrade` below is kept as a shortcut that hands off to it.
 #
 # Prerequisites
 #   - Rust 1.84+ with `rustup target add wasm32v1-none`
@@ -31,13 +28,7 @@
 #       -> creates + Friendbot-funds the identity first (testnet only)
 #
 #   REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --upgrade
-#       -> uploads the built Wasm and queues it behind the 24h delay
-#
-#   REGISTRY=C... ./scripts/deploy-testnet.sh --execute-upgrade
-#       -> installs the queued Wasm once the execution ledger has been reached
-#
-#   REGISTRY=C... ./scripts/deploy-testnet.sh --cancel-upgrade
-#       -> drops the queued Wasm without installing it
+#       -> runs scripts/upgrade.sh --contract-id $REGISTRY --admin $SOURCE_ACCOUNT
 #
 # Environment
 #   SOURCE_ACCOUNT          stellar CLI identity/key used to sign. Default: keylease-admin
@@ -124,51 +115,9 @@ PROVIDER="${PROVIDER:-$ADMIN}"
 # Upgrade modes: propose -> wait 24h -> execute (or cancel)
 # ---------------------------------------------------------------------------
 
-require_registry() {
-  [ -n "${REGISTRY:-}" ] || die "REGISTRY=<contract id> is required for upgrade modes"
-  printf '%s' "$REGISTRY" | grep -Eq '^C[A-Z0-9]{55}$' \
-    || die "REGISTRY must be a contract id starting with C, got: $REGISTRY"
-}
-
-if [ "$MODE" = "upgrade" ]; then
-  require_registry
-
-  step "Building Soroban Wasm (wasm32v1-none, release)"
-  build_wasm
-
-  step "Uploading registry Wasm"
-  WASM_HASH="$(stellar contract upload \
-    --wasm "$REGISTRY_WASM" \
-    --source-account "$SOURCE_ACCOUNT" \
-    --network "$NETWORK" | tail -n1)"
-
-  printf '%s' "$WASM_HASH" | grep -Eq '^[0-9a-fA-F]{64}$' \
-    || die "unexpected upload output, expected a 64-char Wasm hash: $WASM_HASH"
-  info "wasm hash: $WASM_HASH"
-
-  step "Proposing upgrade for $REGISTRY (admin = $ADMIN)"
-  stellar contract invoke \
-    --id "$REGISTRY" \
-    --source-account "$SOURCE_ACCOUNT" \
-    --network "$NETWORK" \
-    --send=yes \
-    -- propose_upgrade --admin "$ADMIN" --new_wasm_hash "$WASM_HASH"
-
-  step "Pending upgrade: Wasm hash and execution ledger"
-  stellar contract invoke \
-    --id "$REGISTRY" \
-    --source-account "$SOURCE_ACCOUNT" \
-    --network "$NETWORK" \
-    -- get_pending_upgrade
-
-  cat <<EOF
-
-============================================================================
  KeyLeaseRegistry upgrade proposed on $NETWORK
-============================================================================
  KEYLEASE_CONTRACT_ID=$REGISTRY
  wasm hash            = $WASM_HASH
-============================================================================
  The Wasm is NOT installed yet. Execution is legal only at/after the
  execute_after ledger timestamp printed above (24h after this proposal).
  Consumers can watch upgrade_proposed / get_pending_upgrade and settle or
@@ -178,7 +127,6 @@ if [ "$MODE" = "upgrade" ]; then
        REGISTRY=$REGISTRY $0 --execute-upgrade
    - Cancel the proposal instead:
        REGISTRY=$REGISTRY $0 --cancel-upgrade
-============================================================================
 EOF
   exit 0
 fi
@@ -203,13 +151,10 @@ if [ "$MODE" = "execute-upgrade" ]; then
 
   cat <<EOF
 
-============================================================================
  KeyLeaseRegistry upgraded on $NETWORK
-============================================================================
  KEYLEASE_CONTRACT_ID=$REGISTRY
  KEYLEASE_NETWORK=$NETWORK
  version()            = $VERSION
-============================================================================
  Next steps
    - Watch the upgrade event:
        stellar events --id $REGISTRY --network $NETWORK --start-ledger <ledger>
@@ -217,9 +162,17 @@ if [ "$MODE" = "execute-upgrade" ]; then
        stellar contract invoke --id $REGISTRY --source-account $SOURCE_ACCOUNT \
          --network $NETWORK -- get_service --service_id 1
    - Explorer: https://stellar.expert/explorer/$NETWORK/contract/$REGISTRY
-============================================================================
 EOF
   exit 0
+if [ "$MODE" = "upgrade" ]; then
+  [ -n "${REGISTRY:-}" ] || die "REGISTRY=<contract id> is required with --upgrade"
+  # scripts/upgrade.sh owns the upgrade sequence: build, upload, upgrade, and a
+  # version() check against the workspace version. SOURCE_ACCOUNT must be the
+  # registry admin; upgrade.sh verifies that against get_admin before sending.
+  exec "$REPO_ROOT/scripts/upgrade.sh" \
+    --contract-id "$REGISTRY" \
+    --admin "$SOURCE_ACCOUNT" \
+    --network "$NETWORK"
 fi
 
 if [ "$MODE" = "cancel-upgrade" ]; then

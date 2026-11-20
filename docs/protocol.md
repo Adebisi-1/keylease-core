@@ -133,6 +133,30 @@ at expiry would lose a legitimate payout to a consumer racing to revoke. The
 window gives providers a guaranteed settlement period while keeping the
 consumer's exit bounded at 24 hours.
 
+### Exact grace-window boundaries
+
+The contract evaluates time against ledger timestamp (`env.ledger().timestamp()`).
+The exact inclusive and exclusive boundary conditions are:
+
+| Condition / Interval | Status (`lease_status`) | `settle_lease` (Provider) | `revoke_expired_lease` (Consumer) | Allowed Transitions |
+| --- | --- | --- | --- | --- |
+| `now < expires_at` | `Active` (0) | Allowed **only if** `verified_calls == allocated_calls`; otherwise reverts (`LeaseNotSettleable`) | Reverts (`LeaseNotExpired`) | Early full-consumption settlement only |
+| `now == expires_at` | `Expired` (1) | Allowed for any `verified_calls <= allocated_calls` | Reverts (`RevokeWindowNotElapsed`) | Provider settlement begins |
+| `expires_at <= now < expires_at + 86_400` | `Expired` (1) | Allowed for any `verified_calls <= allocated_calls` | Reverts (`RevokeWindowNotElapsed`) | Exclusive provider settlement window |
+| `now >= expires_at + 86_400` | `Expired` (1) | Allowed if not yet revoked; reverts (`LeaseAlreadySettled`) once revoked | Allowed; refunds 100% of locked deposit to consumer | Consumer revocation enabled (first revocable second is `expires_at + 86_400`) |
+
+### Boundary verification tests
+
+These boundary conditions are unit-tested and asserted in
+[`contracts/registry/src/test.rs`](https://github.com/KeyLease-Security/keylease-core/blob/main/contracts/registry/src/test.rs):
+
+- `test_revoke_before_expiry_is_rejected`: verifies that when `now < expires_at`, `revoke_expired_lease` returns `Err(Error::LeaseNotExpired)`.
+- `test_full_usage_can_settle_before_expiry`: confirms early settlement when `verified_calls == allocated_calls` even when `now < expires_at`.
+- `test_provider_can_settle_within_grace_window`: confirms provider payout at `expires_at + GRACE / 2` (12 hours into grace).
+- `test_revoke_during_grace_window_is_rejected`: asserts `revoke_expired_lease` reverts with `Err(Error::RevokeWindowNotElapsed)` at `expires_at + GRACE - 1` (the final second of provider grace).
+- `test_expired_unsettled_lease_is_fully_reclaimed`: verifies consumer revocation succeeds at exactly `expires_at + GRACE`, returning 100% of escrowed deposit.
+- `test_lease_ttl_ask_floors_once_the_grace_window_is_past`: ensures storage rent bumps clamp gracefully after the grace period has elapsed.
+
 ## Events
 
 Every transition publishes a typed Soroban event. Event names are the first
