@@ -162,6 +162,11 @@ A maintainer will approve the note before you begin coding.
 - Fill in `.github/pull_request_template.md`, including the security checklist.
 - Reference the issue you are closing (`Closes #123`).
 - A PR is merged once CI is green and a maintainer approves.
+- Area labels (`area: registry`, `area: mock-token`, `area: docs`,
+  `area: scripts`, `area: ci`) are added automatically from the paths you
+  touch; see [`.github/labeler.yml`](./.github/labeler.yml). If you add a
+  top-level directory, add a rule there and its label to
+  `scripts/setup-repo.sh`.
 
 ## Commit messages
 
