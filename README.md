@@ -171,6 +171,7 @@ cargo test --all
 # 3. Lint the way CI does
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 
 # 4. Produce deployable Soroban WASM
 cargo build --target wasm32v1-none --release --all

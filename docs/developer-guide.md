@@ -25,11 +25,12 @@ cargo test --all
 
 ## The commands CI runs
 
-These four are the definition of "green". Run all four before opening a PR.
+These five are the definition of "green". Run all five before opening a PR.
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 cargo test --all
 cargo build --target wasm32v1-none --release --all
 ```
@@ -210,6 +211,7 @@ deployer's secret key. Addresses and ledger numbers are fine and useful.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 cargo test --all
 cargo build --target wasm32v1-none --release --all
 cargo deny check

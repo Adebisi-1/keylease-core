@@ -21,6 +21,7 @@ cargo build --all                  # compile
 cargo test --all                   # run the full test suite
 cargo fmt --all                    # format
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 ```
 
 Everything must be green **before** you open a PR — CI runs exactly the
