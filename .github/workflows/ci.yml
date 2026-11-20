@@ -62,6 +62,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Soroban contracts
         run: cargo build --target wasm32v1-none --release --all
+      # Fails if a contract crate drops #![no_std] or its unsafe_code lints,
+      # if the target ever ships a std to link, or if a built .wasm imports
+      # anything but Soroban host functions or carries std source paths.
+      # Kept in this job so the required check name does not change.
+      - name: Check Wasm is built without std
+        run: ./scripts/check-no-std.sh --no-build
 
   spellcheck:
     name: Spell Check
