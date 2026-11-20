@@ -73,6 +73,7 @@ nav:
       - Developer guide: developer-guide.md
       - Deployment: deployment.md
       - Troubleshooting: troubleshooting.md
+      - FAQ: faq.md
   - Project:
       - Deployments: deployments.md
       - Design notes:
