@@ -52,6 +52,7 @@ malware scan over the checkout and the built Wasm artifacts. CI job names are
 | `contracts/registry/src/test.rs` | Lifecycle, SAC, events, upgrade and re-entrancy tests. |
 | `contracts/mock_token/` | Test/sandbox SEP-41 token. |
 | `scripts/deploy-testnet.sh` | Sequential testnet deploy and upgrade. |
+| `scripts/check-no-std.sh` | Checks the release Wasm is built without `std` and crates forbid `unsafe`. |
 | `scripts/create-issues.sh` | Batch Wave backlog creation. |
 | `scripts/setup-repo.sh` | Topics, labels, branch protection. |
 
@@ -214,12 +215,14 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --target wasm32v1-none --release --all -- -D warnings
 cargo test --all
 cargo build --target wasm32v1-none --release --all
+./scripts/check-no-std.sh --no-build
 cargo deny check
 ./scripts/scan-malware.sh
 pip install -r requirements-docs.txt && mkdocs build --strict
 ```
 
-The first four are the CI jobs every commit must pass; `cargo deny check` and
+The first four are the CI jobs every commit must pass, and
+`check-no-std.sh` runs inside the `Build (wasm32v1-none)` job; `cargo deny check` and
 `./scripts/scan-malware.sh` are the Dependency Policy and Malware Scan jobs run
 locally. `mkdocs build --strict` is the one that bites at release time: the docs
 workflow only runs on `main`, so a notes page missing from `nav:` or a dangling
