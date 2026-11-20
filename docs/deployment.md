@@ -111,7 +111,55 @@ The contract id itself is in the registry: see
 ## Upgrading
 
 The contract is upgradeable in place through the Soroban deployer; the contract
-id, storage and balances are preserved.
+id, storage and balances are preserved. Because the old storage carries over,
+the steps must run in order and the result must be checked, so they are
+scripted:
+
+```bash
+./scripts/upgrade.sh --contract-id C... --admin keylease-admin
+```
+
+Both flags are required and have no defaults: the script will not guess which
+contract to replace or which key signs for it. `--admin` is a stellar CLI
+identity; its address is passed to `upgrade --admin` and must equal the live
+`get_admin`, which the script checks before it sends anything.
+
+### What the upgrade script does
+
+```text
+0. get_admin, version                     -> confirm the signer is the admin, record the live version
+1. cargo build --target wasm32v1-none --release --package keylease-registry
+2. stellar contract upload  <registry wasm> -> Wasm hash (must equal sha256 of the built file)
+3. stellar contract invoke -- upgrade      --admin <ADMIN> --new_wasm_hash <HASH>
+4. stellar contract invoke -- version      -> must equal [workspace.package] version in Cargo.toml
+```
+
+It then prints the Wasm hash, the version before and after, and the
+`stellar events` command (with the `contract_upgraded` topic filter and the
+ledger it started from) to confirm the upgrade event. It exits non-zero when:
+
+- `--contract-id` or `--admin` is missing, or the id is not a `C...` contract id;
+- the identity is not the registry admin;
+- the live contract already reports the workspace version — bump
+  `[workspace.package] version` first, or pass `--allow-same-version` to
+  re-install the same release deliberately;
+- the uploaded hash differs from the local build;
+- `version()` after the upgrade does not equal the workspace version.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--contract-id` | required (env `CONTRACT_ID`) | registry contract to upgrade |
+| `--admin` | required (env `ADMIN_IDENTITY`) | stellar CLI identity of the registry admin |
+| `--network` | `testnet` (env `NETWORK`) | network name from your CLI config |
+| `--allow-same-version` | off | proceed when the live version already equals the workspace version |
+| `--yes` | off | skip the confirmation prompt (required on a non-interactive shell) |
+
+`REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --upgrade`
+still works and hands off to `scripts/upgrade.sh`.
+
+### Upgrading manually
+
+The raw commands the script wraps are:
 
 ```bash
 # 1. upload the new Wasm and print its hash
@@ -127,12 +175,6 @@ stellar contract invoke --id $REGISTRY --source-account keylease-admin \
 # 3. confirm the new version and watch the event
 stellar contract invoke --id $REGISTRY --source-account keylease-admin --network testnet -- version
 stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
-```
-
-Or use the script:
-
-```bash
-REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --upgrade
 ```
 
 Guard rails for an upgrade: keep the storage layout unchanged, append error
@@ -176,6 +218,8 @@ Keep the highest pre-upgrade `lease_id` and note the current ledger: it is the
 `--start-ledger` for the replay in step 5.
 
 **3. Upgrade.** Upload, install, and keep the hash the deployer returned.
+`./scripts/upgrade.sh --contract-id $REGISTRY --admin keylease-admin` runs this
+step and step 4 together; the raw commands are:
 
 ```bash
 WASM_HASH=$(stellar contract upload \

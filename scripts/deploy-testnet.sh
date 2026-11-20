@@ -12,11 +12,9 @@
 #   4. stellar contract invoke -- set_token    --admin <ADMIN> --token <TOKEN>
 #   5. stellar contract invoke -- register_service --provider <P> --rate_per_call <R> --endpoint_hash <H>
 #
-# Upgrade an existing deployment in place:
-#   1. cargo build --target wasm32v1-none --release --all
-#   2. stellar contract upload   (registry)  -> Wasm hash
-#   3. stellar contract invoke -- upgrade --admin <ADMIN> --new_wasm_hash <HASH>
-#   4. stellar contract invoke -- version  (verify)
+# Upgrade an existing deployment in place: use scripts/upgrade.sh, which builds,
+# uploads, invokes upgrade and checks version() against the workspace version.
+# `--upgrade` below is kept as a shortcut that hands off to it.
 #
 # Prerequisites
 #   - Rust 1.84+ with `rustup target add wasm32v1-none`
@@ -30,7 +28,7 @@
 #       -> creates + Friendbot-funds the identity first (testnet only)
 #
 #   REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --upgrade
-#       -> uploads the built Wasm and installs it over an existing contract id
+#       -> runs scripts/upgrade.sh --contract-id $REGISTRY --admin $SOURCE_ACCOUNT
 #
 # Environment
 #   SOURCE_ACCOUNT          stellar CLI identity/key used to sign. Default: keylease-admin
@@ -117,57 +115,13 @@ PROVIDER="${PROVIDER:-$ADMIN}"
 
 if [ "$MODE" = "upgrade" ]; then
   [ -n "${REGISTRY:-}" ] || die "REGISTRY=<contract id> is required with --upgrade"
-  printf '%s' "$REGISTRY" | grep -Eq '^C[A-Z0-9]{55}$' \
-    || die "REGISTRY must be a contract id starting with C, got: $REGISTRY"
-
-  step "Building Soroban Wasm (wasm32v1-none, release)"
-  build_wasm
-
-  step "Uploading registry Wasm"
-  WASM_HASH="$(stellar contract upload \
-    --wasm "$REGISTRY_WASM" \
-    --source-account "$SOURCE_ACCOUNT" \
-    --network "$NETWORK" | tail -n1)"
-
-  printf '%s' "$WASM_HASH" | grep -Eq '^[0-9a-fA-F]{64}$' \
-    || die "unexpected upload output, expected a 64-char Wasm hash: $WASM_HASH"
-  info "wasm hash: $WASM_HASH"
-
-  step "Upgrading $REGISTRY (admin = $ADMIN)"
-  stellar contract invoke \
-    --id "$REGISTRY" \
-    --source-account "$SOURCE_ACCOUNT" \
-    --network "$NETWORK" \
-    --send=yes \
-    -- upgrade --admin "$ADMIN" --new_wasm_hash "$WASM_HASH"
-
-  step "Verifying on-chain version"
-  VERSION="$(stellar contract invoke \
-    --id "$REGISTRY" \
-    --source-account "$SOURCE_ACCOUNT" \
-    --network "$NETWORK" \
-    -- version | tail -n1)"
-
-  cat <<EOF
-
-============================================================================
- KeyLeaseRegistry upgraded on $NETWORK
-============================================================================
- KEYLEASE_CONTRACT_ID=$REGISTRY
- KEYLEASE_NETWORK=$NETWORK
- version()            = $VERSION
- wasm hash            = $WASM_HASH
-============================================================================
- Next steps
-   - Watch the upgrade event:
-       stellar events --id $REGISTRY --network $NETWORK --start-ledger <ledger>
-   - Verify storage and balances are intact:
-       stellar contract invoke --id $REGISTRY --source-account $SOURCE_ACCOUNT \
-         --network $NETWORK -- get_service --service_id 1
-   - Explorer: https://stellar.expert/explorer/$NETWORK/contract/$REGISTRY
-============================================================================
-EOF
-  exit 0
+  # scripts/upgrade.sh owns the upgrade sequence: build, upload, upgrade, and a
+  # version() check against the workspace version. SOURCE_ACCOUNT must be the
+  # registry admin; upgrade.sh verifies that against get_admin before sending.
+  exec "$REPO_ROOT/scripts/upgrade.sh" \
+    --contract-id "$REGISTRY" \
+    --admin "$SOURCE_ACCOUNT" \
+    --network "$NETWORK"
 fi
 
 if [ -z "${TOKEN:-}" ]; then

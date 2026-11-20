@@ -1202,7 +1202,7 @@ fn test_upgrade_is_admin_only() {
 // A successful upgrade installs a real Wasm uploaded with
 // `stellar contract upload`, which the unit-test host cannot fabricate (it
 // requires a valid `contractspecv0` metadata section). The success path is
-// exercised end to end by `scripts/deploy-testnet.sh --upgrade` against
+// exercised end to end by `scripts/upgrade.sh` against
 // Testnet; here we pin the authorization guard.
 
 #[test]
