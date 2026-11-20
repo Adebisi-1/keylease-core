@@ -7,8 +7,8 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRegistered,
-    ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRateUpdated,
+    ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{self, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
 use crate::{
@@ -262,6 +262,114 @@ fn test_set_service_active_is_provider_only() {
         ctx.registry
             .try_set_service_active(&impostor, &service_id, &false),
         Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_update_service_is_provider_only() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let impostor = Address::generate(&env);
+
+    assert_eq!(
+        ctx.registry
+            .try_update_service(&impostor, &service_id, &100, &endpoint_hash(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_update_service_rejects_non_positive_rate() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    assert_eq!(
+        ctx.registry
+            .try_update_service(&ctx.provider, &service_id, &0, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_update_service(&ctx.provider, &service_id, &-1, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(ctx.registry.get_service(&service_id).rate_per_call, RATE);
+}
+
+#[test]
+fn test_update_service_preserves_existing_lease_rate() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    // Update the rate to a new value.
+    ctx.registry
+        .update_service(&ctx.provider, &service_id, &200, &endpoint_hash(&env));
+
+    // The existing lease still uses the old rate.
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert_eq!(
+        lease.locked_deposit,
+        RATE * 10,
+        "existing lease keeps old rate"
+    );
+
+    // A new lease uses the new rate.
+    let new_lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let new_lease = ctx.registry.get_lease(&new_lease_id);
+    assert_eq!(
+        new_lease.locked_deposit,
+        200 * 10,
+        "new lease uses new rate"
+    );
+}
+
+#[test]
+fn test_update_service_updates_rate_and_endpoint() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Update both rate and endpoint hash.
+    ctx.registry
+        .update_service(&ctx.provider, &service_id, &150, &endpoint_hash(&env));
+
+    let service = ctx.registry.get_service(&service_id);
+    assert_eq!(service.rate_per_call, 150, "rate was updated");
+    assert_eq!(
+        service.endpoint_hash,
+        endpoint_hash(&env),
+        "endpoint_hash was updated"
+    );
+}
+
+#[test]
+fn test_update_service_emits_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    ctx.registry
+        .update_service(&ctx.provider, &service_id, &200, &endpoint_hash(&env));
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &ServiceRateUpdated {
+            schema_version: EVENT_SCHEMA_VERSION,
+            service_id,
+            provider: ctx.provider.clone(),
+            rate_per_call: 200,
+            endpoint_hash: endpoint_hash(&env),
+        },
     );
 }
 

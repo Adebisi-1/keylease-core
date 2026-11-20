@@ -66,7 +66,8 @@ use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, String};
 pub use crate::errors::Error;
 pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
-    RegistryInitialized, ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
+    EVENT_SCHEMA_VERSION,
 };
 pub use crate::types::{Lease, LeaseStatus, Service};
 
@@ -267,6 +268,44 @@ impl KeyLeaseRegistry {
             schema_version: EVENT_SCHEMA_VERSION,
             provider,
             is_active,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Update the rate_per_call and/or endpoint_hash for a service.
+    /// Only the owning provider may call this.
+    ///
+    /// Existing leases keep their original rate — `locked_deposit` is escrowed
+    /// at the old rate and is not altered. Only *new* leases will use the
+    /// updated rate.
+    ///
+    /// Non-positive `rate_per_call` values are rejected with `Error::InvalidRate`.
+    pub fn update_service(
+        env: Env,
+        provider: Address,
+        service_id: u64,
+        rate_per_call: i128,
+        endpoint_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        provider.require_auth();
+
+        let mut service = storage::get_service(&env, service_id)?;
+        if service.provider != provider {
+            return Err(Error::Unauthorized);
+        }
+        if rate_per_call <= 0 {
+            return Err(Error::InvalidRate);
+        }
+        service.rate_per_call = rate_per_call;
+        service.endpoint_hash = endpoint_hash.clone();
+        storage::save_service(&env, &service);
+        ServiceRateUpdated {
+            service_id,
+            schema_version: EVENT_SCHEMA_VERSION,
+            provider,
+            rate_per_call,
+            endpoint_hash,
         }
         .publish(&env);
         Ok(())

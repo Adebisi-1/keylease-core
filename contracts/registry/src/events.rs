@@ -106,6 +106,23 @@ pub struct ServiceStatusChanged {
     pub is_active: bool,
 }
 
+/// Emitted when a provider updates the rate_per_call and/or endpoint_hash of a service.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRateUpdated {
+    /// Service whose rate/endpoint was updated.
+    #[topic]
+    pub service_id: u64,
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
+    /// Provider that owns the service.
+    pub provider: Address,
+    /// New per-call rate in the escrow token's smallest unit.
+    pub rate_per_call: i128,
+    /// New commitment to the off-chain endpoint descriptor.
+    pub endpoint_hash: BytesN<32>,
+}
+
 /// Emitted when a consumer escrows a deposit and a lease is minted.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
