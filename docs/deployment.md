@@ -265,6 +265,66 @@ way. It is only safe while the new build has written nothing the old one cannot
 read, so a new `DataKey` variant or new field is a one-way door the moment it is
 used.
 
+## Multisig admin deployment and upgrades
+
+In production, operators should configure a cold or multi-signature account as
+the registry `admin` to prevent a single compromised key from executing unauthorized
+contract upgrades or token modifications.
+
+### 1. Initialization with a multisig admin
+
+Any funded account can build and deploy the contract Wasm. When initializing the
+registry, pass the multi-signature account address (`G_MULTISIG...`) as the `--admin` parameter:
+
+```bash
+stellar contract invoke --id "$REGISTRY" --source-account deployer \
+  --network testnet --send=yes -- init --admin "$MULTISIG_ADMIN"
+```
+
+Once initialized, all functions requiring admin privileges (`set_token` and `upgrade`)
+call `admin.require_auth()`, delegating authorization enforcement to the Stellar host.
+
+### 2. Multi-party upgrade workflow
+
+Upgrades with a multisig admin are coordinated through transaction envelopes:
+
+1. **Upload the new Wasm:** Any account can upload the compiled bytecode to obtain its hash:
+   ```bash
+   WASM_HASH=$(stellar contract upload \
+     --wasm target/wasm32v1-none/release/keylease_registry.wasm \
+     --source-account deployer --network testnet)
+   ```
+
+2. **Construct the unsigned invocation transaction:**
+   ```bash
+   stellar contract invoke --id "$REGISTRY" \
+     --source-account "$MULTISIG_ADMIN" \
+     --network testnet \
+     --build-only \
+     -- upgrade --admin "$MULTISIG_ADMIN" --new_wasm_hash "$WASM_HASH" > upgrade_tx.xdr
+   ```
+
+3. **Collect signatures from signers:** Each required co-signer signs the envelope until
+   the cumulative signature weight meets or exceeds the admin account's threshold:
+   ```bash
+   stellar tx sign --network testnet --source-account signer-alice upgrade_tx.xdr > signed_1.xdr
+   stellar tx sign --network testnet --source-account signer-bob signed_1.xdr > signed_threshold.xdr
+   ```
+
+4. **Submit the fully-signed transaction:**
+   ```bash
+   stellar tx send --network testnet signed_threshold.xdr
+   ```
+
+### Host-level auth guarantees
+
+- **What the contract enforces:** The contract checks `admin.require_auth()`. If the
+  accumulated signature weight does not meet the Stellar account's configured threshold,
+  the host rejects the transaction before contract invocation occurs.
+- **What the contract cannot enforce:** The contract does not inspect individual
+  signer identities, weights, or whether the signer set is 2-of-3 versus 1-of-1.
+  Those rules live entirely within the Stellar account configuration.
+
 ## Post-deploy
 
 1. **Fund a consumer** so `create_lease` can escrow a deposit.
