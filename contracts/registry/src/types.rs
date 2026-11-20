@@ -66,3 +66,40 @@ impl LeaseStatus {
         }
     }
 }
+
+/// A signed statement from an optional attestor that a lease consumed a given
+/// number of calls.
+///
+/// This is the payload a service opts into with
+/// [`crate::KeyLeaseRegistry::set_service_attestor`]. The attestor signs
+/// [`crate::usage_attestation_message`] for exactly the fields below, so a
+/// signature only settles the lease, service and call count it was issued for:
+///
+/// * `lease_id` — replaying an attestation against another lease fails with
+///   `AttestationMismatch`.
+/// * `service_id` — an attestation issued for a service cannot settle a lease of
+///   a different service.
+/// * `verified_calls` — signed, so the provider cannot report a different count
+///   than the attestor saw. `settle_lease_attested` rejects a payload whose
+///   `verified_calls` differs from the call argument.
+/// * `valid_until` — the last ledger timestamp at which the attestation may be
+///   used (inclusive). A settlement attempt after it fails with
+///   `AttestationStale`.
+///
+/// The attestation is an *additional* check, never a replacement for the
+/// existing ones: expiry, allotment, ownership and single-settlement rules all
+/// still apply.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageAttestation {
+    /// The lease this attestation was issued for.
+    pub lease_id: u64,
+    /// The service that lease belongs to.
+    pub service_id: u64,
+    /// Calls the attestor observed (and signed) for that lease.
+    pub verified_calls: u32,
+    /// Last ledger timestamp at which this attestation is accepted, inclusive.
+    pub valid_until: u64,
+    /// Ed25519 signature over [`crate::usage_attestation_message`].
+    pub signature: BytesN<64>,
+}
