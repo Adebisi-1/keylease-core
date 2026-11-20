@@ -7,8 +7,8 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, ServiceRateUpdated,
-    ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, RegistryInitialized,
+    ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{self, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
 use crate::{
@@ -832,6 +832,26 @@ fn test_lease_status_unknown_lease() {
 // ---------------------------------------------------------------------------
 // Soroban contract events
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_init_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let registry_id = env.register(KeyLeaseRegistry, ());
+    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
+
+    registry.init(&admin);
+
+    assert_single_event(
+        &env,
+        &registry_id,
+        &RegistryInitialized {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin,
+        },
+    );
+}
 
 #[test]
 fn test_set_token_emits_event() {
