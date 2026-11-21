@@ -59,10 +59,7 @@ pub enum Error {
     NoPendingUpgrade = 22,
     /// The proposed upgrade is still inside its mandatory delay window.
     UpgradeDelayNotElapsed = 23,
-    /// Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`.
-    ///
-    /// Raised by `register_service`, before any consumer can be quoted a price
-    /// that no lease could fund or whose deposit the arithmetic could not
-    /// represent.
-    RateTooHigh = 24,
+    /// A page size outside `1..=MAX_PAGE_SIZE`, so serving it would read an
+    /// unbounded number of ledger entries in one transaction.
+    InvalidLimit = 24,
 }
