@@ -59,4 +59,7 @@ pub enum Error {
     NoPendingUpgrade = 22,
     /// The proposed upgrade is still inside its mandatory delay window.
     UpgradeDelayNotElapsed = 23,
+    /// A page size outside `1..=MAX_PAGE_SIZE`, so serving it would read an
+    /// unbounded number of ledger entries in one transaction.
+    InvalidLimit = 24,
 }

@@ -239,7 +239,9 @@ ledger it started from) to confirm the upgrade event. It exits non-zero when:
 | `--yes` | off | skip the confirmation prompt (required on a non-interactive shell) |
 
 `REGISTRY=C... SOURCE_ACCOUNT=keylease-admin ./scripts/deploy-testnet.sh --upgrade`
-still works and hands off to `scripts/upgrade.sh`.
+builds and uploads the Wasm and then queues it behind the contract's 24h time
+lock; `--execute-upgrade` installs the proposal once that delay has elapsed and
+`--cancel-upgrade` drops it.
 
 ### Upgrading manually
 
