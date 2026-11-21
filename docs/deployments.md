@@ -118,3 +118,30 @@ sha256sum target/wasm32v1-none/release/keylease_registry.wasm
 3. Record the deployment ledger so `stellar events` can be replayed.
 4. Commit the change and tag the release so the addresses are tied to a
    specific revision.
+
+### Recording a post-reset deployment
+
+A Testnet reset (2–4 times a year, 17:00 UTC) wipes the ledger, so this table is
+stale from the moment it happens and a reader can be pointed at a contract id
+that no longer exists. The operator sequence is in
+[Networks — After a Testnet reset](networks.md#after-a-testnet-reset); what
+changes here is only the record:
+
+| Field | After a reset |
+| --- | --- |
+| `KeyLeaseRegistry` | **new id** — from the script output, never from memory. |
+| Contract version, Wasm hash | Whatever this build produced. Unchanged only if you deployed the same commit. |
+| `Contract created`, `init`, `set_token`, `register_service` | All new ledgers and tx links. The pre-reset history is gone, so replay starts at the new `Contract created` ledger. |
+| Escrow token (native SAC) | **unchanged** — derived from the passphrase, which a reset does not alter. Re-derive it to prove it: `stellar contract id asset --network testnet --asset native`. |
+| Admin / provider / demo consumer | **unchanged addresses**, but the accounts themselves were wiped and must be re-funded before they can sign. |
+| Demo `service_id` | Back to `1`. `ServiceCount` is instance storage and the instance is new, so ids restart rather than continue. Any consumer still holding an old id is calling a service that does not exist. |
+
+Two things to do before merging the update:
+
+1. **Prove the old id is dead.** `stellar contract info fetch --id <OLD> --network testnet`
+   and `… -- version` must both fail; the event stream must answer empty. If
+   `version()` replies, you are on the wrong RPC or the reset has not landed yet.
+2. **Keep the superseded id in history, not in the table.** The old id belongs in
+   the commit that replaces it (`git log -p docs/deployments.md`), not in a
+   "previous deployments" section — a second live-looking address on this page is
+   exactly the fake-contract-id risk [Security](security.md) warns about.
