@@ -28,7 +28,7 @@
 //! merely *read* for months has to be bumped explicitly, which is what the two
 //! `bump_*` entry points are for.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Symbol, TryFromVal, Val};
 
 use crate::errors::Error;
 use crate::types::{Lease, PendingUpgrade, Service};
@@ -359,10 +359,40 @@ pub(crate) fn lease_ttl_extend(env: &Env, lease: &Lease) -> u32 {
 /// A lease that needs to outlive its current horizon is kept alive by
 /// [`crate::KeyLeaseRegistry::bump_lease`], not by looking at it.
 pub fn get_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
-    env.storage()
+    let key = DataKey::Lease(lease_id);
+    let val: Val = env
+        .storage()
         .persistent()
-        .get(&DataKey::Lease(lease_id))
-        .ok_or(Error::LeaseNotFound)
+        .get(&key)
+        .ok_or(Error::LeaseNotFound)?;
+
+    // Decide which shape is stored *before* decoding: the derive unpacks an exact
+    // field-name key set and the host escalates a size mismatch instead of
+    // returning a recoverable error.
+    let map = Map::<Symbol, Val>::try_from_val(env, &val).map_err(|_| Error::LeaseNotFound)?;
+    if map.contains_key(Symbol::new(env, "created_at")) {
+        return Lease::try_from_val(env, &val).map_err(|_| Error::LeaseNotFound);
+    }
+    if map.len() != LEGACY_LEASE_FIELDS {
+        // Neither a current nor a pre-`created_at` lease entry.
+        return Err(Error::LeaseNotFound);
+    }
+
+    // A lease written before `created_at` existed. Its creation time is not
+    // recoverable from storage, so report `0` (unknown) rather than failing a
+    // settlement or refund that is still owed.
+    let legacy = LegacyLease::try_from_val(env, &val).map_err(|_| Error::LeaseNotFound)?;
+    Ok(Lease {
+        lease_id: legacy.lease_id,
+        service_id: legacy.service_id,
+        consumer: legacy.consumer,
+        allocated_calls: legacy.allocated_calls,
+        used_calls: legacy.used_calls,
+        created_at: 0,
+        expires_at: legacy.expires_at,
+        locked_deposit: legacy.locked_deposit,
+        settled: legacy.settled,
+    })
 }
 
 /// Test-only: rewrite a lease entry in the pre-`created_at` shape so the legacy

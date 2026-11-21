@@ -2052,6 +2052,7 @@ fn lease_expiring_at(env: &Env, expires_at: u64) -> Lease {
         consumer: Address::generate(env),
         allocated_calls: 1,
         used_calls: 0,
+        created_at: 0,
         expires_at,
         locked_deposit: RATE,
         settled: false,

@@ -449,6 +449,23 @@ pub struct Lease {
 pub enum LeaseStatus { Active = 0, Expired = 1, Settled = 2 }
 ```
 
+### `created_at` and upgrade compatibility
+
+The lease value is a `SCV_MAP` keyed by field name, and decoding unpacks exactly
+the fields the current `Lease` declares. `created_at` was therefore added in the
+only compatible way: **appended** to the field list, with no `DataKey` added,
+removed or renumbered and no existing field touched. Concretely:
+
+- Entries written by a release that predates `created_at` are decoded through a
+  legacy fallback in `storage::get_lease` and report `created_at = 0`, which means
+  “written before creation times were recorded — unknown”. They stay settleable
+  and revocable, so an upgrade can neither strand escrow nor block a refund.
+- Nothing has to be migrated before an upgrade. Each entry is rewritten in the
+  current shape the next time it is saved (settlement or revocation), keeping
+  `created_at = 0` if it was already unknown.
+- Never reorder, rename or remove a field: the field names are the storage key
+  set, so doing so would make existing entries undecodable.
+
 ## Storage layout
 
 ```rust
