@@ -1,4 +1,11 @@
 #![no_std]
+// No unsafe code in contract crates (CONTRIBUTING.md#unsafe-code-and-std).
+// `forbid` on the deployed Wasm. On the host, soroban-sdk's `testutils`
+// feature registers contracts through `ctor`, whose expansion carries its own
+// `#[allow(unsafe_code)]`, which `forbid` rejects; `deny` still rejects any
+// unsafe written in this crate. scripts/check-no-std.sh checks these lines.
+#![cfg_attr(target_family = "wasm", forbid(unsafe_code))]
+#![cfg_attr(not(target_family = "wasm"), deny(unsafe_code))]
 
 //! # KeyLease Registry
 //!
@@ -50,8 +57,9 @@
 //!   duration plus the grace period whenever it is written, so escrow cannot
 //!   fall off the ledger. Reads never extend: `bump_lease` and `bump_service`
 //!   keep an entry alive on their own terms (see [`storage`]).
-//! * **Wasm upgrades** — the admin can install a new Wasm through the Soroban
-//!   deployer, and `contractmeta!` identifies the running version on-chain.
+//! * **Wasm upgrades** — the admin proposes a new Wasm through the Soroban
+//!   deployer and may only execute it after a 24-hour on-ledger delay, giving
+//!   consumers time to exit; `contractmeta!` identifies the running version.
 
 mod errors;
 mod events;
@@ -61,15 +69,18 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod test_wasm;
+
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String};
 
 pub use crate::errors::Error;
 pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
     RegistryInitialized, ServiceAttestorSet, ServiceRateUpdated, ServiceRegistered,
-    ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
-pub use crate::types::{Lease, LeaseStatus, Service, UsageAttestation};
+pub use crate::types::{Lease, LeaseStatus, PendingUpgrade, Service, UsageAttestation};
 
 // On-chain contract metadata, readable from the ledger without the source.
 soroban_sdk::contractmeta!(key = "name", val = "KeyLeaseRegistry");
@@ -89,6 +100,13 @@ soroban_sdk::contractmeta!(
 /// Grace period after lease expiry during which the provider may still settle.
 /// After this window elapses, the consumer may reclaim the full deposit.
 pub const SETTLE_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60;
+
+/// Mandatory wait between proposing and executing a Wasm upgrade.
+///
+/// The delay is the consumers' exit window: a proposal is public for 24 hours
+/// on-ledger before any new rules can take effect, so a lease created under the
+/// current code can be settled before the contract changes underneath it.
+pub const UPGRADE_DELAY_SECS: u64 = 24 * 60 * 60;
 
 /// Longest lease the TTL policy is guaranteed to keep alive.
 ///
@@ -180,8 +198,9 @@ impl KeyLeaseRegistry {
     /// Initialize the registry and appoint `admin`.
     ///
     /// Can only be called once. The admin is the only account allowed to
-    /// configure the escrow token via [`Self::set_token`] or upgrade the
-    /// contract via [`Self::upgrade`].
+    /// configure the escrow token via [`Self::set_token`] or manage upgrades via
+    /// [`Self::propose_upgrade`], [`Self::execute_upgrade`] and
+    /// [`Self::cancel_upgrade`].
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         if storage::is_initialized(&env) {
@@ -230,22 +249,98 @@ impl KeyLeaseRegistry {
         Ok(())
     }
 
-    /// Install a new registry Wasm through the Soroban deployer. Admin only.
+    /// Queue a Wasm upgrade behind the mandatory [`UPGRADE_DELAY_SECS`] delay.
     ///
-    /// `new_wasm_hash` is the hash produced by `stellar contract upload`. The
-    /// contract id stays the same; storage, balances and in-flight leases are
-    /// preserved, which is why upgrades must never change the storage layout.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+    /// Admin only. `new_wasm_hash` is the hash produced by
+    /// `stellar contract upload`. A new proposal replaces a pending one and
+    /// restarts the delay, so the exit window can never be shortened. The hash
+    /// and the execution ledger timestamp are stored and reported by
+    /// [`UpgradeProposed`]; clients can read them with
+    /// [`Self::get_pending_upgrade`].
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
         admin.require_auth();
         require_admin(&env, &admin)?;
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-        ContractUpgraded {
+
+        let execute_after = env
+            .ledger()
+            .timestamp()
+            .checked_add(UPGRADE_DELAY_SECS)
+            .ok_or(Error::Overflow)?;
+        storage::set_pending_upgrade(
+            &env,
+            &PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                execute_after,
+            },
+        );
+        storage::extend_instance_ttl(&env);
+        UpgradeProposed {
             schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             new_wasm_hash,
+            execute_after,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Drop a pending upgrade so it can never be executed. Admin only.
+    ///
+    /// Emits [`UpgradeCancelled`] with the abandoned hash. Cancelling when no
+    /// proposal is pending fails with [`Error::NoPendingUpgrade`].
+    pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+
+        let pending = storage::get_pending_upgrade(&env).ok_or(Error::NoPendingUpgrade)?;
+        storage::remove_pending_upgrade(&env);
+        storage::extend_instance_ttl(&env);
+        UpgradeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: admin.clone(),
+            new_wasm_hash: pending.new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Install the pending Wasm, but only once the delay has elapsed. Admin only.
+    ///
+    /// Before execution, `ledger.timestamp()` must have reached the
+    /// `execute_after` recorded at proposal time; an early call fails with
+    /// [`Error::UpgradeDelayNotElapsed`]. The proposal is consumed atomically
+    /// with the install and [`ContractUpgraded`] reports both the installed hash
+    /// and the ledger timestamp that had to be reached.
+    ///
+    /// The contract id stays the same; storage, balances and in-flight leases
+    /// are preserved, which is why upgrades must never change the storage layout.
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+
+        let pending = storage::get_pending_upgrade(&env).ok_or(Error::NoPendingUpgrade)?;
+        if env.ledger().timestamp() < pending.execute_after {
+            return Err(Error::UpgradeDelayNotElapsed);
+        }
+
+        // Persist the consumed proposal and publish the event before handing
+        // control to the deployer. A failing install reverts the whole
+        // transaction, so no event or storage change can outlive it.
+        storage::remove_pending_upgrade(&env);
+        storage::extend_instance_ttl(&env);
+        ContractUpgraded {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: admin.clone(),
+            new_wasm_hash: pending.new_wasm_hash.clone(),
+            execute_after: pending.execute_after,
+        }
+        .publish(&env);
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash);
         Ok(())
     }
 
@@ -756,6 +851,14 @@ impl KeyLeaseRegistry {
     /// Return the configured escrow token, or `TokenNotSet`.
     pub fn get_token(env: Env) -> Result<Address, Error> {
         storage::get_token(&env).ok_or(Error::TokenNotSet)
+    }
+
+    /// Pending upgrade waiting out its delay, if one has been proposed.
+    ///
+    /// The returned `execute_after` is a ledger timestamp; clients can compare
+    /// it with `ledger.timestamp()` to know when execution becomes possible.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        storage::get_pending_upgrade(&env)
     }
 
     /// Version string embedded in the Wasm by `contractmeta!`.

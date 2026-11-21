@@ -42,8 +42,8 @@ Initialize the registry and appoint `admin`.
 - **State:** sets `Admin`; extends instance TTL.
 - **Events:** `registry_initialized { admin }`.
 - **Errors:** `AlreadyInitialized`.
-- **Notes:** the admin can only call `set_token` and `upgrade`. It cannot move
-  user funds.
+- **Notes:** the admin can only call `set_token` and manage upgrades through the
+  propose/execute/cancel flow below. It cannot move user funds.
 
 ### `set_token`
 
@@ -67,20 +67,55 @@ Point the registry at the SEP-41 token used for every deposit and payout.
   stored-admin check still run first, so an unauthorized caller receives
   `Unauthorized` either way.
 
-### `upgrade`
+### `propose_upgrade`
 
 ```rust
-pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error>
+pub fn propose_upgrade(
+    env: Env,
+    admin: Address,
+    new_wasm_hash: BytesN<32>,
+) -> Result<(), Error>
 ```
 
-Install a new registry Wasm through the Soroban deployer.
+Queue a Wasm upgrade behind the mandatory `UPGRADE_DELAY_SECS` (24h) delay.
 
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
 - **Trigger:** a released bug fix or feature, after uploading the Wasm with
   `stellar contract upload`.
-- **Effects:** `env.deployer().update_current_contract_wasm(new_wasm_hash)`.
-- **Events:** `contract_upgraded { admin, new_wasm_hash }`.
-- **Errors:** `NotInitialized`, `Unauthorized`.
+- **State:** writes `PendingUpgrade { new_wasm_hash, execute_after }`; a new
+  proposal replaces the old one and restarts the delay.
+- **Events:** `upgrade_proposed { schema_version, admin, new_wasm_hash, execute_after }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `Overflow`.
+- **Notes:** `execute_after` is a ledger timestamp. Consumers can read it with
+  `get_pending_upgrade` and exit before it is reached.
+
+### `cancel_upgrade`
+
+```rust
+pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), Error>
+```
+
+Drop a pending proposal without installing any code.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **Effects:** removes `PendingUpgrade`.
+- **Events:** `upgrade_cancelled { schema_version, admin, new_wasm_hash }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`.
+
+### `execute_upgrade`
+
+```rust
+pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), Error>
+```
+
+Install the proposed Wasm through `env.deployer().update_current_contract_wasm`.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **Preconditions:** a proposal exists and `ledger.timestamp() >= execute_after`.
+- **Effects:** removes `PendingUpgrade` and installs the proposed hash.
+- **Events:** `contract_upgraded { schema_version, admin, new_wasm_hash, execute_after }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`,
+  `UpgradeDelayNotElapsed`.
 - **Notes:** the contract id, storage and balances are preserved, so an upgrade
   must never change the `DataKey` layout or the meaning of stored values. See
   [Deployment](deployment.md#upgrading).
@@ -342,6 +377,7 @@ performed one could not be used to price a read.
 | --- | --- | --- |
 | `get_admin` | `(env) -> Result<Address, Error>` | stored admin, else `NotInitialized` |
 | `get_token` | `(env) -> Result<Address, Error>` | escrow token, else `TokenNotSet` |
+| `get_pending_upgrade` | `(env) -> Option<PendingUpgrade>` | queued hash and execution ledger, if any |
 | `version` | `(env) -> String` | version embedded by `contractmeta!` |
 | `service_count` | `(env) -> u64` | total services ever registered |
 | `lease_count` | `(env) -> u64` | total leases ever created |
@@ -393,6 +429,11 @@ pub struct Service {
     pub endpoint_hash: BytesN<32>,
 }
 
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub execute_after: u64, // ledger timestamp
+}
+
 pub struct Lease {
     pub lease_id: u64,
     pub service_id: u64,
@@ -411,12 +452,13 @@ pub enum LeaseStatus { Active = 0, Expired = 1, Settled = 2 }
 
 ```rust
 pub enum DataKey {
-    Admin,        // instance
-    Token,        // instance
-    ServiceCount, // instance
-    LeaseCount,   // instance
-    Service(u64), // persistent
-    Lease(u64),   // persistent
+    Admin,          // instance
+    Token,          // instance
+    ServiceCount,   // instance
+    LeaseCount,     // instance
+    Service(u64),   // persistent
+    Lease(u64),     // persistent
+    PendingUpgrade, // instance (appended)
 }
 ```
 
@@ -424,6 +466,109 @@ pub enum DataKey {
 `SCV_SYMBOL` variant name — so `DataKey::Lease(7)` is the wire key
 `Vec[Symbol("Lease"), u64(7)]`. This matters if you read contract data directly
 with `getContractData`; see the [developer guide](developer-guide.md#reading-contract-state-and-events).
+
+### Storage classes and TTL policies
+
+Soroban expires storage: every key below has a lifetime, and when it runs out the
+host deletes the entry. Two operations keep an entry alive — a **save** on a
+write path (`save_service`, `save_lease`, the instance writes) and an **explicit
+bump** (`bump_service`, `bump_lease`, documented under
+[Storage maintenance](#storage-maintenance)). Reads do neither. That split is
+deliberate and it is priced: an extension bills the caller for rent across the
+whole extended horizon, so a view that bumped what it read would turn a free
+lookup into a large fee. `test_bump_lease_is_where_the_rent_lives` pins the
+difference — the pure read costs 113 stroops, `bump_lease` costs 48,798, of
+which 48,684 is the rent for the horizon it just bought.
+
+The numbers come from `contracts/registry/src/storage.rs`:
+
+| Constant | Ledgers | Wall clock at 5s blocks |
+| --- | --- | --- |
+| `LEDGER_CLOSE_SECS` | — | 5 seconds |
+| `LEDGER_BUMP_THRESHOLD` | `17_280` | 1 day — below this remaining life, a save or a bump extends the entry |
+| `LEDGER_BUMP_EXTEND` | `518_400` | 30 days — the horizon instance and `Service` entries are extended to |
+| `MAX_ENTRY_TTL_LEDGERS` | `1_555_200` | 90 days — the ceiling every extension in this module is clamped to |
+
+The last row is a policy bound rather than a network constant. `ttl_ceiling`
+returns `min(MAX_ENTRY_TTL_LEDGERS, env.storage().max_ttl())`, so no call can ask
+for more than 90 days of lifetime and no call can contradict a network that
+publishes a smaller `maxEntryTtl` (6,312,000 ledgers on Pubnet and Testnet).
+Because `create_lease` caps a lease at 30 days, the clamp never truncates a
+well-formed lease; what it bounds is an entry whose `expires_at` says something
+else — one migrated in by an upgrade, or created after a future raise of
+`MAX_LEASE_DURATION_SECS`.
+
+| Key | Class | Holds | Extended by | TTL policy | If it is never extended |
+| --- | --- | --- | --- | --- | --- |
+| `Admin` | Instance | `Address` of the protocol admin | `init`, `set_token` (only when the token actually changes; a repeat call is a no-op), `register_service`, `create_lease` — each via `extend_instance_ttl` | extend to 30 days, clamped, when less than 1 day is left | The whole contract instance entry is evicted: the id stops resolving, and admin, token and both counters are gone with it. |
+| `Token` | Instance | SEP-41 escrow token `Address` | as `Admin` | as `Admin` | as `Admin`. Reads answer `TokenNotSet`, writes answer `NotInitialized` long before eviction, so a missing value is a bug report, not a normal state. |
+| `ServiceCount` | Instance | `u64`, next service id | as `Admin` | as `Admin` | as `Admin`. It resets to `0` on a fresh instance, which is why id monotonicity is only guaranteed within one live instance. |
+| `LeaseCount` | Instance | `u64`, next lease id | as `Admin` | as `Admin` | as `ServiceCount`. |
+| `Service(u64)` | Persistent | `Service` struct (provider, rate, endpoint hash, active) | `save_service` — so `register_service` and `set_service_active`; `create_lease` via `extend_service_ttl`; and `bump_service`. **Not** `get_service`, `settle_lease` (which reads the service), or any view | extend to 30 days, clamped, when less than 1 day is left | The entry is dropped and every call naming that id answers `ServiceNotFound` (4) — including `settle_lease` on leases that are still live. Nothing resurrects it: re-registering mints a **new** id, so the old leases are orphaned. The defence is `bump_service`, which needs no authorisation and is paid for by whoever calls it. |
+| `Lease(u64)` | Persistent | `Lease` struct (allotted and used calls, `expires_at`, `locked_deposit`, `settled`) | `save_lease` — so `create_lease`, `settle_lease`, `revoke_expired_lease`; and `bump_lease`. **Not** the `get_lease`, `lease_status`, `remaining_calls`, `locked_balance` views | lease-specific: see the next section | The entry is dropped and `get_lease` answers `LeaseNotFound` (6). Settlement and the consumer's refund path both begin by reading the lease, so an evicted lease can be neither settled nor refunded. `bump_lease` prevents that while the entry still exists and can do nothing after it is gone. |
+
+A registry that is deployed and then left unused is not kept alive by reads:
+`settle_lease`, `revoke_expired_lease`, `upgrade`, `bump_service`, `bump_lease`
+and every view leave the instance horizon alone. Instance eviction is a redeploy
+event, and [Networks](networks.md#after-a-testnet-reset) treats it as one.
+
+### The lease-specific extension
+
+`save_lease` and `extend_lease_ttl` (the body of `bump_lease`) do not use the
+generic 30-day horizon. Both call `storage::lease_ttl_extend`, which sizes the
+entry to the time the lease can actually be acted on:
+
+```text
+ledgers = (remaining_term_secs + SETTLE_GRACE_PERIOD_SECS) / LEDGER_CLOSE_SECS
+          + LEDGER_BUMP_THRESHOLD
+          then clamped to ttl_ceiling
+```
+
+`remaining_term_secs` is `expires_at - now`, saturating at zero, so the result
+covers the lease term, then the 24-hour provider settlement window, then one
+extra day of buffer for the consumer's `revoke_expired_lease` call. Worked
+examples:
+
+| Lease | Extension | Entry lives |
+| --- | --- | --- |
+| 1 hour, fresh | `35_280` ledgers | ~2 days |
+| 7 days, fresh | `155_520` ledgers | ~9 days |
+| 30 days (`MAX_LEASE_DURATION_SECS`), fresh | `552_960` ledgers | ~32 days |
+| already expired | `34_560` ledgers | 2 days — the grace window plus the buffer |
+| `expires_at` far past any legitimate term | `1_555_200` ledgers | 90 days — the clamp, not the term |
+
+The fourth row is why `bump_lease` is safe to expose permissionlessly: once a
+lease's horizon is in the past the ask stops shrinking. An expired lease is
+extended about two days at a time, never by its original term, so bumping the
+tail of a lease is a small explicit payment rather than an accidental re-buy of
+months of rent.
+
+Three properties make this safe rather than merely cheap:
+
+- **Bounded.** `create_lease` rejects durations above
+  `MAX_LEASE_DURATION_SECS` (`DurationTooLong`, 16) and every ask passes through
+  `ttl_ceiling`, so a caller cannot inflate the extension and rent stays
+  predictable. `bump_lease` takes only a `lease_id`: the horizon comes from the
+  lease's own `expires_at`, never from the caller.
+- **Never shorter than the money is locked.** The entry outlives
+  `expires_at + SETTLE_GRACE_PERIOD_SECS`, which is the last moment anyone can
+  claim against the lease. A deposit cannot outlive the record that authorises
+  paying it — the invariant `docs/security.md` states as "every lease has a
+  consumer path to a full refund, for its entire TTL".
+- **Only ever forward.** Soroban's `extend_ttl` raises `liveUntilLedgerSeq` and
+  cannot lower it, so a bump can never shorten a lease somebody already paid for
+  (`test_bump_lease_cannot_shorten_a_live_lease`).
+
+One asymmetry is worth stating plainly: keeping an entry alive is not the same as
+being able to read it. `bump_lease` refuses a settled lease with
+`LeaseAlreadySettled` (7) because its funds have already moved and extending it
+would only grow state, and `bump_service` answers `ServiceNotFound` (4) for an
+unknown id so that nobody pays rent for an entry that was never there.
+
+The old behaviour — extending every lease to the generic 30-day horizon on every
+read — charged a one-hour lease thirty days of Soroban rent, and made the read
+path expensive. That is why the calculation is per-lease, and why reads no longer
+do it.
 
 ## Error codes
 
@@ -449,6 +594,12 @@ never reused.
 | 15 | `Overflow` | checked arithmetic failed |
 | 16 | `DurationTooLong` | lease duration above `MAX_LEASE_DURATION_SECS` |
 | 17 | `DepositTooLarge` | deposit above `MAX_LEASE_DEPOSIT` |
+| 18 | `AttestorNotConfigured` | `settle_lease_attested` on a service with no attestor |
+| 19 | `AttestationRequired` | plain `settle_lease` on a service that requires one |
+| 20 | `AttestationMismatch` | attestation does not match the lease, service or calls |
+| 21 | `AttestationStale` | attestation's `valid_until` has passed |
+| 22 | `NoPendingUpgrade` | `cancel_upgrade`/`execute_upgrade` with no proposal |
+| 23 | `UpgradeDelayNotElapsed` | `execute_upgrade` before `execute_after` |
 
 ## Invoking with the Stellar CLI
 
