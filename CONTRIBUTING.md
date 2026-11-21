@@ -21,13 +21,15 @@ cargo build --all                  # compile
 cargo test --all                   # run the full test suite
 cargo fmt --all                    # format
 cargo clippy --all-targets -- -D warnings
+cargo clippy --target wasm32v1-none --release --all -- -D warnings
 
 # lint every tracked shell script (the CI Shellcheck job runs the same command)
 git ls-files -z '*.sh' | xargs -0 shellcheck
 ```
 
 Everything must be green **before** you open a PR — CI runs exactly the
-commands above, plus `cargo build --target wasm32v1-none --release --all` and a
+commands above, plus `cargo build --target wasm32v1-none --release --all`,
+[`./scripts/check-no-std.sh`](#unsafe-code-and-std) and a
 ClamAV malware scan of the checkout and the built Wasm artifacts. The scan job
 ("Malware Scan") is a required check, so do not commit binaries or archives
 that you cannot explain; CI will fail the PR if a signature matches.
@@ -99,7 +101,7 @@ opening one. The checks that guard your branch are the CI jobs `Format`,
 | `contracts/registry/src/errors.rs` | Stable `Error` codes (never reuse a number). |
 | `contracts/registry/src/test.rs` | Lifecycle, SAC, event, upgrade and re-entrancy tests. |
 | `contracts/mock_token/` | Test-only SEP-41 token. |
-| `scripts/` | Deploy, issue generation, repo setup. |
+| `scripts/` | Deploy, no_std check, malware scan, issue generation, repo setup. |
 | `docs/` | Protocol docs, contract reference, guides. |
 
 Before your first change, read [`docs/developer-guide.md`](./docs/developer-guide.md)
@@ -110,7 +112,7 @@ verify leases.
 
 ## Code standards
 
-- `#![no_std]` — contracts target `wasm32v1-none`; no `std` in contract code.
+- `#![no_std]` and no `unsafe` — see [Unsafe code and std](#unsafe-code-and-std).
 - **All token math is checked.** Use `checked_mul` / `checked_add` /
   `checked_sub` and map failures to `Error::Overflow`.
 - **Authenticate actors.** Every state-changing entry point calls
@@ -127,6 +129,38 @@ verify leases.
   recoverable conditions.
 - **Don't reuse error codes.** Append new variants; codes are part of the ABI.
 - Keep `lib.rs` entry points documented, including their auth and preconditions.
+
+## Unsafe code and std
+
+Contract crates (everything under `contracts/`) hold escrow, so the deployed
+Wasm must contain only code the Soroban SDK and this repository vouch for.
+
+- **No `unsafe`.** Each crate's `lib.rs` starts with:
+
+  ```rust
+  #![no_std]
+  #![cfg_attr(target_family = "wasm", forbid(unsafe_code))]
+  #![cfg_attr(not(target_family = "wasm"), deny(unsafe_code))]
+  ```
+
+  The deployed `wasm32v1-none` build uses `forbid`, which nothing can
+  override. The host build (tests, clippy) uses `deny`: soroban-sdk's
+  `testutils` feature registers contracts through the `ctor` crate, whose
+  generated code carries its own `#[allow(unsafe_code)]`, and `forbid` would
+  reject that. `deny` still rejects any `unsafe` written in the crate, on both
+  targets. Do not add `#[allow(unsafe_code)]`; if you believe you need unsafe,
+  open an issue first.
+- **No `std`.** Contracts are `#![no_std]` and may use `core` and
+  `soroban-sdk`. A new dependency must build for `wasm32v1-none`
+  with `default-features = false` where it has a `std` feature. Test-only
+  crates go in `[dev-dependencies]`, never `[dependencies]`.
+
+`./scripts/check-no-std.sh` enforces both in CI (the `Build (wasm32v1-none)`
+job). It fails if a crate drops these attributes, if the toolchain ships a
+`std` for `wasm32v1-none`, if the release build fails (a crate that needs `std`
+cannot build for that target), or if a built `.wasm` imports anything other
+than Soroban host modules or contains `std` source paths. Run it locally
+before opening a PR that touches dependencies or crate attributes.
 
 ## Adding a new entry point
 
@@ -172,6 +206,11 @@ A maintainer will approve the note before you begin coding.
 - Fill in `.github/pull_request_template.md`, including the security checklist.
 - Reference the issue you are closing (`Closes #123`).
 - A PR is merged once CI is green and a maintainer approves.
+- Area labels (`area: registry`, `area: mock-token`, `area: docs`,
+  `area: scripts`, `area: ci`) are added automatically from the paths you
+  touch; see [`.github/labeler.yml`](./.github/labeler.yml). If you add a
+  top-level directory, add a rule there and its label to
+  `scripts/setup-repo.sh`.
 
 ## Commit messages
 

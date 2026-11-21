@@ -15,6 +15,8 @@
 //! | `init`, `upgrade`, `register_service` | extend | — | — |
 //! | `set_token` | extend, unless the token is unchanged | — | — |
 //! | `set_service_active` | — | extend (save) | — |
+//! | `set_service_attestor` | — | attestor entry extends when set, is removed when cleared | — |
+//! | `set_service_attestor` | — | attestor entry extends when set, is removed when cleared | — |
 //! | `create_lease` | extend | extend | extend (save) |
 //! | `settle_lease`, `revoke_expired_lease` | — | — | extend (save) |
 //! | [`crate::KeyLeaseRegistry::bump_service`] | — | extend | — |
@@ -32,10 +34,10 @@
 //! indexes, so any write to any of a provider's services keeps that provider's
 //! catalogue alive, and no read extends it.
 
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
 use crate::errors::Error;
-use crate::types::{Lease, ProviderServicePage, Service};
+use crate::types::{Lease, PendingUpgrade, ProviderServicePage, Service};
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
 /// Expected Stellar ledger close time, used to translate lease durations into
@@ -100,6 +102,15 @@ pub enum DataKey {
     Service(u64),
     /// `Lease` by id (persistent storage).
     Lease(u64),
+    /// Optional ed25519 attestor key for a service (persistent storage).
+    ///
+    /// Kept out of [`Service`] on purpose: `Service` is a stored struct, so a
+    /// new field would change the encoding of every existing service entry. A
+    /// new key is invisible until the provider opts the service in.
+    ServiceAttestor(u64),
+    /// Pending, time-locked Wasm upgrade (instance storage). Append-only:
+    /// existing keys keep their wire encoding.
+    PendingUpgrade,
     /// Service ids registered by a provider, oldest first (persistent storage).
     ///
     /// Derived state, appended to by [`save_service`]: `Service.provider` stays
@@ -132,6 +143,23 @@ pub fn set_token(env: &Env, token: &Address) {
 
 pub fn get_token(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Token)
+}
+
+/// Store a pending upgrade, replacing any previous proposal.
+pub fn set_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingUpgrade, pending);
+}
+
+/// Return the pending upgrade, if one is queued.
+pub fn get_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+/// Drop a pending upgrade after execution or cancellation.
+pub fn remove_pending_upgrade(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 /// Bump the TTL of the instance (configuration) storage entry.
@@ -197,13 +225,55 @@ pub fn save_service(env: &Env, service: &Service) {
 /// Bump a service entry's TTL without reading it back to the caller.
 ///
 /// This is the only path that extends a service's lifetime other than saving
-/// it; [`get_service`] is a pure lookup.
+/// it; [`get_service`] is a pure lookup. The service's attestor entry, when it
+/// has one, is carried along: a lease keeps the service it leases from alive,
+/// and the attestor key decides whether a settlement needs a signature, so the
+/// two must not drift apart on the same call.
 pub fn extend_service_ttl(env: &Env, service_id: u64) {
-    let key = DataKey::Service(service_id);
     let extend_to = LEDGER_BUMP_EXTEND.min(ttl_ceiling(env));
+    env.storage().persistent().extend_ttl(
+        &DataKey::Service(service_id),
+        LEDGER_BUMP_THRESHOLD,
+        extend_to,
+    );
+
+    let attestor_key = DataKey::ServiceAttestor(service_id);
+    if env.storage().persistent().has(&attestor_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&attestor_key, LEDGER_BUMP_THRESHOLD, extend_to);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optional attestor
+// ---------------------------------------------------------------------------
+
+/// Register, replace or clear the ed25519 attestor key of a service.
+///
+/// `None` removes the entry, which is also how a service opts back out: no
+/// attestor key means `settle_lease` needs no signature, exactly as before this
+/// feature existed.
+pub fn set_service_attestor(env: &Env, service_id: u64, attestor: Option<&BytesN<32>>) {
+    let key = DataKey::ServiceAttestor(service_id);
+    match attestor {
+        Some(attestor) => {
+            env.storage().persistent().set(&key, attestor);
+            let extend_to = LEDGER_BUMP_EXTEND.min(ttl_ceiling(env));
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, extend_to);
+        }
+        None => env.storage().persistent().remove(&key),
+    }
+}
+
+/// Pure lookup for a service's attestor key. An absent entry means the service
+/// has not opted in to attestation.
+pub fn get_service_attestor(env: &Env, service_id: u64) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
-        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, extend_to);
+        .get(&DataKey::ServiceAttestor(service_id))
 }
 
 /// Pure lookup: reads a service and touches no storage metadata.
