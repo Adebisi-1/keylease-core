@@ -607,6 +607,7 @@ never reused.
 | 21 | `AttestationStale` | attestation's `valid_until` has passed |
 | 22 | `NoPendingUpgrade` | `cancel_upgrade`/`execute_upgrade` with no proposal |
 | 23 | `UpgradeDelayNotElapsed` | `execute_upgrade` before `execute_after` |
+| 24 | `InvalidEndpointHash` | `register_service` with an all-zero `endpoint_hash` |
 
 ## Invoking with the Stellar CLI
 
