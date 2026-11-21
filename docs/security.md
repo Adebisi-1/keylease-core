@@ -108,6 +108,106 @@ When `admin.require_auth()` is called inside `set_token` or `upgrade`:
 | **Cannot enforce** | Minimum threshold | The contract cannot verify whether the admin account is 1-of-1, 2-of-3, or 3-of-5 |
 | **Cannot enforce** | Signer set immutability | Signers and thresholds can be modified on the Stellar account via standard `SetOptions` operations without contract interaction |
 
+## Audit status
+
+**No external audit of this contract has been performed.** As of v0.2.1 no third
+party has reviewed, formally verified or signed off on `contracts/registry`. No
+firm is engaged and no report exists. Everything on this page is the project's own
+claim about its own code: read [Guarantees](#guarantees) as a specification of
+what the authors intended, not as an independent finding.
+
+### Coverage that exists
+
+| What | How much | Where |
+| --- | --- | --- |
+| Contract tests | 63 | `contracts/registry/src/test.rs`, run by `cargo test --all` |
+| Documented guarantees | 10 | [Guarantees](#guarantees) |
+| Invariants asserted in tests | 5 | [Invariants](#invariants) |
+| Threats modelled | 14 | [Threats considered](#threats-considered) |
+| CI gates | 8 | `Format`, `Clippy`, `Test`, `Build (wasm32v1-none)`, `Spell Check`, `Markdown Lint`, `Dependency Policy` (cargo-deny) and `Malware Scan` (ClamAV) in [`.github/workflows/ci.yml`](https://github.com/KeyLease-Security/keylease-core/blob/main/.github/workflows/ci.yml) |
+
+The counts are as of the revision this page is written against; each one is
+mechanically checkable from the file it names.
+
+Two of the 63 tests matter more than the rest, because they attack the contract
+instead of exercising it:
+
+- `test_reentrant_token_cannot_settle_a_lease_twice` registers a hostile token
+  whose `transfer` calls back into `settle_lease` while the first settlement is
+  still paying out. The attack is attempted once, and the test asserts the
+  re-entrant call errored and the lease ended up settled exactly once. This is
+  the only executable proof of the checks-effects-interactions ordering, and it
+  is the property that makes a malicious token non-exploitable rather than merely
+  inconvenient.
+- the full lifecycle test escrowed with the **real Stellar Asset Contract**
+  (`env.register_stellar_asset_contract_v2`) rather than `contracts/mock_token`,
+  so the money paths are checked against a token this project does not control.
+
+### What that coverage does not establish
+
+A green suite is easy to over-read, so the limits are stated explicitly.
+
+- **The threat model may be incomplete.** The 14 rows are the threats the authors
+  thought of. The main value of an audit is the rows it adds, and by definition
+  none of those are here yet.
+- **Arbitrary tokens are out of scope.** `set_token` accepts any SEP-41 address.
+  The suite proves the registry survives a re-entrant token; it cannot prove
+  anything about a token that deviates from the interface in ways the registry
+  does not expect.
+- **Only simulated-ledger behaviour is tested.** The tests run against the
+  `soroban-sdk` `Env`, not a deployed network, so instruction-footprint limits,
+  eviction under real storage pressure, and consensus-timing edges are not
+  covered here. The `soroban-sdk` test host does not enforce `maxEntryTtl` on
+  `extend_ttl` at all, so the TTL clamp is asserted from the policy value rather
+  than demonstrated as a host rejection. Read the TTL rules in the
+  [contract reference](contract-reference.md#storage-classes-and-ttl-policies) as
+  analysis, not as measurement.
+- **State growth is bounded per call, not in aggregate.** `bump_service` and
+  `bump_lease` are permissionless and each one charges its rent to the caller,
+  which is what makes them safe to expose — but nothing here bounds how many
+  entries may be kept alive or by whom. Persistent state that outlives its
+  usefulness is an operational cost, and the suite does not price it.
+- **Client code and provider middleware are not this contract.** Anything
+  integrating per [Integration](integration.md) is outside the audited surface,
+  and outside the surface these guarantees describe.
+- **The documentation itself is unaudited.** A page that describes behaviour the
+  code does not have is precisely the defect an audit catches and a test suite
+  cannot.
+
+### What a mainnet deployment would require
+
+[Deployments](deployments.md#mainnet) records Mainnet as ⛔ not deployed, and
+[Deployment → Mainnet](deployment.md#mainnet) gives the reason: deployment is
+deferred until the contract is audited. Audited is a process, not a badge, so the
+gate list a mainnet launch would have to clear first is:
+
+1. **An independent audit** by a contract-security firm, with the report
+   published and linked from the release notes and
+   [SECURITY.md](https://github.com/KeyLease-Security/keylease-core/blob/main/SECURITY.md).
+   A private report that stays private does not count as clearing this.
+2. **Findings fixed and re-proved.** Every High and Medium with a code fix and a
+   test in `contracts/registry/src/test.rs` that fails without the fix. Per
+   [the developer guide](developer-guide.md), each security-sensitive change gets
+   an adversarial case, not just a happy path.
+3. **Upgrade trust bounded.** Today a single admin key can swap the Wasm and
+   rewrite the escrow rules. Before mainnet value is in range, that key should be
+   multisig or timelocked, and the timelock itself reviewed (see
+   [Known limitations](#known-limitations)).
+4. **A live operation path.** Someone watching the event stream, a named owner
+   for the deployment, and a written response procedure. There is no
+   protocol-wide pause: `set_service_active(provider, service_id, false)` blocks
+   *new* leases on one service and leaves in-flight leases valid, and `upgrade` is
+   admin-only. That is a throttle, not a kill switch.
+5. **A staged value ramp.** Deploy, cap total escrow to something you would
+   accept losing, run real lease cycles against the cap, and only then raise it.
+6. **A verifiable record.** The mainnet contract id, Wasm hash and version in
+   [`docs/deployments.md`](deployments.md), each confirmed on-chain through
+   `version()`, `get_admin()` and `get_token()` rather than taken from the page.
+
+Until 1 through 4 are done, this contract is for Testnet and for limited-value
+evaluation. On Testnet every failure mode above costs an afternoon of redeploying
+fake XLM; on Mainnet it costs someone's deposit.
+
 ## Known limitations
 
 These are real and tracked as Drips Wave issues rather than hidden.
@@ -123,7 +223,8 @@ These are real and tracked as Drips Wave issues rather than hidden.
   `verified_calls`; it cannot independently observe HTTP usage. Consumers are
   protected by the fixed allotment and the refund path, not by proof of
   non-delivery.
-- **Not audited.** Do not escrow mainnet value you would be unhappy to lose.
+- **Not audited, and nothing on this page substitutes for it.** See
+  [Audit status](#audit-status).
 
 ## Deployment hygiene
 

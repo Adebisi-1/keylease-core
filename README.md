@@ -302,6 +302,41 @@ re-entrant token.
 > It must never be deployed to a network holding real value. The test suite
 > additionally exercises the real Stellar Asset Contract.
 
+### Audit status
+
+**This contract has not been independently audited.** As of v0.2.1 no third party
+has reviewed `contracts/registry`, no firm is engaged, and no report exists. The
+numbered properties in the model above are what the authors believe and test, not
+what an outside reviewer has confirmed.
+
+What stands in place of an audit:
+
+| Coverage | Amount |
+| --- | --- |
+| Contract tests, including two adversarial ones | 63 in `contracts/registry/src/test.rs` |
+| Security properties this README states | 8, in [Security model](#security-model) |
+| Invariants asserted outright in tests | 5, in [Security model → Invariants](./docs/security.md#invariants) |
+| Threats modelled | 14, in [Security model → Threats considered](./docs/security.md#threats-considered) |
+| CI gates on every PR | 8 (`Format`, `Clippy`, `Test`, `Build (wasm32v1-none)`, `Spell Check`, `Markdown Lint`, `Dependency Policy`, `Malware Scan`) |
+
+The eight above are the security properties this README claims; the five are the
+ones `contracts/registry/src/test.rs` asserts outright. They overlap and are not
+the same list, which is itself a fact an auditor would want.
+
+The adversarial pair is `test_reentrant_token_cannot_settle_a_lease_twice`, which
+installs a token that calls back into `settle_lease` mid-payout, and the full
+lifecycle test escrowed with the **native Stellar Asset Contract** instead of the
+mock. Neither is a substitute for a reviewer asking what the suite never thought
+to assert.
+
+Mainnet is therefore **not deployed and not scheduled**: it is deferred until an
+independent audit is published, its findings fixed with tests, and the admin's
+upgrade power bounded by a multisig or timelock. The full gate list is in
+[Security model → Audit status](./docs/security.md#audit-status), and
+[SECURITY.md](./SECURITY.md) carries the same statement for reporters. Use this
+on Testnet, where the escrow is fake XLM and the worst failure costs an
+afternoon of redeploying.
+
 ---
 
 ## Testing
