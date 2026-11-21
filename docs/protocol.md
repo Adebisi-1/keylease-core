@@ -157,6 +157,32 @@ These boundary conditions are unit-tested and asserted in
 - `test_expired_unsettled_lease_is_fully_reclaimed`: verifies consumer revocation succeeds at exactly `expires_at + GRACE`, returning 100% of escrowed deposit.
 - `test_lease_ttl_ask_floors_once_the_grace_window_is_past`: ensures storage rent bumps clamp gracefully after the grace period has elapsed.
 
+### Who may act, and what each path writes
+
+The arrows themselves — including the two transfers on the settlement path — are
+drawn in [Architecture — The money paths in order](architecture.md#the-money-paths-in-order).
+What the timing needs alongside it is the pairing of authorization and state
+write, because that pairing is what makes the deadline safe to race: every
+transition is recorded before money moves, so the actor that arrives second
+reverts instead of paying twice.
+
+| Transition | Authenticates | Timing required | Written before any token call | Money moved | Error if too early |
+| --- | --- | --- | --- | --- | --- |
+| `settle_lease` | provider, and it must own the service | expired, **or** `verified_calls == allocated_calls` | `used_calls`, `settled = true` | payout + refund | `LeaseNotSettleable` (8) |
+| `revoke_expired_lease` | consumer, and it must be the lease's | `now ≥ expires_at + SETTLE_GRACE_PERIOD_SECS` | `settled = true` only | full `locked_deposit` | `LeaseNotExpired` (9), then `RevokeWindowNotElapsed` (10) |
+
+Two consequences worth stating plainly:
+
+- A revoke leaves `used_calls` at `0`, so a revoked lease is book-keeping-wise a
+  lease that was never paid for; a settlement always satisfies
+  `payout + refund == locked_deposit`. The same ambiguity, with the read that
+  separates the two paths, is tabulated in
+  [`LeaseStatus` and the `settled` flag](contract-reference.md#telling-the-two-paths-apart).
+- The grace window ends the provider's *guarantee*, not the provider's *option*:
+  `settle_lease` has no upper deadline, so after `expires_at + 24h` either actor
+  can still finish the lease and the first transaction to land wins. That is why
+  consumers are told to act, not to assume the refund is automatic.
+
 ## Events
 
 Every transition publishes a typed Soroban event. Event names are the first
