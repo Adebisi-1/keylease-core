@@ -53,6 +53,19 @@ pub struct Lease {
     pub created_at: u64,
 }
 
+/// A proposed Wasm upgrade waiting out its mandatory delay.
+///
+/// Stored in instance storage so it survives as long as the registry's
+/// configuration. The delay is 24 hours, far inside the instance TTL horizon.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// Hash of the Wasm that will be installed on execution.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger timestamp at which execution becomes legal.
+    pub execute_after: u64,
+}
+
 /// Derived lifecycle state of a [`Lease`]. Discriminants are stable on the wire.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

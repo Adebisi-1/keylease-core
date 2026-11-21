@@ -7,13 +7,15 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled, RegistryInitialized,
-    ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
+    RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
+    UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{self, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS};
+use crate::test_wasm::UPGRADE_TEST_WASM;
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS,
+    MAX_LEASE_DURATION_SECS, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -62,6 +64,19 @@ fn setup(env: &Env) -> Ctx<'_> {
         provider,
         consumer,
     }
+}
+
+/// Ready-to-use registry: initialized, token configured, consumer funded and
+/// one active service registered.
+///
+/// Ledger time is deliberately *not* touched here. Every test sets its own
+/// timestamp so timing assumptions stay visible at the call site.
+fn setup_with_service(env: &Env) -> (Ctx<'_>, u64) {
+    let ctx = setup(env);
+    let service_id = ctx
+        .registry
+        .register_service(&ctx.provider, &RATE, &endpoint_hash(env));
+    (ctx, service_id)
 }
 
 fn endpoint_hash(env: &Env) -> BytesN<32> {
@@ -381,8 +396,7 @@ fn test_update_service_emits_event() {
 fn test_create_lease_locks_deposit_and_records_terms() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
 
     let lease_id = ctx
         .registry
@@ -541,8 +555,7 @@ fn test_create_lease_requires_configured_token() {
 fn test_full_usage_can_settle_before_expiry() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
@@ -564,8 +577,7 @@ fn test_full_usage_can_settle_before_expiry() {
 fn test_partial_settle_after_expiry_refunds_remainder() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
@@ -667,8 +679,7 @@ fn test_provider_cannot_over_claim_calls() {
 fn test_expired_unsettled_lease_is_fully_reclaimed() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
     let lease_id = ctx
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &100);
@@ -1170,8 +1181,7 @@ fn test_service_status_change_emits_event() {
 fn test_lease_lifecycle_emits_events() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
-    let ctx = setup(&env);
-    let service_id = register_default_service(&env, &ctx);
+    let (ctx, service_id) = setup_with_service(&env);
 
     let lease_id = ctx
         .registry
@@ -1250,22 +1260,154 @@ fn test_version_matches_contract_metadata() {
 }
 
 #[test]
-fn test_upgrade_is_admin_only() {
+fn test_propose_upgrade_records_hash_and_execution_ledger() {
     let env = Env::default();
-    let ctx = setup(&env);
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    // Read events before any further invocation: the host resets them per call.
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &UpgradeProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            new_wasm_hash: new_wasm_hash.clone(),
+            execute_after: 1_000 + UPGRADE_DELAY_SECS,
+        },
+    );
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.execute_after, 1_000 + UPGRADE_DELAY_SECS);
+}
+
+#[test]
+fn test_execute_upgrade_before_delay_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    // One second short of the recorded execution ledger.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS - 1);
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::UpgradeDelayNotElapsed))
+    );
+    // A failed execution must not consume the proposal.
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, new_wasm_hash);
+    assert_eq!(pending.execute_after, 1_000 + UPGRADE_DELAY_SECS);
+}
+
+#[test]
+fn test_execute_upgrade_after_delay_reports_hash_and_ledger() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let wasm_hash = env.deployer().upload_contract_wasm(UPGRADE_TEST_WASM);
+    ctx.registry.propose_upgrade(&ctx.admin, &wasm_hash);
+
+    // At the recorded ledger, execution becomes legal.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    ctx.registry.execute_upgrade(&ctx.admin);
+
+    // The install swaps the contract code, so all registry reads happen before
+    // execution. Host-level events remain readable afterwards.
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &ContractUpgraded {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            new_wasm_hash: wasm_hash,
+            execute_after: 1_000 + UPGRADE_DELAY_SECS,
+        },
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_prevents_execution() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &new_wasm_hash);
+
+    ctx.registry.cancel_upgrade(&ctx.admin);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &UpgradeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            new_wasm_hash: new_wasm_hash.clone(),
+        },
+    );
+    assert!(ctx.registry.get_pending_upgrade().is_none());
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::NoPendingUpgrade))
+    );
+}
+
+#[test]
+fn test_upgrade_entry_points_are_admin_only() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
     let impostor = Address::generate(&env);
     let new_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
 
     assert_eq!(
-        ctx.registry.try_upgrade(&impostor, &new_wasm_hash),
+        ctx.registry.try_propose_upgrade(&impostor, &new_wasm_hash),
         Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_cancel_upgrade(&impostor),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&impostor),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(ctx.registry.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn test_reproposal_restarts_the_delay() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, _service_id) = setup_with_service(&env);
+    let first_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let second_hash = BytesN::from_array(&env, &[2u8; 32]);
+    ctx.registry.propose_upgrade(&ctx.admin, &first_hash);
+
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS - 1);
+    ctx.registry.propose_upgrade(&ctx.admin, &second_hash);
+
+    let pending = ctx.registry.get_pending_upgrade().expect("pending upgrade");
+    assert_eq!(pending.new_wasm_hash, second_hash);
+    assert_eq!(
+        pending.execute_after,
+        1_000 + UPGRADE_DELAY_SECS - 1 + UPGRADE_DELAY_SECS
+    );
+    assert_eq!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Ok(Error::UpgradeDelayNotElapsed))
     );
 }
 
 // A successful upgrade installs a real Wasm uploaded with
 // `stellar contract upload`, which the unit-test host cannot fabricate (it
 // requires a valid `contractspecv0` metadata section). The success path is
-// exercised end to end by `scripts/deploy-testnet.sh --upgrade` against
+// exercised end to end by `scripts/upgrade.sh` against
 // Testnet; here we pin the authorization guard.
 
 #[test]

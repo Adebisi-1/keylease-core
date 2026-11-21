@@ -31,7 +31,7 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 use crate::errors::Error;
-use crate::types::{Lease, Service};
+use crate::types::{Lease, PendingUpgrade, Service};
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
 /// Expected Stellar ledger close time, used to translate lease durations into
@@ -102,6 +102,9 @@ pub enum DataKey {
     /// new field would change the encoding of every existing service entry. A
     /// new key is invisible until the provider opts the service in.
     ServiceAttestor(u64),
+    /// Pending, time-locked Wasm upgrade (instance storage). Append-only:
+    /// existing keys keep their wire encoding.
+    PendingUpgrade,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +129,23 @@ pub fn set_token(env: &Env, token: &Address) {
 
 pub fn get_token(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Token)
+}
+
+/// Store a pending upgrade, replacing any previous proposal.
+pub fn set_pending_upgrade(env: &Env, pending: &PendingUpgrade) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingUpgrade, pending);
+}
+
+/// Return the pending upgrade, if one is queued.
+pub fn get_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+/// Drop a pending upgrade after execution or cancellation.
+pub fn remove_pending_upgrade(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 /// Bump the TTL of the instance (configuration) storage entry.

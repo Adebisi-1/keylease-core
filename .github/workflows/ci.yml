@@ -37,9 +37,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+      # The host run above lints tests and the std/testutils build. This one
+      # lints the artifact that is actually deployed: the contracts compiled
+      # no_std for the Soroban target in release, against the SDK's guest
+      # environment instead of the host one. It stays in this job so the
+      # "Clippy" required check name in branch protection does not change.
+      - name: cargo clippy (wasm32v1-none)
+        run: cargo clippy --target wasm32v1-none --release --all -- -D warnings
 
   test:
     name: Test
@@ -62,6 +70,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Soroban contracts
         run: cargo build --target wasm32v1-none --release --all
+      # Fails if a contract crate drops #![no_std] or its unsafe_code lints,
+      # if the target ever ships a std to link, or if a built .wasm imports
+      # anything but Soroban host functions or carries std source paths.
+      # Kept in this job so the required check name does not change.
+      - name: Check Wasm is built without std
+        run: ./scripts/check-no-std.sh --no-build
 
   spellcheck:
     name: Spell Check

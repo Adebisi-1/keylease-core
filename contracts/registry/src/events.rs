@@ -206,7 +206,36 @@ pub struct LeaseRevoked {
     pub refund: i128,
 }
 
-/// Emitted when the admin upgrades the registry's Wasm.
+/// Emitted when the admin proposes a Wasm upgrade.
+///
+/// `execute_after` is the ledger timestamp at which `execute_upgrade` becomes
+/// legal, giving consumers a window to exit before the rules change.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposed {
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
+    /// Admin that proposed the upgrade.
+    pub admin: Address,
+    /// Hash of the Wasm that will be installed.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger timestamp before which execution is rejected.
+    pub execute_after: u64,
+}
+
+/// Emitted when the admin cancels a pending Wasm upgrade.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeCancelled {
+    /// Payload schema version; see the module docs.
+    pub schema_version: u32,
+    /// Admin that cancelled the upgrade.
+    pub admin: Address,
+    /// Hash of the Wasm that will no longer be installed.
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Emitted when the admin executes a proposed upgrade after the delay.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractUpgraded {
@@ -216,4 +245,6 @@ pub struct ContractUpgraded {
     pub admin: Address,
     /// Hash of the new Wasm installed by the Soroban deployer.
     pub new_wasm_hash: BytesN<32>,
+    /// Ledger timestamp that had to be reached before execution was allowed.
+    pub execute_after: u64,
 }
