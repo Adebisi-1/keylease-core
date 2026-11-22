@@ -39,7 +39,7 @@ will never be served — has to wait out that whole window before any funds move
 
 ### Flow
 
-```
+```text
 consumer                      registry                       provider
    |-- request_early_cancel ---->|                               |
    |                             |-- lease_cancellation_requested ->|
@@ -135,10 +135,10 @@ carries no funds and is harmless.
 
 | Event | Topics | Payload |
 | --- | --- | --- |
-| `lease_cancellation_requested` | `lease_id` | `consumer` |
-| `lease_cancellation_rejected` | `lease_id` | `provider` |
-| `lease_cancellation_withdrawn` | `lease_id` | `consumer` |
-| `lease_cancelled` | `lease_id` | `provider`, `consumer`, `verified_calls`, `payout`, `refund` |
+| `lease_cancellation_requested` | `lease_id` | `schema_version`, `consumer` |
+| `lease_cancellation_rejected` | `lease_id` | `schema_version`, `provider` |
+| `lease_cancellation_withdrawn` | `lease_id` | `schema_version`, `consumer` |
+| `lease_cancelled` | `lease_id` | `schema_version`, `provider`, `consumer`, `verified_calls`, `payout`, `refund` |
 
 `lease_cancelled` is the money-moving event, so indexers can treat it like
 `lease_settled` for reconciliation.
@@ -147,9 +147,9 @@ carries no funds and is harmless.
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
-| 17 | `CancellationNotRequested` | no pending request |
-| 18 | `CancellationAlreadyRequested` | a request is already pending |
-| 19 | `LeaseExpired` | early cancellation is only for active leases |
+| 25 | `CancellationNotRequested` | no pending request |
+| 26 | `CancellationAlreadyRequested` | a request is already pending |
+| 27 | `LeaseExpired` | early cancellation is only for active leases |
 
 ## Safety analysis
 

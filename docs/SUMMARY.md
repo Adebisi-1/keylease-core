@@ -23,9 +23,11 @@
 - [Developer guide](developer-guide.md)
 - [Deployment](deployment.md)
 - [Troubleshooting](troubleshooting.md)
+- [Protocol FAQ](faq.md)
 
 ## Project
 
+- [Design: time-locked upgrades](design/upgrade-timelock.md)
 - [Design: early cancellation](design/early-cancellation.md)
 - [Deployments](deployments.md)
 - Design notes
