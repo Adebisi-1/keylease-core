@@ -50,7 +50,7 @@ pub fn transfer_lease(
   `!lease.settled`, and `new_consumer != consumer`.
 - **Effect:** sets `lease.consumer = new_consumer` and saves the lease once.
   There is no second copy of ownership to keep in sync.
-- **Event:** `lease_transferred { lease_id | from, to }`.
+- **Event:** `lease_transferred { lease_id | schema_version, from, to }`.
 
 The new consumer does not authorize the assignment. Being given a lease is
 receiving an asset; requiring the recipient's signature would let a typo or a
@@ -74,8 +74,8 @@ Updating that one field is the atomic move the acceptance criteria ask for. A
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
-| 17 | `LeaseNotTransferable` | lease is settled or revoked |
-| 18 | `InvalidConsumer` | `new_consumer` equals the current consumer |
+| 25 | `LeaseNotTransferable` | lease is settled or revoked |
+| 26 | `InvalidConsumer` | `new_consumer` equals the current consumer |
 
 `Unauthorized` still covers a caller that is not the current consumer.
 
