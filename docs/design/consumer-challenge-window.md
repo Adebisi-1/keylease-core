@@ -55,7 +55,7 @@ service metadata.
 
 ### State machine
 
-```
+```text
 settle_lease (proposal)
         │
         ▼
@@ -123,11 +123,11 @@ the standard ~30-day persistent TTL on every save and read.
 
 | Event | Topics | Payload |
 | --- | --- | --- |
-| `lease_settlement_proposed` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund`, `challengeable_until` |
-| `lease_challenged` | `lease_id` | `consumer`, `evidence_hash` |
-| `lease_challenge_cancelled` | `lease_id` | `consumer` |
-| `lease_challenge_resolved` | `lease_id` | `admin`, `upheld` |
-| `lease_settled` | `lease_id` | `provider`, `verified_calls`, `payout`, `refund` |
+| `lease_settlement_proposed` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund`, `challengeable_until` |
+| `lease_challenged` | `lease_id` | `schema_version`, `consumer`, `evidence_hash` |
+| `lease_challenge_cancelled` | `lease_id` | `schema_version`, `consumer` |
+| `lease_challenge_resolved` | `lease_id` | `schema_version`, `admin`, `upheld` |
+| `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 
 `lease_settled` keeps its payload but now means **funds have been released**; it
 is emitted only by finalize and resolve, not by the proposal. Indexers that
@@ -138,13 +138,13 @@ watched it as "provider was paid" remain correct; they should add
 
 | Code | Variant |
 | --- | --- |
-| 17 | `SettlementNotFound` |
-| 18 | `SettlementFinalized` |
-| 19 | `ChallengeWindowClosed` |
-| 20 | `SettlementChallenged` |
-| 21 | `NoActiveChallenge` |
-| 22 | `ChallengeWindowStillOpen` |
-| 23 | `InvalidEvidence` |
+| 25 | `SettlementNotFound` |
+| 26 | `SettlementFinalized` |
+| 27 | `ChallengeWindowClosed` |
+| 28 | `SettlementChallenged` |
+| 29 | `NoActiveChallenge` |
+| 30 | `ChallengeWindowStillOpen` |
+| 31 | `InvalidEvidence` |
 
 ## Safety analysis
 
