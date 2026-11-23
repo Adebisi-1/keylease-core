@@ -36,10 +36,11 @@ cargo build --target wasm32v1-none --release --all
 ```
 
 CI also runs a cargo-deny dependency policy check (`deny.toml`), a shellcheck
-pass over every tracked shell script, and a ClamAV malware scan over the
-checkout and the built Wasm artifacts. CI job names are `Format`, `Shellcheck`,
-`Clippy`, `Test`, `Build (wasm32v1-none)`, `SBOM (CycloneDX)`, `Dependency Policy`
-and `Malware Scan` — these are the required status checks in branch protection.
+pass over every tracked shell script, a gitleaks secret scan, and a ClamAV
+malware scan over the checkout and the built Wasm artifacts. CI job names are
+`Format`, `Shellcheck`, `Clippy`, `Test`, `Build (wasm32v1-none)`,
+`SBOM (CycloneDX)`, `Secret Scan`, `Dependency Policy` and `Malware Scan` — these
+are the required status checks in branch protection.
 
 `SBOM (CycloneDX)` generates a machine-readable inventory of the crates in the
 registry Wasm from `Cargo.lock`, stamps the workspace version and full commit SHA
