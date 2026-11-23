@@ -33,26 +33,30 @@ take more than it is owed, and it cannot prevent the consumer's refund.
    `transfer_lease` rewrites the single `Lease.consumer` field, so access and the
    refund path always belong to the same address (`Unauthorized`,
    `LeaseNotTransferable`, `InvalidConsumer`).
-5. **A lease releases funds once.** Every money path checks `settled` first,
+5. **Early cancellation needs the provider's consent.** Only the consumer can
+   request or withdraw, only the owning provider can approve or reject, and only
+   approval moves funds (`Unauthorized`, `CancellationNotRequested`). A request
+   never blocks use, settlement or revocation and expires with the lease.
+6. **A lease releases funds once.** Every money path checks `settled` first,
    persists `settled = true`, and only then calls the token
    (`LeaseAlreadySettled`). Checks-effects-interactions is enforced by
    `test_reentrant_token_cannot_settle_a_lease_twice`.
-6. **Overflow aborts.** Deposit, payout and expiry arithmetic use
+7. **Overflow aborts.** Deposit, payout, refund and expiry arithmetic use
    `checked_mul`/`checked_add`/`checked_sub` and revert with `Overflow`.
-7. **Lease durations are storage-safe.** Durations above
+8. **Lease durations are storage-safe.** Durations above
    `MAX_LEASE_DURATION_SECS` (30 days) revert with `DurationTooLong`, and the
    persistent entry is extended for the term plus the grace window, so escrow
    cannot be evicted while it is claimable.
-8. **A single lease cannot escrow an unbounded amount.** A deposit that fits
+9. **A single lease cannot escrow an unbounded amount.** A deposit that fits
    `i128` but exceeds `MAX_LEASE_DEPOSIT` reverts with `DepositTooLarge`, before
    the lease id is allocated and before the token is called. Checked arithmetic
    alone cannot catch this: a product can be perfectly representable and still
    be three orders of magnitude more than the consumer meant to lock.
-9. **The admin cannot touch user funds.** It can only call `set_token` and
+10. **The admin cannot touch user funds.** It can only call `set_token` and
    `upgrade`.
-10. **Every mutation is authenticated.** No state-changing entry point trusts its
+11. **Every mutation is authenticated.** No state-changing entry point trusts its
    caller without `require_auth()`.
-11. **Every mutation is observable.** Each transition emits a typed Soroban event
+12. **Every mutation is observable.** Each transition emits a typed Soroban event
    with no secret material in it.
 
 ## Invariants
@@ -61,7 +65,8 @@ Asserted in `contracts/registry/src/test.rs`. The
 [contract reference](contract-reference.md) lists the exact error code for each
 violation.
 
-- `payout + refund == locked_deposit` for every lease.
+- `payout + refund == locked_deposit` for every settlement and every approved
+  early cancellation.
 - A settled lease never transitions again and cannot be transferred.
 - `settled` is true on-chain before any value leaves the contract.
 - No lease can leave more value than was escrowed.
@@ -80,6 +85,9 @@ violation.
 | Attacker transfers someone else's lease | `lease.consumer == consumer` check + `require_auth` on the current consumer |
 | Consumer transfers, then revokes as the old owner | Ownership is one field; the revoke/refund path reads the new consumer |
 | Lease changes hands after payout | `settled` check in `transfer_lease` (`LeaseNotTransferable`) |
+| Consumer cancels early without paying for served calls | Provider approval reports `verified_calls`; no unilateral path reduces the payout |
+| Provider approves a cancellation that was never requested | `CancellationNotRequested` |
+| Cancellation bypasses the grace window at expiry | Requests are rejected at/after `expires_at` (`LeaseExpired`) |
 | Re-entrant token pays a lease twice | checks-effects-interactions; adversarial test |
 | Provider strands funds by never settling | 24h grace, then full consumer refund |
 | Consumer races the provider at expiry | 24h grace window reserved for the provider |
@@ -233,6 +241,9 @@ These are real and tracked as Drips Wave issues rather than hidden.
   it. Transferring a service is a `wave-medium` issue.
 - **No rate updates.** Changing `rate_per_call` requires registering a new
   service; in-flight leases keep their original escrow.
+- **Early cancellation depends on the provider.** A consumer cannot exit early
+  unilaterally; if the provider never approves or rejects, the lease runs to
+  expiry and the normal revoke path applies. There is no penalty scheme yet.
 - **Settlement is a single report.** The contract trusts the provider's
   `verified_calls`; it cannot independently observe HTTP usage. Consumers are
   protected by the fixed allotment and the refund path, not by proof of

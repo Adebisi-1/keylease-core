@@ -62,8 +62,14 @@ pub enum Error {
     /// A page size outside `1..=MAX_PAGE_SIZE`, so serving it would read an
     /// unbounded number of ledger entries in one transaction.
     InvalidLimit = 24,
+    /// No early-cancellation request exists for the lease.
+    CancellationNotRequested = 25,
+    /// The lease already has a pending early-cancellation request.
+    CancellationAlreadyRequested = 26,
+    /// Early cancellation is only available before the lease expires.
+    LeaseExpired = 27,
     /// The lease is already settled or revoked and cannot change hands.
-    LeaseNotTransferable = 25,
+    LeaseNotTransferable = 28,
     /// The transfer target is the current consumer.
-    InvalidConsumer = 26,
+    InvalidConsumer = 29,
 }

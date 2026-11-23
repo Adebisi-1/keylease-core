@@ -136,6 +136,21 @@ cannot be transferred, and neither can a lease whose settlement is pending under
 a challenge window. An expired, unsettled lease can still be transferred: you
 are selling the refund claim, not access.
 
+### End the lease early
+
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  --send=yes -- request_early_cancel --consumer $CONSUMER --lease_id 1
+```
+
+The provider either approves — reporting the calls it actually served — or
+rejects the request. On approval you are refunded `rate × unused_calls`
+immediately and the lease ends; on rejection the lease keeps running exactly as
+before. You can withdraw a pending request with `withdraw_early_cancel`. Early
+cancellation is only available before `expires_at`; after expiry, use the revoke
+path below.
+
 ## 6. Get your money back
 
 **Normal path — automatic.** When the provider settles, the unused balance is
@@ -169,6 +184,8 @@ constant in the contract (`SETTLE_GRACE_PERIOD_SECS = 86_400`).
 | Provider never settles, `now ≥ expiry + 24h` | You `revoke` and get the entire deposit |
 | Provider never settles, inside the 24h window | Nothing yet — wait |
 | You transferred the lease | The new consumer receives all later refunds |
+| You request early cancel and the provider approves | `rate × unused_calls`, immediately |
+| You request early cancel and the provider rejects | Lease continues; nothing moves |
 
 ## Costs
 
