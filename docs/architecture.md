@@ -37,7 +37,7 @@ A pure Rust Soroban contract. It is the only component that can move value.
 | Module | Role |
 | --- | --- |
 | `lib.rs` | Entry points, `contractmeta!`, upgrade, lifecycle documentation. |
-| `types.rs` | `Service`, `Lease`, `LeaseStatus`, `Settlement`, `SettlementState`. |
+| `types.rs` | `Service`, `Lease`, `ServiceStats`, `LeaseStatus`, `Settlement`, `SettlementState`. |
 | `storage.rs` | `DataKey` layout, instance/persistent split, duration-aware TTL policy. |
 | `events.rs` | Typed `#[contractevent]` payloads for every transition. |
 | `errors.rs` | Stable error codes (part of the ABI). |
@@ -148,7 +148,7 @@ and the lease record are the same transaction, so either both are visible
 on-chain or neither is. A consumer that cannot fund the deposit never gets a
 lease id.
 
-### 2. `settle_lease` — two transfers, out of escrow
+### 2. `settle_lease` → `finalize_settlement` — two transfers, out of escrow
 
 ```mermaid
 sequenceDiagram
@@ -161,10 +161,14 @@ sequenceDiagram
     P->>R: settle_lease(provider, lease_id, verified_calls)
     Note over P,R: AUTH — provider.require_auth()
     Note over R: CHECKS — lease not settled, verified_calls ≤ allocated_calls,<br/>caller owns the service, and (expired OR verified_calls == allocated_calls)
-    Note over R: STATE WRITE — Lease(lease_id).used_calls = verified_calls and<br/>settled = true, persisted BEFORE any token call
-    R->>T: TRANSFER OUT 1 — transfer(registry → provider, verified_calls × rate_per_call)
+    Note over R: STATE WRITE — Lease(lease_id).used_calls = verified_calls and<br/>settled = true, plus Settlement(lease_id) = Pending
+    Note over R: EVENT — lease_settlement_proposed, topic lease_id, payload includes<br/>payout, refund and challengeable_until. No token call yet.
+    Note over C,R: 24h consumer challenge window; an admin may resolve a challenge
+    R->>R: finalize_settlement(lease_id) (permissionless, after the window)
+    Note over R: STATE WRITE — Settlement.state = Finalized and ServiceStats updated,<br/>persisted BEFORE any token call
+    R->>T: TRANSFER OUT 1 — transfer(registry → provider, payout)
     T-->>P: payout
-    R->>T: TRANSFER OUT 2 — transfer(registry → consumer, locked_deposit − payout)
+    R->>T: TRANSFER OUT 2 — transfer(registry → consumer, refund)
     T-->>C: refund
     Note over R: EVENT — lease_settled, topic lease_id, payload { schema_version,<br/>provider, verified_calls, payout, refund }
     R-->>P: ok
@@ -172,10 +176,11 @@ sequenceDiagram
 
 `payout + refund == locked_deposit` always, and a leg of zero is skipped rather
 than emitted as a transfer. The `STATE WRITE` above the two arrows is what makes
-the pair atomic against a malicious token: after a re-entrant call the lease
-already reads `settled`, so the second settlement attempt fails with
-`LeaseAlreadySettled` (7) instead of paying twice.
-`test_reentrant_token_cannot_settle_a_lease_twice` holds that line.
+the pair atomic against a malicious token: after a re-entrant call the settlement
+already reads `Finalized`, so a second payout fails with `SettlementFinalized`
+(29) instead of paying twice. `test_reentrant_token_cannot_settle_a_lease_twice`
+holds that line. A challenged settlement is frozen until the admin resolves it;
+an upheld challenge pays the consumer the full deposit instead.
 
 ### 3. `revoke_expired_lease` — one transfer, after the grace window
 
@@ -209,7 +214,7 @@ was never paid for.
 | Path | Who authenticates | State written first | Token transfers out |
 | --- | --- | --- | --- |
 | `create_lease` | consumer | `Lease(lease_id)`, `LeaseCount` | — (one transfer **in**) |
-| `settle_lease` | provider (must own the service) | `used_calls`, `settled = true` | payout + refund |
+| `settle_lease` → `finalize_settlement` | provider, then anyone after the challenge window | `used_calls`, `settled = true`, then `Settlement.state = Finalized` | payout + refund |
 | `revoke_expired_lease` | consumer (must be the lease's) | `settled = true` | full `locked_deposit` |
 
 Read the deadlines and the worked numbers in
@@ -241,6 +246,8 @@ claims to represent, and the consumer always has an exit.
 | `Service(u64)` | persistent | extended on save and by `bump_service` (≈30 days) |
 | `Lease(u64)` | persistent | extended for the lease's remaining term **plus** the 24h grace window and a one-day read buffer, or by `bump_lease` |
 | `Settlement(u64)` | persistent | extended on save and read to the standard ~30-day horizon; keyed by lease id |
+| `ServiceStats(u64)` | persistent | extended on settlement only (≈30 days); derived data, so aging out loses a convenience counter, not money |
+| `LeaseRevoked(u64)` | persistent | written when a consumer reclaims, given the same horizon as its lease in that transaction, so a readable lease always has a readable marker |
 | `CancelRequest(u64)` | persistent | pending early-cancellation request; standard ~30-day TTL, removed on withdraw/reject/approve |
 
 ### What extends a TTL, and what does not
@@ -252,10 +259,14 @@ calls extend anything:
 `create_lease`, `settle_lease`, `revoke_expired_lease`, `bump_service` and
 `bump_lease` — and, since PR #152, `set_token` only when it actually changes the
 configured token. Every read-only view — `get_service`, `get_lease`,
-`lease_status`, `remaining_calls`, `locked_balance` — is pure, so a simulation of
-a view costs instructions and no rent. At the ledger where an extension is due,
-`get_lease` estimates at 113 stroops (all instructions) against 48,798 for
-`bump_lease`, of which 48,684 is persistent rent.
+`lease_status`, `remaining_calls`, `locked_balance`, `service_stats` — is pure,
+so a simulation of a view costs instructions and no rent. In particular
+`lease_status` consulting the revocation marker and `service_stats` reading the
+settlement counters both extend nothing: each of those entries is sized by the
+write that created it, and a marker is never left alive longer than the lease it
+describes. At the ledger where an extension is due, `get_lease` estimates at 113
+stroops (all instructions) against 48,798 for `bump_lease`, of which 48,684 is
+persistent rent.
 
 Because reads stopped bumping, state that is only ever looked at has to be kept
 alive deliberately, and `create_lease` therefore extends the service it leases
