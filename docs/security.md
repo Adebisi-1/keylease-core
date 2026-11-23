@@ -29,42 +29,48 @@ take more than it is owed, and it cannot prevent the consumer's refund.
 3. **Only the consumer can revoke, and only after the grace window.** Combined
    checks for ownership, expiry and elapsed grace (`Unauthorized`,
    `LeaseNotExpired`, `RevokeWindowNotElapsed`).
-4. **A lease releases funds once.** Every money path checks `settled` first,
+4. **Early cancellation needs the provider's consent.** Only the consumer can
+   request or withdraw, only the owning provider can approve or reject, and only
+   approval moves funds (`Unauthorized`, `CancellationNotRequested`). A request
+   never blocks use, settlement or revocation and expires with the lease.
+5. **A lease releases funds once.** Every money path checks `settled` first,
    persists `settled = true`, and only then calls the token
    (`LeaseAlreadySettled`). Checks-effects-interactions is enforced by
    `test_reentrant_token_cannot_settle_a_lease_twice`; the service's running
    totals are written in the same window, before the transfers, so a re-entrant
    token cannot inflate them either.
-5. **Overflow aborts.** Deposit, payout, aggregate and expiry arithmetic use
+6. **Overflow aborts.** Deposit, payout, refund and expiry arithmetic use
    `checked_mul`/`checked_add`/`checked_sub` and revert with `Overflow`.
-6. **Lease durations are storage-safe.** Durations above
+7. **Lease durations are storage-safe.** Durations above
    `MAX_LEASE_DURATION_SECS` (30 days) revert with `DurationTooLong`, and the
    persistent entry is extended for the term plus the grace window, so escrow
    cannot be evicted while it is claimable.
-7. **A single lease cannot escrow an unbounded amount.** A deposit that fits
+8. **A single lease cannot escrow an unbounded amount.** A deposit that fits
    `i128` but exceeds `MAX_LEASE_DEPOSIT` reverts with `DepositTooLarge`, before
    the lease id is allocated and before the token is called. Checked arithmetic
    alone cannot catch this: a product can be perfectly representable and still
    be three orders of magnitude more than the consumer meant to lock.
-8. **Listed prices are leasable.** `register_service` rejects `rate_per_call`
+9. **Listed prices are leasable.** `register_service` rejects `rate_per_call`
    above `MAX_RATE_PER_CALL`, which equals `MAX_LEASE_DEPOSIT`. A service can
    therefore never be listed at a price that cannot fund even the smallest
    (one-call) lease, and the worst legal `rate × calls` product stays far inside
    `i128`, so a consumer's quote is always the amount that moves.
-9. **The admin cannot touch user funds.** It can only call `set_token` and
-   `upgrade`.
-10. **Every mutation is authenticated.** No state-changing entry point trusts its
-    caller without `require_auth()`.
-11. **A sponsor cannot spend your balance.** `create_lease_for` calls
+10. **The admin cannot touch user funds.** It can only call `set_token` and
+    `upgrade`.
+11. **Every mutation is authenticated.** No state-changing entry point trusts
+    its caller without `require_auth()`.
+12. **A sponsor cannot spend your balance.** `create_lease_for` calls
     `require_auth()` on the delegate *and* the consumer, and the deposit is
     transferred from the consumer; the refund and revoke paths stay bound to the
     consumer alone. Missing either signature reverts before any state changes.
-12. **Revocation is not settlement.** A reclaimed lease reports
+13. **Revocation is not settlement.** A reclaimed lease reports
     `LeaseStatus::Revoked`, keeps `used_calls == 0`, pays the provider nothing,
     and is excluded from `service_stats`, so revenue reporting cannot be
-    confused with a refund.
-13. **Every mutation is observable.** Each transition emits a typed Soroban event
-    with no secret material in it.
+    confused with a refund. An approved early cancellation is the opposite case:
+    the provider was paid for served calls, so it is counted like any other
+    settlement.
+14. **Every mutation is observable.** Each transition emits a typed Soroban
+    event with no secret material in it.
 
 ## Invariants
 
@@ -72,7 +78,8 @@ Asserted in `contracts/registry/src/test.rs`. The
 [contract reference](contract-reference.md) lists the exact error code for each
 violation.
 
-- `payout + refund == locked_deposit` for every lease.
+- `payout + refund == locked_deposit` for every settlement and every approved
+  early cancellation.
 - A settled lease never transitions again.
 - `settled` is true on-chain before any value leaves the contract.
 - No lease can leave more value than was escrowed.
@@ -90,6 +97,9 @@ violation.
 | Provider settles a lease twice | `settled` flag persisted before transfers + `LeaseAlreadySettled` |
 | Attacker settles someone else's lease | `service.provider == provider` check |
 | Attacker revokes someone else's lease | `lease.consumer == consumer` check |
+| Consumer cancels early without paying for served calls | Provider approval reports `verified_calls`; no unilateral path reduces the payout |
+| Provider approves a cancellation that was never requested | `CancellationNotRequested` |
+| Cancellation bypasses the grace window at expiry | Requests are rejected at/after `expires_at` (`LeaseExpired`) |
 | Re-entrant token pays a lease twice | checks-effects-interactions; adversarial test |
 | Provider strands funds by never settling | 24h grace, then full consumer refund |
 | Consumer races the provider at expiry | 24h grace window reserved for the provider |
@@ -114,6 +124,7 @@ can be a native Stellar multi-signature account (`G...`) or a multisig smart con
 ### Host-enforced authentication
 
 When `admin.require_auth()` is called inside `set_token` or `upgrade`:
+
 - If `admin` is a Stellar account, Soroban's runtime delegates authentication to
   Stellar's native account signing engine.
 - If the account is configured with multi-signature weights and operation thresholds
@@ -242,6 +253,9 @@ These are real and tracked as Drips Wave issues rather than hidden.
   it. Transferring a service is a `wave-medium` issue.
 - **No rate updates.** Changing `rate_per_call` requires registering a new
   service; in-flight leases keep their original escrow.
+- **Early cancellation depends on the provider.** A consumer cannot exit early
+  unilaterally; if the provider never approves or rejects, the lease runs to
+  expiry and the normal revoke path applies. There is no penalty scheme yet.
 - **Settlement is a single report.** The contract trusts the provider's
   `verified_calls`; it cannot independently observe HTTP usage. Consumers are
   protected by the fixed allotment and the refund path, not by proof of

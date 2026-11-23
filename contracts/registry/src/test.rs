@@ -2,7 +2,7 @@ use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{
         storage::{Instance as _, Persistent as _},
-        Address as _, Events as _, Ledger as _,
+        Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
     },
     token, xdr, Address, BytesN, Env, Event, IntoVal, Map, Symbol, TryFromVal, Val, Vec,
 };
@@ -10,18 +10,19 @@ use soroban_sdk::{
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
-    ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled,
-    RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
+    ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
+    LeaseCancellationWithdrawn, LeaseCancelled, LeaseCreated, LeaseDelegated, LeaseRevoked,
+    LeaseSettled, RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
     UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{
     self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS,
 };
 use crate::test_wasm::UPGRADE_TEST_WASM;
-use crate::types::Service;
+use crate::types::{Service, ServiceStats};
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE, UPGRADE_DELAY_SECS,
+    MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE, MAX_RATE_PER_CALL, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -592,15 +593,23 @@ fn test_quote_lease_reports_the_same_errors_as_create_lease() {
 }
 
 #[test]
-fn test_quote_lease_rejects_an_overflowing_deposit() {
+fn test_quote_lease_overflow_survives_the_rate_bound() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
     let ctx = setup(&env);
-    // A rate that overflows i128 for any call count above 1.
-    let service_id = ctx
-        .registry
-        .register_service(&ctx.provider, &i128::MAX, &endpoint_hash(&env));
+    // The rate this test used to reach `Overflow` through — one that overflows
+    // `i128` at two calls — can no longer be listed at all. `MAX_RATE_PER_CALL`
+    // stops it at registration with a code a client can act on.
+    assert_eq!(
+        ctx.registry
+            .try_register_service(&ctx.provider, &i128::MAX, &endpoint_hash(&env)),
+        Err(Ok(Error::RateTooHigh))
+    );
 
+    // `Overflow` is still reachable, and `quote_lease` still reports exactly
+    // what `create_lease` would: a legal deposit whose expiry leaves `u64`.
+    let service_id = register_service_at(&env, &ctx, MAX_LEASE_DEPOSIT / 2);
+    env.ledger().set_timestamp(u64::MAX);
     assert_eq!(
         ctx.registry.try_quote_lease(&service_id, &2, &3_600),
         Err(Ok(Error::Overflow))
@@ -1374,6 +1383,35 @@ fn test_revoked_lease_does_not_count_toward_service_stats() {
 }
 
 #[test]
+fn test_approved_early_cancellation_counts_toward_service_stats() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+    ctx.registry
+        .approve_early_cancel(&ctx.provider, &lease_id, &4);
+
+    // The provider was paid for 4 served calls, so the cancellation is a
+    // settlement of this service and the totals must show it; the 6 refunded
+    // calls earned nothing and stay out of `settled_calls`.
+    assert_eq!(
+        ctx.registry.service_stats(&service_id),
+        ServiceStats {
+            settled_leases: 1,
+            settled_calls: 4,
+            total_payout: RATE * 4,
+        }
+    );
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 4);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 4);
+}
+
+#[test]
 fn test_service_stats_are_scoped_per_service() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
@@ -1393,6 +1431,239 @@ fn test_service_stats_are_scoped_per_service() {
         ctx.registry.service_stats(&second_service),
         ServiceStats::zero()
     );
+}
+
+#[test]
+fn test_rate_update_above_max_is_rejected() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // `register_service` is not the only writer of a published price: raising it
+    // through `update_service` must hit the same bound, or a provider could
+    // list a leasable rate and then move the service out of reach.
+    assert_eq!(
+        ctx.registry.try_update_service(
+            &ctx.provider,
+            &service_id,
+            &(MAX_RATE_PER_CALL + 1),
+            &endpoint_hash(&env)
+        ),
+        Err(Ok(Error::RateTooHigh))
+    );
+    assert_eq!(
+        ctx.registry.get_service(&service_id).rate_per_call,
+        RATE,
+        "the rejected update must not have been stored"
+    );
+
+    // The ceiling itself still moves.
+    ctx.registry.update_service(
+        &ctx.provider,
+        &service_id,
+        &MAX_RATE_PER_CALL,
+        &endpoint_hash(&env),
+    );
+    assert_eq!(
+        ctx.registry.get_service(&service_id).rate_per_call,
+        MAX_RATE_PER_CALL
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Delegated lease creation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_delegate_can_create_lease_for_consumer() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+
+    let lease_id =
+        ctx.registry
+            .create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600);
+
+    // `env.events().all()` only covers the *last* invocation, so snapshot the
+    // creation's events before any read call overwrites them.
+    let events = env.events().all();
+
+    // The lease is the consumer's, and the consumer alone was debited.
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert_eq!(lease.consumer, ctx.consumer);
+    assert_eq!(lease.allocated_calls, 10);
+    assert!(!lease.settled);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
+    assert_eq!(ctx.token.balance(&delegate), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+
+    // `lease_created` is unchanged; `lease_delegated` records the courier.
+    let created = LeaseCreated {
+        lease_id,
+        schema_version: EVENT_SCHEMA_VERSION,
+        service_id,
+        consumer: ctx.consumer.clone(),
+        allocated_calls: 10,
+        expires_at: 4_600,
+        locked_deposit: RATE * 10,
+        rate_per_call: RATE,
+    };
+    let delegated = LeaseDelegated {
+        lease_id,
+        schema_version: EVENT_SCHEMA_VERSION,
+        delegate: delegate.clone(),
+        consumer: ctx.consumer.clone(),
+    };
+    let expected = Vec::from_array(
+        &env,
+        [
+            (ctx.registry_id(), created.topics(&env), created.data(&env)),
+            (
+                ctx.registry_id(),
+                delegated.topics(&env),
+                delegated.data(&env),
+            ),
+        ],
+    );
+    assert_eq!(events, expected);
+}
+
+#[test]
+fn test_delegate_cannot_create_lease_without_consumer_authorization() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+    let registry_id = ctx.registry_id();
+
+    // `setup` mocked every auth; this hands the host exactly one signature —
+    // the delegate's — so anything requiring the consumer must now fail.
+    env.mock_auths(&[MockAuth {
+        address: &delegate,
+        invoke: &MockAuthInvoke {
+            contract: &registry_id,
+            fn_name: "create_lease_for",
+            args: (&delegate, &ctx.consumer, &service_id, &10u32, &3_600u64).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result =
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600);
+
+    assert!(
+        result.is_err(),
+        "a delegate must not lock a consumer's deposit without the consumer's signature"
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_consumer_alone_cannot_create_a_delegated_lease() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+    let registry_id = ctx.registry_id();
+
+    // The mirror case: the consumer signed, but the named delegate never did,
+    // so the transaction that pays the fee cannot be attributed to it.
+    env.mock_auths(&[MockAuth {
+        address: &ctx.consumer,
+        invoke: &MockAuthInvoke {
+            contract: &registry_id,
+            fn_name: "create_lease_for",
+            args: (&delegate, &ctx.consumer, &service_id, &10u32, &3_600u64).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result =
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600);
+
+    assert!(
+        result.is_err(),
+        "create_lease_for must authenticate the delegate too"
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
+}
+
+#[test]
+fn test_delegated_lease_refund_belongs_to_the_consumer() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+
+    let lease_id = ctx
+        .registry
+        .create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &100);
+
+    // The delegate is not on the lease and cannot reclaim it.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    assert_eq!(
+        ctx.registry.try_revoke_expired_lease(&delegate, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &lease_id);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&delegate), 0);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Revoked);
+}
+
+#[test]
+fn test_delegated_creation_enforces_the_same_preconditions() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let delegate = Address::generate(&env);
+
+    // The delegate path shares the creation checks, it does not bypass them.
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &999, &10, &3_600),
+        Err(Ok(Error::ServiceNotFound))
+    );
+    let service_id = register_default_service(&env, &ctx);
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &0, &3_600),
+        Err(Ok(Error::InvalidCalls))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &0),
+        Err(Ok(Error::InvalidDuration))
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
+}
+
+#[test]
+fn test_delegated_creation_is_rejected_for_an_inactive_service() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let delegate = Address::generate(&env);
+    ctx.registry
+        .set_service_active(&ctx.provider, &service_id, &false);
+
+    assert_eq!(
+        ctx.registry
+            .try_create_lease_for(&delegate, &ctx.consumer, &service_id, &10, &3_600),
+        Err(Ok(Error::ServiceInactive))
+    );
+    assert_eq!(ctx.registry.lease_count(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,7 +1790,7 @@ fn test_error_codes_are_appended_not_renumbered() {
     assert_eq!(Error::Overflow as u32, 15);
     assert_eq!(Error::DurationTooLong as u32, 16);
     assert_eq!(Error::DepositTooLarge as u32, 17);
-    assert_eq!(Error::RateTooHigh as u32, 24);
+    assert_eq!(Error::RateTooHigh as u32, 28);
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,3 +3285,351 @@ fn test_lease_ttl_ask_follows_a_lowered_network_max_entry_ttl() {
     );
     assert_eq!(ask, env.storage().max_ttl());
 }
+
+// ---------------------------------------------------------------------------
+// Early consumer cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_early_cancel_with_provider_consent() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseCancellationRequested {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer: ctx.consumer.clone(),
+        },
+    );
+
+    // The request alone moves nothing.
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+
+    // The provider consent reports 4 served calls; the other 6 are refunded.
+    env.ledger().set_timestamp(1_500);
+    ctx.registry
+        .approve_early_cancel(&ctx.provider, &lease_id, &4);
+
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 4);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - RATE * 10 + RATE * 6
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert_eq!(lease.used_calls, 4);
+    assert!(lease.settled);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+
+    // The lease is finished: it cannot be approved, settled or revoked again.
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&ctx.provider, &lease_id, &4),
+        Err(Ok(Error::LeaseAlreadySettled))
+    );
+    assert_eq!(
+        ctx.registry.try_settle_lease(&ctx.provider, &lease_id, &4),
+        Err(Ok(Error::LeaseAlreadySettled))
+    );
+}
+
+#[test]
+fn test_early_cancel_conservation() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    // Zero calls served: the entire deposit comes back.
+    let unused_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    ctx.registry
+        .request_early_cancel(&ctx.consumer, &unused_lease);
+    ctx.registry
+        .approve_early_cancel(&ctx.provider, &unused_lease, &0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.provider), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+
+    // Every call served: no refund, and the provider receives the full deposit.
+    let used_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    ctx.registry
+        .request_early_cancel(&ctx.consumer, &used_lease);
+    ctx.registry
+        .approve_early_cancel(&ctx.provider, &used_lease, &10);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_provider_can_refuse_early_cancel() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+    ctx.registry.reject_early_cancel(&ctx.provider, &lease_id);
+
+    // The request is gone, so consent can no longer release funds.
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&ctx.provider, &lease_id, &2),
+        Err(Ok(Error::CancellationNotRequested))
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+
+    // The lease is untouched and still settles normally at expiry.
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &3);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 3);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - RATE * 10 + RATE * 7
+    );
+}
+
+#[test]
+fn test_early_cancel_requires_consent_and_ownership() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let impostor = Address::generate(&env);
+
+    // Only the consumer may request cancellation.
+    assert_eq!(
+        ctx.registry.try_request_early_cancel(&impostor, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_request_early_cancel(&ctx.provider, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+
+    // One pending request at a time.
+    assert_eq!(
+        ctx.registry
+            .try_request_early_cancel(&ctx.consumer, &lease_id),
+        Err(Ok(Error::CancellationAlreadyRequested))
+    );
+
+    // Only the owning provider may approve or reject.
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&impostor, &lease_id, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&ctx.consumer, &lease_id, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_reject_early_cancel(&impostor, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Approval without a request is rejected even for the real provider.
+    let other_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&ctx.provider, &other_lease, &1),
+        Err(Ok(Error::CancellationNotRequested))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_reject_early_cancel(&ctx.provider, &other_lease),
+        Err(Ok(Error::CancellationNotRequested))
+    );
+}
+
+#[test]
+fn test_consumer_can_withdraw_early_cancel() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let impostor = Address::generate(&env);
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+
+    assert_eq!(
+        ctx.registry.try_withdraw_early_cancel(&impostor, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    ctx.registry.withdraw_early_cancel(&ctx.consumer, &lease_id);
+
+    assert_eq!(
+        ctx.registry
+            .try_withdraw_early_cancel(&ctx.consumer, &lease_id),
+        Err(Ok(Error::CancellationNotRequested))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&ctx.provider, &lease_id, &2),
+        Err(Ok(Error::CancellationNotRequested))
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+}
+
+#[test]
+fn test_early_cancel_rejected_after_settlement() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    // The consumer asked early, then the provider settled partially instead.
+    env.ledger().set_timestamp(2_000);
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &4);
+
+    assert_eq!(
+        ctx.registry
+            .try_request_early_cancel(&ctx.consumer, &lease_id),
+        Err(Ok(Error::LeaseAlreadySettled))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_approve_early_cancel(&ctx.provider, &lease_id, &4),
+        Err(Ok(Error::LeaseAlreadySettled))
+    );
+
+    // Settlement cleared the pending request; nothing stale is left behind.
+    assert_eq!(
+        ctx.registry
+            .try_withdraw_early_cancel(&ctx.consumer, &lease_id),
+        Err(Ok(Error::CancellationNotRequested))
+    );
+}
+
+#[test]
+fn test_early_cancel_after_expiry_is_rejected() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+
+    let expired_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+    env.ledger().set_timestamp(1_100);
+    assert_eq!(
+        ctx.registry
+            .try_request_early_cancel(&ctx.consumer, &expired_lease),
+        Err(Ok(Error::LeaseExpired))
+    );
+
+    // A request made before expiry can still be approved after the lease expires.
+    let active_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+    env.ledger().set_timestamp(1_199);
+    ctx.registry
+        .request_early_cancel(&ctx.consumer, &active_lease);
+    env.ledger().set_timestamp(1_200);
+    ctx.registry
+        .approve_early_cancel(&ctx.provider, &active_lease, &5);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 5);
+}
+
+#[test]
+fn test_early_cancel_events() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseCancellationRequested {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer: ctx.consumer.clone(),
+        },
+    );
+
+    ctx.registry.reject_early_cancel(&ctx.provider, &lease_id);
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseCancellationRejected {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider: ctx.provider.clone(),
+        },
+    );
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+    ctx.registry.withdraw_early_cancel(&ctx.consumer, &lease_id);
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseCancellationWithdrawn {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer: ctx.consumer.clone(),
+        },
+    );
+
+    ctx.registry.request_early_cancel(&ctx.consumer, &lease_id);
+    ctx.registry
+        .approve_early_cancel(&ctx.provider, &lease_id, &6);
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider: ctx.provider.clone(),
+            consumer: ctx.consumer.clone(),
+            verified_calls: 6,
+            payout: RATE * 6,
+            refund: RATE * 4,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------

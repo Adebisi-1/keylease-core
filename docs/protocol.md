@@ -123,6 +123,36 @@ The second clause is the "consumer got what it paid for" fast path: if every
 allocated call was consumed, the provider should not have to wait for expiry to
 be paid.
 
+### Early cancellation with provider consent
+
+A consumer that stops using a service does not have to wait for expiry plus the
+24-hour grace window. They can ask the provider to end the lease early:
+
+1. `request_early_cancel(consumer, lease_id)` — consumer auth; requires an
+   unsettled, unexpired lease and no pending request. Moves no funds.
+2. The provider either `reject_early_cancel(provider, lease_id)` (request
+   cleared, lease unchanged) or `approve_early_cancel(provider, lease_id,
+   verified_calls)` (report served calls and release funds immediately).
+3. The consumer may `withdraw_early_cancel(consumer, lease_id)` at any time.
+
+Approval is a consented early settlement. The refund is defined exactly:
+
+```text
+payout = rate_per_call × verified_calls
+unused_calls = allocated_calls − verified_calls
+refund = rate_per_call × unused_calls
+```
+
+Every step uses checked arithmetic and `payout + refund` must equal
+`locked_deposit`. The rate is an integer price per whole call, so there is no
+division and **no rounding**: the refund is the exact value of the unused calls.
+
+Approval settles the lease, emits `lease_cancelled { lease_id, provider,
+consumer, verified_calls, payout, refund }`, and removes the request. The lease
+can no longer be settled or revoked. A request cannot be filed after expiry — the
+post-expiry revoke path remains the fallback when a provider is unresponsive —
+but a request filed before expiry may be approved after it.
+
 ### The 24-hour grace window
 
 After expiry there is a 24-hour window (`SETTLE_GRACE_PERIOD_SECS = 86_400`)
@@ -161,12 +191,46 @@ The exact inclusive and exclusive boundary conditions are:
 These boundary conditions are unit-tested and asserted in
 [`contracts/registry/src/test.rs`](https://github.com/KeyLease-Security/keylease-core/blob/main/contracts/registry/src/test.rs):
 
-- `test_revoke_before_expiry_is_rejected`: verifies that when `now < expires_at`, `revoke_expired_lease` returns `Err(Error::LeaseNotExpired)`.
-- `test_full_usage_can_settle_before_expiry`: confirms early settlement when `verified_calls == allocated_calls` even when `now < expires_at`.
-- `test_provider_can_settle_within_grace_window`: confirms provider payout at `expires_at + GRACE / 2` (12 hours into grace).
-- `test_revoke_during_grace_window_is_rejected`: asserts `revoke_expired_lease` reverts with `Err(Error::RevokeWindowNotElapsed)` at `expires_at + GRACE - 1` (the final second of provider grace).
-- `test_expired_unsettled_lease_is_fully_reclaimed`: verifies consumer revocation succeeds at exactly `expires_at + GRACE`, returning 100% of escrowed deposit.
-- `test_lease_ttl_ask_floors_once_the_grace_window_is_past`: ensures storage rent bumps clamp gracefully after the grace period has elapsed.
+- `test_revoke_before_expiry_is_rejected`: verifies that when
+  `now < expires_at`, `revoke_expired_lease` returns
+  `Err(Error::LeaseNotExpired)`.
+- `test_full_usage_can_settle_before_expiry`: confirms early settlement when
+  `verified_calls == allocated_calls` even when `now < expires_at`.
+- `test_provider_can_settle_within_grace_window`: confirms provider payout at
+  `expires_at + GRACE / 2` (12 hours into grace).
+- `test_revoke_during_grace_window_is_rejected`: asserts `revoke_expired_lease`
+  reverts with `Err(Error::RevokeWindowNotElapsed)` at `expires_at + GRACE - 1`
+  (the final second of provider grace).
+- `test_expired_unsettled_lease_is_fully_reclaimed`: verifies consumer revocation
+  succeeds at exactly `expires_at + GRACE`, returning 100% of escrowed deposit.
+- `test_lease_ttl_ask_floors_once_the_grace_window_is_past`: ensures storage rent
+  bumps clamp gracefully after the grace period has elapsed.
+
+### Who may act, and what each path writes
+
+The arrows themselves — including the two transfers on the settlement path — are
+drawn in [Architecture — The money paths in order](architecture.md#the-money-paths-in-order).
+What the timing needs alongside it is the pairing of authorization and state
+write, because that pairing is what makes the deadline safe to race: every
+transition is recorded before money moves, so the actor that arrives second
+reverts instead of paying twice.
+
+| Transition | Authenticates | Timing required | Written before any token call | Money moved | Error if too early |
+| --- | --- | --- | --- | --- | --- |
+| `settle_lease` | provider, and it must own the service | expired, **or** `verified_calls == allocated_calls` | `used_calls`, `settled = true` | payout + refund | `LeaseNotSettleable` (8) |
+| `revoke_expired_lease` | consumer, and it must be the lease's | `now ≥ expires_at + SETTLE_GRACE_PERIOD_SECS` | `settled = true` only | full `locked_deposit` | `LeaseNotExpired` (9), then `RevokeWindowNotElapsed` (10) |
+
+Two consequences worth stating plainly:
+
+- A revoke leaves `used_calls` at `0`, so a revoked lease is book-keeping-wise a
+  lease that was never paid for; a settlement always satisfies
+  `payout + refund == locked_deposit`. The same ambiguity, with the read that
+  separates the two paths, is tabulated in
+  [`LeaseStatus` and the `settled` flag](contract-reference.md#telling-the-two-paths-apart).
+- The grace window ends the provider's *guarantee*, not the provider's *option*:
+  `settle_lease` has no upper deadline, so after `expires_at + 24h` either actor
+  can still finish the lease and the first transaction to land wins. That is why
+  consumers are told to act, not to assume the refund is automatic.
 
 ## Events
 
@@ -183,6 +247,10 @@ spans a contract upgrade stays decodable (see
 | `service_registered` | `service_id` | `schema_version`, `provider`, `rate_per_call`, `endpoint_hash` |
 | `service_status_changed` | `service_id` | `schema_version`, `provider`, `is_active` |
 | `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
+| `lease_cancellation_requested` | `lease_id` | `schema_version`, `consumer` |
+| `lease_cancellation_rejected` | `lease_id` | `schema_version`, `provider` |
+| `lease_cancellation_withdrawn` | `lease_id` | `schema_version`, `consumer` |
+| `lease_cancelled` | `lease_id` | `schema_version`, `provider`, `consumer`, `verified_calls`, `payout`, `refund` |
 | `lease_delegated` | `lease_id` | `schema_version`, `delegate`, `consumer` |
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
@@ -313,22 +381,26 @@ These must hold for every reachable state. They are asserted in tests.
 3. **Bounded claim.** A provider can never receive more than
    `allocated_calls × rate_per_call`, and only for a service it owns.
 4. **Guaranteed exit.** Every lease has a consumer path to a full refund.
-5. **Checked math.** Deposit, payout, aggregate and timestamp arithmetic abort on
+5. **Checked math.** Deposit, payout, refund and timestamp arithmetic abort on
    overflow rather than truncating.
-6. **Claimable storage.** A lease's persistent entry outlives its term plus the
+6. **Consented early exit.** An early cancellation releases `rate × served_calls`
+   to the provider and `rate × unused_calls` to the consumer, with
+   `payout + refund == locked_deposit`, and only after the provider approves.
+7. **Claimable storage.** A lease's persistent entry outlives its term plus the
    grace window (`MAX_LEASE_DURATION_SECS = 30 days`), and so does the
    revocation marker recorded against it.
-7. **Funded, computable prices.** `register_service` rejects `rate_per_call`
+8. **Funded, computable prices.** `register_service` rejects `rate_per_call`
    above `MAX_RATE_PER_CALL`, and `create_lease` rejects a
    `rate_per_call × requested_calls` above `MAX_LEASE_DEPOSIT`. The two bounds
    are the same number, so every listed price can fund at least a one-call lease
    and no accepted lease can quote a deposit `i128` cannot hold.
-8. **Refund ownership.** Whoever created a lease — consumer or delegate — the
+9. **Refund ownership.** Whoever created a lease — consumer or delegate — the
    **consumer** is debited, is the refund recipient, and is the only address
    that can revoke.
-9. **Distinct closure.** A lease closed by the provider reads `Settled`; one
-   reclaimed by the consumer reads `Revoked`. Only `Settled` leases enter
-   `service_stats`.
+10. **Distinct closure.** A lease closed by the provider reads `Settled`; one
+    reclaimed by the consumer or ended by a cancellation the provider declined
+    reads differently from revenue. Only leases that paid the provider enter
+    `service_stats`.
 
 ## Storage and lifetime
 
@@ -339,6 +411,7 @@ These must hold for every reachable state. They are asserted in tests.
 | `Service(u64)` | persistent | TTL extended on save, on `create_lease` and by `bump_service`, never by a read |
 | `Lease(u64)` | persistent | TTL extended on save and by `bump_lease`, never by a read |
 | `ProviderServices(Address)` | persistent | service-id index per provider; extended by `save_service`, never by a read |
+| `CancelRequest(u64)` | persistent | pending early-cancellation request; cleared on withdraw/reject/approve |
 
 `LEDGER_BUMP_THRESHOLD = 17_280` ledgers (~1 day at 5s ledgers) and
 `LEDGER_BUMP_EXTEND = 518_400` ledgers (~30 days). For leases, `save_lease` and

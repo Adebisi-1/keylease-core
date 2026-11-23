@@ -37,7 +37,9 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
 use crate::errors::Error;
-use crate::types::{Lease, PendingUpgrade, ProviderServicePage, Service};
+use crate::types::{
+    CancelRequest, Lease, PendingUpgrade, ProviderServicePage, Service, ServiceStats,
+};
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
 /// Expected Stellar ledger close time, used to translate lease durations into
@@ -123,6 +125,8 @@ pub enum DataKey {
     /// contain an id the provider no longer owns — never report a service that
     /// belongs to someone else.
     ProviderServices(Address),
+    /// Pending early-cancellation request by lease id (persistent storage).
+    CancelRequest(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -545,4 +549,33 @@ pub fn mark_lease_revoked(env: &Env, lease: &Lease) {
 pub fn is_lease_revoked(env: &Env, lease: &Lease) -> bool {
     let key = DataKey::LeaseRevoked(lease.lease_id);
     env.storage().persistent().get(&key) == Some(true)
+}
+
+// ---------------------------------------------------------------------------
+// Early-cancellation requests
+// ---------------------------------------------------------------------------
+
+pub fn save_cancel_request(env: &Env, request: &CancelRequest) {
+    let key = DataKey::CancelRequest(request.lease_id);
+    env.storage().persistent().set(&key, request);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+}
+
+pub fn get_cancel_request(env: &Env, lease_id: u64) -> Option<CancelRequest> {
+    let key = DataKey::CancelRequest(lease_id);
+    let request = env.storage().persistent().get(&key);
+    if request.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+    request
+}
+
+pub fn remove_cancel_request(env: &Env, lease_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::CancelRequest(lease_id));
 }
