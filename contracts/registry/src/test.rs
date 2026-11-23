@@ -432,6 +432,37 @@ fn test_create_lease_locks_deposit_and_records_terms() {
     assert_eq!(ctx.registry.locked_balance(&lease_id), RATE * 10);
 }
 
+/// A failed escrow transfer must roll back the lease counter and storage (#34).
+#[test]
+fn test_failed_create_lease_rolls_back_counter_and_reuses_id() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, service_id) = setup_with_service(&env);
+
+    // Drain the consumer *after* setup so the registry reaches the token
+    // transfer after allocating the lease id and writing the lease.
+    ctx.token.transfer(&ctx.consumer, &ctx.admin, &FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.consumer), 0);
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    let failed = ctx
+        .registry
+        .try_create_lease(&ctx.consumer, &service_id, &1, &3_600);
+    assert!(failed.is_err(), "an unfunded escrow transfer must fail");
+    assert_eq!(ctx.registry.lease_count(), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+
+    // Re-fund the consumer and prove the reverted attempt did not consume id 1.
+    ctx.token.mint(&ctx.consumer, &FUNDING);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &1, &3_600);
+    assert_eq!(lease_id, 1);
+    assert_eq!(ctx.registry.lease_count(), 1);
+    assert_eq!(ctx.registry.get_lease(&lease_id).lease_id, 1);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE);
+}
+
 #[test]
 fn test_create_lease_rejects_zero_calls() {
     let env = Env::default();
@@ -444,6 +475,29 @@ fn test_create_lease_rejects_zero_calls() {
         Err(Ok(Error::InvalidCalls))
     );
     assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+}
+
+/// Zero is a valid ledger timestamp, not an uninitialized expiry (#38).
+#[test]
+fn test_create_lease_at_timestamp_zero_is_active_until_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(0);
+    let (ctx, service_id) = setup_with_service(&env);
+    let duration_secs = 3_600;
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &duration_secs);
+
+    assert_eq!(env.ledger().timestamp(), 0);
+    assert_eq!(ctx.registry.get_lease(&lease_id).expires_at, duration_secs);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+    assert_eq!(
+        ctx.registry.try_settle_lease(&ctx.provider, &lease_id, &4),
+        Err(Ok(Error::LeaseNotSettleable))
+    );
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+    assert_eq!(ctx.registry.lease_count(), 1);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
 }
 
 #[test]
@@ -1079,6 +1133,44 @@ fn test_partial_settle_after_expiry_refunds_remainder() {
     let lease = ctx.registry.get_lease(&lease_id);
     assert_eq!(lease.used_calls, 6);
     assert!(lease.settled);
+}
+
+/// A zero-call settlement after expiry must refund the entire escrow (#36).
+#[test]
+fn test_zero_call_settlement_after_expiry_refunds_entire_deposit() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, service_id) = setup_with_service(&env);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let deposit = RATE * 10;
+
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - deposit);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), deposit);
+
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &0);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseSettled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider: ctx.provider.clone(),
+            verified_calls: 0,
+            payout: 0,
+            refund: deposit,
+        },
+    );
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert!(lease.settled);
+    assert_eq!(lease.used_calls, 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.provider), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
 }
 
 #[test]
