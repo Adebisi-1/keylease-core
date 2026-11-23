@@ -1085,6 +1085,11 @@ do it.
 Codes are part of the ABI. New variants are **appended**; existing numbers are
 never reused.
 
+This table is pinned by `ERROR_ABI` in `contracts/registry/src/test.rs`:
+inserting a variant in the middle, renumbering one, or appending one without
+recording it there fails `cargo test`. Add a new code by appending it to
+`Error`, to `ERROR_ABI` and to this table together.
+
 | Code | Variant | Meaning |
 | --- | --- | --- |
 | 1 | `AlreadyInitialized` | `init` called twice |
