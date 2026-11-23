@@ -3633,3 +3633,169 @@ fn test_early_cancel_events() {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Id allocation, counters, exact-balance escrow and error ABI
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rejected_registration_does_not_consume_an_id() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // `register_service` validates the rate before `next_service_id`, so a
+    // rejected call must leave the counter exactly where it was.
+    assert_eq!(
+        ctx.registry
+            .try_register_service(&ctx.provider, &0, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(ctx.registry.service_count(), 0);
+
+    // The next valid registration still receives the first id.
+    let service_id = register_default_service(&env, &ctx);
+    assert_eq!(service_id, 1);
+    assert_eq!(ctx.registry.service_count(), 1);
+}
+
+#[test]
+fn test_deposit_can_consume_the_consumers_entire_balance() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, service_id) = setup_with_service(&env);
+
+    // A fresh consumer funded with exactly the deposit and not one unit more.
+    let calls: u32 = 10;
+    let deposit = RATE * calls as i128;
+    let consumer = Address::generate(&env);
+    ctx.token.mint(&consumer, &deposit);
+    assert_eq!(ctx.token.balance(&consumer), deposit);
+
+    let lease_id = ctx
+        .registry
+        .create_lease(&consumer, &service_id, &calls, &3_600);
+
+    // The whole balance moved into escrow: no implicit fee, no rounding.
+    assert_eq!(ctx.token.balance(&consumer), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), deposit);
+    assert_eq!(ctx.registry.get_lease(&lease_id).locked_deposit, deposit);
+
+    // Settle a partial use after expiry; the consumer gets the unused
+    // remainder back and nothing more.
+    let used: u32 = 6;
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &used);
+
+    let refund = RATE * (calls - used) as i128;
+    assert_eq!(ctx.token.balance(&consumer), refund);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * used as i128);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_fresh_counters_start_at_zero_and_move_only_on_success() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+
+    // Both views are part of the read interface before any mutation.
+    assert_eq!(ctx.registry.service_count(), 0);
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    // A failed registration moves neither counter.
+    assert_eq!(
+        ctx.registry
+            .try_register_service(&ctx.provider, &0, &endpoint_hash(&env)),
+        Err(Ok(Error::InvalidRate))
+    );
+    assert_eq!(ctx.registry.service_count(), 0);
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    // A successful registration moves only `service_count`.
+    let service_id = register_default_service(&env, &ctx);
+    assert_eq!(ctx.registry.service_count(), 1);
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    // A failed create moves neither counter.
+    assert_eq!(
+        ctx.registry
+            .try_create_lease(&ctx.consumer, &service_id, &0, &3_600),
+        Err(Ok(Error::InvalidCalls))
+    );
+    assert_eq!(ctx.registry.service_count(), 1);
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    // A successful create moves only `lease_count`.
+    ctx.registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    assert_eq!(ctx.registry.service_count(), 1);
+    assert_eq!(ctx.registry.lease_count(), 1);
+}
+
+/// Every published error code with the variant it names, in order. This is the
+/// table in `docs/contract-reference.md`; the two must change together, and only
+/// by appending.
+const ERROR_ABI: [(u32, Error); 28] = [
+    (1, Error::AlreadyInitialized),
+    (2, Error::NotInitialized),
+    (3, Error::Unauthorized),
+    (4, Error::ServiceNotFound),
+    (5, Error::ServiceInactive),
+    (6, Error::LeaseNotFound),
+    (7, Error::LeaseAlreadySettled),
+    (8, Error::LeaseNotSettleable),
+    (9, Error::LeaseNotExpired),
+    (10, Error::RevokeWindowNotElapsed),
+    (11, Error::InvalidCalls),
+    (12, Error::InvalidDuration),
+    (13, Error::InvalidRate),
+    (14, Error::TokenNotSet),
+    (15, Error::Overflow),
+    (16, Error::DurationTooLong),
+    (17, Error::DepositTooLarge),
+    (18, Error::AttestorNotConfigured),
+    (19, Error::AttestationRequired),
+    (20, Error::AttestationMismatch),
+    (21, Error::AttestationStale),
+    (22, Error::NoPendingUpgrade),
+    (23, Error::UpgradeDelayNotElapsed),
+    (24, Error::InvalidLimit),
+    (25, Error::CancellationNotRequested),
+    (26, Error::CancellationAlreadyRequested),
+    (27, Error::LeaseExpired),
+    (28, Error::RateTooHigh),
+];
+
+#[test]
+fn test_error_discriminants_are_pinned() {
+    for (code, variant) in ERROR_ABI {
+        // Variant -> number, as clients and `try_*` tests compare it.
+        assert_eq!(variant as u32, code, "{variant:?} changed its code");
+        assert_eq!(
+            soroban_sdk::Error::from(variant),
+            soroban_sdk::Error::from_contract_error(code),
+        );
+        // Number -> variant, as the host decodes it.
+        assert_eq!(
+            Error::try_from(soroban_sdk::Error::from_contract_error(code)),
+            Ok(variant),
+            "code {code} no longer decodes to {variant:?}"
+        );
+    }
+}
+
+#[test]
+fn test_error_codes_are_contiguous_with_no_gap_or_insertion() {
+    // Codes run 1..=N with no hole: the table above is indexed by code.
+    for (index, (code, _)) in ERROR_ABI.iter().enumerate() {
+        assert_eq!(*code, index as u32 + 1);
+    }
+    // Inserting a variant in the middle shifts every later discriminant, which
+    // `test_error_discriminants_are_pinned` catches. Appending one without
+    // recording it here is caught by the code past the tail now decoding.
+    let next = ERROR_ABI.len() as u32 + 1;
+    assert!(
+        Error::try_from(soroban_sdk::Error::from_contract_error(next)).is_err(),
+        "code {next} decodes: append the new variant to ERROR_ABI and the docs table"
+    );
+}
