@@ -22,6 +22,9 @@ version in [`Cargo.toml`](./Cargo.toml). Per-release notes live in
 - Checked-in ABI snapshot (`contracts/registry/abi_snapshot.json`) covering
   exported functions, event specs, and error discriminants, with a test that
   fails on drift and developer-guide instructions for legitimate updates.
+- CI reproducibility check: the Wasm build job rebuilds the release Wasm twice
+  from clean targets, compares hashes, and prints the registry hash for
+  comparison with `docs/deployments.md`.
 
 ### Changed
 
