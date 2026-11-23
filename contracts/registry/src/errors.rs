@@ -1,8 +1,9 @@
 use soroban_sdk::contracterror;
 
-/// Contract-level error codes returned by [`crate::KeyLeaseRegistry`].
-///
-/// Codes are stable and start at 1 (`0` is reserved by the host for success).
+/** Contract-level error codes returned by [`crate::KeyLeaseRegistry`].
+ * Codes are stable and start at 1 (`0` is reserved by the host for success).
+ * New codes must be appended; codes are part of the ABI.
+ */
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -68,4 +69,8 @@ pub enum Error {
     CancellationAlreadyRequested = 26,
     /// Early cancellation is only available before the lease expires.
     LeaseExpired = 27,
+    /// Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`. Appended after the
+    /// early-cancellation codes, so every number already published keeps its
+    /// meaning.
+    RateTooHigh = 28,
 }
