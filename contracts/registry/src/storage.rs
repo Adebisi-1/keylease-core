@@ -34,7 +34,7 @@
 //! indexes, so any write to any of a provider's services keeps that provider's
 //! catalogue alive, and no read extends it.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Symbol, TryFromVal, Val, Vec};
 
 use crate::errors::Error;
 use crate::types::{CancelRequest, Lease, PendingUpgrade, ProviderServicePage, Service};
