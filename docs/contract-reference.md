@@ -1000,6 +1000,7 @@ never reused.
 | 25 | `CancellationNotRequested` | no pending early-cancellation request |
 | 26 | `CancellationAlreadyRequested` | a request is already pending |
 | 27 | `LeaseExpired` | early cancellation requires `now < expires_at` |
+| 28 | `InvalidEndpointHash` | all-zero `endpoint_hash` passed to `register_service` |
 
 ## Invoking with the Stellar CLI
 

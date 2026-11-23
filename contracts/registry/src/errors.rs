@@ -68,4 +68,7 @@ pub enum Error {
     CancellationAlreadyRequested = 26,
     /// Early cancellation is only available before the lease expires.
     LeaseExpired = 27,
+    /// `register_service` was called with an all-zero `endpoint_hash`, which
+    /// commits to nothing and is treated as a placeholder.
+    InvalidEndpointHash = 28,
 }
