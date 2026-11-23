@@ -52,7 +52,10 @@ A provider should implement these steps, in order, and fail closed at every one:
 7. **Settle** with `settle_lease` when the lease expires or when the allotment is
    fully consumed, then **finalize** with `finalize_settlement` after the
    24-hour challenge window. Settlement only proposes the split; funds move at
-   finalization.
+   finalization. If the consumer asks to end the lease early
+   (`request_early_cancel`), decide with `approve_early_cancel` (report served
+   calls and release the unused balance) or `reject_early_cancel` (leave the
+   lease running).
 
 Step 5's local counter is an optimisation, not the source of truth. On-chain
 `allocated_calls × rate_per_call` bounds what the provider can ever be paid, so a
@@ -219,6 +222,10 @@ act on it without decoding.
 | `lease_challenged` / `lease_challenge_cancelled` | The consumer disputed (or withdrew a dispute of) the reported calls; the payout is frozen until resolved. |
 | `lease_challenge_resolved` | The admin decided a dispute (`upheld`), immediately followed by the payout event. |
 | `lease_settled` | Funds actually left escrow: reconcile payouts and refunds; close the lease in your ledger. |
+| `lease_cancellation_requested` | A consumer wants to exit early; route the decision to the provider. |
+| `lease_cancellation_rejected` / `lease_cancellation_withdrawn` | No cancellation: the lease continues and must still be settled. |
+| `lease_cancelled` | Early exit paid out; reconcile `payout` and `refund` like `lease_settled`. |
+| `lease_settled` | Reconcile payouts and refunds; close the lease in your ledger. |
 | `lease_revoked` | A consumer reclaimed an expired lease; the provider earned nothing. |
 | `service_registered` / `service_status_changed` | Keep a service catalogue in sync. |
 | `contract_upgraded` | Detect a new Wasm version (`version()` also changes). |

@@ -30,34 +30,38 @@ take more than it is owed, and it cannot prevent the consumer's refund.
 3. **Only the consumer can revoke, and only after the grace window.** Combined
    checks for ownership, expiry and elapsed grace (`Unauthorized`,
    `LeaseNotExpired`, `RevokeWindowNotElapsed`).
-4. **A lease releases funds once.** A settlement is proposed once (`settled` is
+4. **Early cancellation needs the provider's consent.** Only the consumer can
+   request or withdraw, only the owning provider can approve or reject, and only
+   approval moves funds (`Unauthorized`, `CancellationNotRequested`). A request
+   never blocks use, settlement or revocation and expires with the lease.
+5. **A lease releases funds once.** A settlement is proposed once (`settled` is
    persisted at proposal time), its state is persisted as `Finalized` before any
    token call, and every payout path rejects an already-finalized settlement
    (`LeaseAlreadySettled`, `SettlementFinalized`). Checks-effects-interactions is
    enforced by `test_reentrant_token_cannot_settle_a_lease_twice`.
-5. **The payout is locked during a dispute.** A pending settlement cannot be
+6. **The payout is locked during a dispute.** A pending settlement cannot be
    finalized before `challengeable_until`, and a challenged one cannot be
    finalized at all until the admin resolves it (`ChallengeWindowStillOpen`,
    `SettlementChallenged`).
-6. **Overflow aborts.** Deposit, payout and expiry arithmetic use
+7. **Overflow aborts.** Deposit, payout and expiry arithmetic use
    `checked_mul`/`checked_add`/`checked_sub` and revert with `Overflow`.
-7. **Lease durations are storage-safe.** Durations above
+8. **Lease durations are storage-safe.** Durations above
    `MAX_LEASE_DURATION_SECS` (30 days) revert with `DurationTooLong`, and the
    persistent entry is extended for the term plus the grace window, so escrow
    cannot be evicted while it is claimable.
-8. **A single lease cannot escrow an unbounded amount.** A deposit that fits
+9. **A single lease cannot escrow an unbounded amount.** A deposit that fits
    `i128` but exceeds `MAX_LEASE_DEPOSIT` reverts with `DepositTooLarge`, before
    the lease id is allocated and before the token is called. Checked arithmetic
    alone cannot catch this: a product can be perfectly representable and still
    be three orders of magnitude more than the consumer meant to lock.
-9. **The admin cannot redirect user funds.** It can call `set_token`, `upgrade`,
-   and `resolve_challenge`. Resolution only chooses between the provider's
-   proposal and a full consumer refund; there is no path that pays an arbitrary
-   recipient.
-10. **Every mutation is authenticated.** No state-changing entry point trusts its
+10. **The admin cannot redirect user funds.** It can call `set_token`, `upgrade`,
+    and `resolve_challenge`. Resolution only chooses between the provider's
+    proposal and a full consumer refund; there is no path that pays an arbitrary
+    recipient.
+11. **Every mutation is authenticated.** No state-changing entry point trusts its
     caller without `require_auth()`. `finalize_settlement` is permissionless by
     design: it can only release the exact split already recorded on chain.
-11. **Every mutation is observable.** Each transition emits a typed Soroban event
+12. **Every mutation is observable.** Each transition emits a typed Soroban event
     with no secret material in it.
 
 ## Invariants
@@ -66,7 +70,8 @@ Asserted in `contracts/registry/src/test.rs`. The
 [contract reference](contract-reference.md) lists the exact error code for each
 violation.
 
-- `payout + refund == locked_deposit` for every settlement.
+- `payout + refund == locked_deposit` for every settlement and every approved
+  early cancellation.
 - A settled lease never transitions again.
 - `settled` is true on-chain before any value leaves the contract.
 - A settlement is `Finalized` on-chain before any value leaves the contract.
@@ -86,6 +91,9 @@ violation.
 | Admin upholds every challenge to deny payouts | On-chain `lease_challenge_resolved` events; admin should be cold/multisig; consumer and provider can both observe |
 | Attacker settles someone else's lease | `service.provider == provider` check |
 | Attacker revokes someone else's lease | `lease.consumer == consumer` check |
+| Consumer cancels early without paying for served calls | Provider approval reports `verified_calls`; no unilateral path reduces the payout |
+| Provider approves a cancellation that was never requested | `CancellationNotRequested` |
+| Cancellation bypasses the grace window at expiry | Requests are rejected at/after `expires_at` (`LeaseExpired`) |
 | Re-entrant token pays a lease twice | checks-effects-interactions; adversarial test |
 | Provider strands funds by never settling | 24h grace, then full consumer refund |
 | Consumer races the provider at expiry | 24h grace window reserved for the provider |
@@ -243,6 +251,13 @@ These are real and tracked as Drips Wave issues rather than hidden.
 - **Resolution depends on the admin.** A challenged settlement stays locked until
   the admin acts. Settlement entries live for the standard ~30-day persistent TTL,
   so disputes should be resolved well inside that horizon.
+- **Early cancellation depends on the provider.** A consumer cannot exit early
+  unilaterally; if the provider never approves or rejects, the lease runs to
+  expiry and the normal revoke path applies. There is no penalty scheme yet.
+- **Settlement is a single report.** The contract trusts the provider's
+  `verified_calls`; it cannot independently observe HTTP usage. Consumers are
+  protected by the fixed allotment and the refund path, not by proof of
+  non-delivery.
 - **Not audited, and nothing on this page substitutes for it.** See
   [Audit status](#audit-status).
 

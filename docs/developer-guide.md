@@ -330,6 +330,7 @@ If you must read storage directly, `#[contracttype]` enums encode as an
 | `DataKey::Lease(7)` | `Vec[Symbol("Lease"), u64(7)]` |
 | `DataKey::Service(3)` | `Vec[Symbol("Service"), u64(3)]` |
 | `DataKey::Settlement(7)` | `Vec[Symbol("Settlement"), u64(7)]` |
+| `DataKey::CancelRequest(7)` | `Vec[Symbol("CancelRequest"), u64(7)]` |
 
 With `@stellar/stellar-sdk`:
 

@@ -118,6 +118,8 @@ keylease-core/
 | `finalize_settlement(lease_id)` | anyone | Release the proposed split once the challenge window closes. Emits `lease_settled`. |
 | `challenge_settlement(consumer, lease_id, evidence_hash)` / `cancel_challenge(consumer, lease_id)` | `consumer` | Dispute or withdraw a dispute of the reported call count. |
 | `resolve_challenge(admin, lease_id, upheld)` | `admin` | Uphold (full consumer refund) or reject the challenge. |
+| `request_early_cancel(consumer, lease_id)` / `withdraw_early_cancel(consumer, lease_id)` | `consumer` | Ask to end an active lease early, or withdraw the request. |
+| `approve_early_cancel(provider, lease_id, verified_calls)` / `reject_early_cancel(provider, lease_id)` | `provider` | Consent to an early exit (paying served calls and refunding the rest) or decline it. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
 | `bump_service(service_id)` | — | Extend a service entry's TTL to its standard horizon. Permissionless; the caller pays the rent. |
 | `bump_lease(lease_id)` | — | Extend a live lease entry using the lease TTL policy. Permissionless; rejects a settled lease. |
@@ -148,6 +150,10 @@ consumer of the stream should branch on it.
 | `lease_challenged` | `lease_id` | `schema_version`, `consumer`, `evidence_hash` |
 | `lease_challenge_cancelled` | `lease_id` | `schema_version`, `consumer` |
 | `lease_challenge_resolved` | `lease_id` | `schema_version`, `admin`, `upheld` |
+| `lease_cancellation_requested` | `lease_id` | `schema_version`, `consumer` |
+| `lease_cancellation_rejected` | `lease_id` | `schema_version`, `provider` |
+| `lease_cancellation_withdrawn` | `lease_id` | `schema_version`, `consumer` |
+| `lease_cancelled` | `lease_id` | `schema_version`, `provider`, `consumer`, `verified_calls`, `payout`, `refund` |
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
@@ -176,8 +182,11 @@ allocated_calls`. Settlement is two-phase: `settle_lease` proposes the payout an
 refund but moves nothing, the consumer has 24 hours to challenge the reported
 call count, and `finalize_settlement` releases the funds afterwards. A challenged
 settlement is resolved by the admin (uphold → full consumer refund, reject →
-proposal stands). The consumer's revoke path stays available only when no
-settlement was ever proposed.
+proposal stands). Before expiry, the consumer can also ask the provider to end
+the lease early (`request_early_cancel`); if the provider approves, served calls
+are paid and unused calls are refunded immediately. The consumer's revoke path
+stays available only when no settlement was ever proposed and the 24-hour
+provider grace window has elapsed.
 
 ---
 
@@ -366,10 +375,12 @@ afternoon of redeploying.
 cargo test --all
 ```
 
-The 112 tests in `contracts/registry/src/test.rs` cover:
+The 120 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
 - the happy path (lock → full-usage settle before expiry → finalize),
+- early cancellation with provider consent, refusal, withdrawal, authorization,
+  conservation at both extremes, and rejection after settlement,
 - partial settlement after expiry with correct refund,
 - the settlement challenge window (no-challenge fast path, boundary, challenge
   and cancellation, admin uphold/reject, authorization and evidence checks),
