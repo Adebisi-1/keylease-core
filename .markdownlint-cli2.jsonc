@@ -12,7 +12,7 @@
   // They hold no Markdown today; the exclusions keep a future `mkdocs` copy
   // step or a vendored `README.md` under `target/` from changing what CI sees.
   "globs": ["**/*.md"],
-  "ignores": ["node_modules/**", "site/**", "target/**"],
+  "ignores": ["node_modules/**", "site/**", "target/**", "PR_DESCRIPTION.md"],
   "config": {
     "MD013": {
       // Prose is hand-wrapped near 80 columns. The exceptions are shell
