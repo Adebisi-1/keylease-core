@@ -1,14 +1,11 @@
 #![no_std]
-//! # KeyLease Registry
-//! 
-//! # Documentation exemptions
-//! 
-//! The following allow attributes suppress doc warnings for items that cannot
-//! be fully documented due to Soroban macro limitations or private intra-doc
-//! links that are intentional:
-#![allow(missing_docs)]
-#![allow(rustdoc::private_intra_doc_links)]
-#![allow(rustdoc::broken_intra_doc_links)]
+// No unsafe code in contract crates (CONTRIBUTING.md#unsafe-code-and-std).
+// `forbid` on the deployed Wasm. On the host, soroban-sdk's `testutils`
+// feature registers contracts through `ctor`, whose expansion carries its own
+// `#[allow(unsafe_code)]`, which `forbid` rejects; `deny` still rejects any
+// unsafe written in this crate. scripts/check-no-std.sh checks these lines.
+#![cfg_attr(target_family = "wasm", forbid(unsafe_code))]
+#![cfg_attr(not(target_family = "wasm"), deny(unsafe_code))]
 
 //! # KeyLease Registry
 //!
@@ -27,6 +24,8 @@
 //!     |                            |    (escrow = rate * calls)     |
 //!     |                            |                                |
 //!     |-- settle_lease(used) ----->|  pay provider, refund rest --->|
+//!                                  |<-- request_early_cancel ------- |
+//!     |-- approve/reject --------->|  consent releases unused funds |
 //!     |                            |                                |
 //!                                  |  (if provider never settles)   |
 //!                                  |<-- revoke_expired_lease ------ |
@@ -60,8 +59,9 @@
 //!   duration plus the grace period whenever it is written, so escrow cannot
 //!   fall off the ledger. Reads never extend: `bump_lease` and `bump_service`
 //!   keep an entry alive on their own terms (see [`storage`]).
-//! * **Wasm upgrades** — the admin can install a new Wasm through the Soroban
-//!   deployer, and `contractmeta!` identifies the running version on-chain.
+//! * **Wasm upgrades** — the admin proposes a new Wasm through the Soroban
+//!   deployer and may only execute it after a 24-hour on-ledger delay, giving
+//!   consumers time to exit; `contractmeta!` identifies the running version.
 
 mod errors;
 mod events;
@@ -71,15 +71,23 @@ mod types;
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod test_wasm;
+
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String};
+
+use crate::types::CancelRequest;
 
 pub use crate::errors::Error;
 pub use crate::events::{
-    ContractUpgraded, EscrowTokenSet, LeaseCreated, LeaseRevoked, LeaseSettled,
+    ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
+    LeaseCancellationWithdrawn, LeaseCancelled, LeaseCreated, LeaseRevoked, LeaseSettled,
     RegistryInitialized, ServiceAttestorSet, ServiceRateUpdated, ServiceRegistered,
-    ServiceStatusChanged, EVENT_SCHEMA_VERSION,
+    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
-pub use crate::types::{Lease, LeaseStatus, Service, UsageAttestation};
+pub use crate::types::{
+    Lease, LeaseQuote, LeaseStatus, PendingUpgrade, ProviderServicePage, Service, UsageAttestation,
+};
 
 // On-chain contract metadata, readable from the ledger without the source.
 soroban_sdk::contractmeta!(key = "name", val = "KeyLeaseRegistry");
@@ -99,6 +107,13 @@ soroban_sdk::contractmeta!(
 /// Grace period after lease expiry during which the provider may still settle.
 /// After this window elapses, the consumer may reclaim the full deposit.
 pub const SETTLE_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60;
+
+/// Mandatory wait between proposing and executing a Wasm upgrade.
+///
+/// The delay is the consumers' exit window: a proposal is public for 24 hours
+/// on-ledger before any new rules can take effect, so a lease created under the
+/// current code can be settled before the contract changes underneath it.
+pub const UPGRADE_DELAY_SECS: u64 = 24 * 60 * 60;
 
 /// Longest lease the TTL policy is guaranteed to keep alive.
 ///
@@ -131,6 +146,12 @@ pub const MAX_LEASE_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 /// protects consumers from the contract's own arithmetic, so raising it should
 /// cost a Wasm upgrade and a release note, not one unsigned transaction.
 pub const MAX_LEASE_DEPOSIT: i128 = 1_000_000_000_000;
+
+/// Largest page [`KeyLeaseRegistry::services_for_provider`] will serve.
+///
+/// Every entry on a page costs one ledger read, so an unbounded `limit` would let
+/// a single call read a provider's whole index and blow the transaction budget.
+pub const MAX_PAGE_SIZE: u32 = 100;
 
 /// Domain separator prefixed to every usage-attestation message.
 ///
@@ -190,8 +211,9 @@ impl KeyLeaseRegistry {
     /// Initialize the registry and appoint `admin`.
     ///
     /// Can only be called once. The admin is the only account allowed to
-    /// configure the escrow token via [`Self::set_token`] or upgrade the
-    /// contract via [`Self::upgrade`].
+    /// configure the escrow token via [`Self::set_token`] or manage upgrades via
+    /// [`Self::propose_upgrade`], [`Self::execute_upgrade`] and
+    /// [`Self::cancel_upgrade`].
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         if storage::is_initialized(&env) {
@@ -240,22 +262,98 @@ impl KeyLeaseRegistry {
         Ok(())
     }
 
-    /// Install a new registry Wasm through the Soroban deployer. Admin only.
+    /// Queue a Wasm upgrade behind the mandatory [`UPGRADE_DELAY_SECS`] delay.
     ///
-    /// `new_wasm_hash` is the hash produced by `stellar contract upload`. The
-    /// contract id stays the same; storage, balances and in-flight leases are
-    /// preserved, which is why upgrades must never change the storage layout.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+    /// Admin only. `new_wasm_hash` is the hash produced by
+    /// `stellar contract upload`. A new proposal replaces a pending one and
+    /// restarts the delay, so the exit window can never be shortened. The hash
+    /// and the execution ledger timestamp are stored and reported by
+    /// [`UpgradeProposed`]; clients can read them with
+    /// [`Self::get_pending_upgrade`].
+    pub fn propose_upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
         admin.require_auth();
         require_admin(&env, &admin)?;
-        env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
-        ContractUpgraded {
+
+        let execute_after = env
+            .ledger()
+            .timestamp()
+            .checked_add(UPGRADE_DELAY_SECS)
+            .ok_or(Error::Overflow)?;
+        storage::set_pending_upgrade(
+            &env,
+            &PendingUpgrade {
+                new_wasm_hash: new_wasm_hash.clone(),
+                execute_after,
+            },
+        );
+        storage::extend_instance_ttl(&env);
+        UpgradeProposed {
             schema_version: EVENT_SCHEMA_VERSION,
             admin: admin.clone(),
             new_wasm_hash,
+            execute_after,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Drop a pending upgrade so it can never be executed. Admin only.
+    ///
+    /// Emits [`UpgradeCancelled`] with the abandoned hash. Cancelling when no
+    /// proposal is pending fails with [`Error::NoPendingUpgrade`].
+    pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+
+        let pending = storage::get_pending_upgrade(&env).ok_or(Error::NoPendingUpgrade)?;
+        storage::remove_pending_upgrade(&env);
+        storage::extend_instance_ttl(&env);
+        UpgradeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: admin.clone(),
+            new_wasm_hash: pending.new_wasm_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Install the pending Wasm, but only once the delay has elapsed. Admin only.
+    ///
+    /// Before execution, `ledger.timestamp()` must have reached the
+    /// `execute_after` recorded at proposal time; an early call fails with
+    /// [`Error::UpgradeDelayNotElapsed`]. The proposal is consumed atomically
+    /// with the install and [`ContractUpgraded`] reports both the installed hash
+    /// and the ledger timestamp that had to be reached.
+    ///
+    /// The contract id stays the same; storage, balances and in-flight leases
+    /// are preserved, which is why upgrades must never change the storage layout.
+    pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+
+        let pending = storage::get_pending_upgrade(&env).ok_or(Error::NoPendingUpgrade)?;
+        if env.ledger().timestamp() < pending.execute_after {
+            return Err(Error::UpgradeDelayNotElapsed);
+        }
+
+        // Persist the consumed proposal and publish the event before handing
+        // control to the deployer. A failing install reverts the whole
+        // transaction, so no event or storage change can outlive it.
+        storage::remove_pending_upgrade(&env);
+        storage::extend_instance_ttl(&env);
+        ContractUpgraded {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: admin.clone(),
+            new_wasm_hash: pending.new_wasm_hash.clone(),
+            execute_after: pending.execute_after,
+        }
+        .publish(&env);
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash);
         Ok(())
     }
 
@@ -524,6 +622,182 @@ impl KeyLeaseRegistry {
         Ok(lease_id)
     }
 
+    /// Request an early cancellation of an active lease. Requires consumer auth.
+    ///
+    /// The consumer is asking the provider to release the unused balance now
+    /// instead of waiting for expiry and the full grace window. The request
+    /// alone moves no funds and changes no balances; the provider decides by
+    /// calling [`Self::approve_early_cancel`] or [`Self::reject_early_cancel`].
+    ///
+    /// Only an unsettled, unexpired lease can be cancelled early, and a lease
+    /// can have at most one pending request. The consumer may withdraw the
+    /// request with [`Self::withdraw_early_cancel`].
+    pub fn request_early_cancel(env: Env, consumer: Address, lease_id: u64) -> Result<(), Error> {
+        consumer.require_auth();
+
+        let lease = storage::get_lease(&env, lease_id)?;
+        if lease.consumer != consumer {
+            return Err(Error::Unauthorized);
+        }
+        if lease.settled {
+            return Err(Error::LeaseAlreadySettled);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= lease.expires_at {
+            return Err(Error::LeaseExpired);
+        }
+        if storage::get_cancel_request(&env, lease_id).is_some() {
+            return Err(Error::CancellationAlreadyRequested);
+        }
+
+        storage::save_cancel_request(
+            &env,
+            &CancelRequest {
+                lease_id,
+                requested_at: now,
+            },
+        );
+
+        LeaseCancellationRequested {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Withdraw a pending early-cancellation request. Requires consumer auth.
+    pub fn withdraw_early_cancel(env: Env, consumer: Address, lease_id: u64) -> Result<(), Error> {
+        consumer.require_auth();
+
+        let lease = storage::get_lease(&env, lease_id)?;
+        if lease.consumer != consumer {
+            return Err(Error::Unauthorized);
+        }
+        if storage::get_cancel_request(&env, lease_id).is_none() {
+            return Err(Error::CancellationNotRequested);
+        }
+
+        storage::remove_cancel_request(&env, lease.lease_id);
+
+        LeaseCancellationWithdrawn {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Decline a pending early-cancellation request. Requires the service
+    /// provider's auth; the lease stays active and unchanged.
+    pub fn reject_early_cancel(env: Env, provider: Address, lease_id: u64) -> Result<(), Error> {
+        provider.require_auth();
+
+        let lease = storage::get_lease(&env, lease_id)?;
+        require_lease_provider(&env, &lease, &provider)?;
+
+        if storage::get_cancel_request(&env, lease_id).is_none() {
+            return Err(Error::CancellationNotRequested);
+        }
+
+        storage::remove_cancel_request(&env, lease.lease_id);
+
+        LeaseCancellationRejected {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Approve an early cancellation and release the refund immediately.
+    /// Requires the service provider's auth.
+    ///
+    /// The provider reports the `verified_calls` it actually served for the
+    /// lease. The payout is `verified_calls * rate_per_call` and the refund is
+    /// `locked_deposit - payout`, which is exactly the unused-call amount at the
+    /// stored rate. Both amounts are integers in the token's smallest unit, so
+    /// there is no rounding. The lease is settled in the same transaction, so it
+    /// cannot be settled or revoked again.
+    pub fn approve_early_cancel(
+        env: Env,
+        provider: Address,
+        lease_id: u64,
+        verified_calls: u32,
+    ) -> Result<(), Error> {
+        provider.require_auth();
+
+        let mut lease = storage::get_lease(&env, lease_id)?;
+        require_lease_provider(&env, &lease, &provider)?;
+        if lease.settled {
+            return Err(Error::LeaseAlreadySettled);
+        }
+        if storage::get_cancel_request(&env, lease_id).is_none() {
+            return Err(Error::CancellationNotRequested);
+        }
+        if verified_calls > lease.allocated_calls {
+            return Err(Error::InvalidCalls);
+        }
+
+        let service = storage::get_service(&env, lease.service_id)?;
+        let rate = service.rate_per_call;
+
+        // Refund is the unused-call value. `verified_calls <= allocated_calls`,
+        // so the subtraction cannot underflow, and the multiplication is
+        // checked like every other money path. Rate is a per-call integer, so
+        // no division or rounding is involved.
+        let unused_calls = lease
+            .allocated_calls
+            .checked_sub(verified_calls)
+            .ok_or(Error::Overflow)?;
+        let payout = rate
+            .checked_mul(verified_calls as i128)
+            .ok_or(Error::Overflow)?;
+        let refund = rate
+            .checked_mul(unused_calls as i128)
+            .ok_or(Error::Overflow)?;
+        if payout.checked_add(refund) != Some(lease.locked_deposit) {
+            return Err(Error::Overflow);
+        }
+
+        // checks-effects-interactions: settle the lease and clear the request
+        // before any token transfer.
+        lease.used_calls = verified_calls;
+        lease.settled = true;
+        storage::save_lease(&env, &lease);
+        storage::remove_cancel_request(&env, lease.lease_id);
+
+        let token_addr = storage::get_token(&env).ok_or(Error::TokenNotSet)?;
+        let client = token::Client::new(&env, &token_addr);
+        let contract = env.current_contract_address();
+        if payout > 0 {
+            client.transfer(&contract, &provider, &payout);
+        }
+        if refund > 0 {
+            client.transfer(&contract, &lease.consumer, &refund);
+        }
+
+        LeaseCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider,
+            consumer: lease.consumer,
+            verified_calls,
+            payout,
+            refund,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Settle a lease, paying the provider for `verified_calls` consumed calls
     /// and refunding the remainder to the consumer. Requires provider auth.
     ///
@@ -615,6 +889,8 @@ impl KeyLeaseRegistry {
         lease.used_calls = verified_calls;
         lease.settled = true;
         storage::save_lease(&env, &lease);
+        // A pending early-cancellation request is moot once the lease settles.
+        storage::remove_cancel_request(&env, lease.lease_id);
 
         let token_addr = storage::get_token(&env).ok_or(Error::TokenNotSet)?;
         let client = token::Client::new(&env, &token_addr);
@@ -676,6 +952,8 @@ impl KeyLeaseRegistry {
         // transfer so a re-entrant token cannot reclaim twice.
         lease.settled = true;
         storage::save_lease(&env, &lease);
+        // A pending early-cancellation request is moot once the lease is revoked.
+        storage::remove_cancel_request(&env, lease.lease_id);
 
         if refund > 0 {
             let token_addr = storage::get_token(&env).ok_or(Error::TokenNotSet)?;
@@ -768,6 +1046,14 @@ impl KeyLeaseRegistry {
         storage::get_token(&env).ok_or(Error::TokenNotSet)
     }
 
+    /// Pending upgrade waiting out its delay, if one has been proposed.
+    ///
+    /// The returned `execute_after` is a ledger timestamp; clients can compare
+    /// it with `ledger.timestamp()` to know when execution becomes possible.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        storage::get_pending_upgrade(&env)
+    }
+
     /// Version string embedded in the Wasm by `contractmeta!`.
     pub fn version(env: Env) -> String {
         String::from_str(&env, env!("CARGO_PKG_VERSION"))
@@ -788,11 +1074,103 @@ impl KeyLeaseRegistry {
         storage::get_service(&env, service_id)
     }
 
+    /// List the services `provider` owns, oldest first, one bounded page at a time.
+    ///
+    /// Reads `limit` entries from the provider's index starting at `after` and
+    /// returns them with the cursor to pass back for the next page. Keep paging
+    /// while `done` is `false`; `next` counts index entries consumed, not ids
+    /// returned, so a page can be legitimately short when an entry no longer
+    /// belongs to the provider.
+    ///
+    /// Ownership is re-checked against each `Service` record, which is the
+    /// authority: the index is derived state that is appended to on write but
+    /// pruned only on read. A provider with no index yet returns an empty page
+    /// rather than an error, so a new account can page before it registers.
+    ///
+    /// Pure read: like every other view, it extends no TTL, its own index entry
+    /// included. Use [`Self::register_service`] or [`Self::set_service_active`]
+    /// to keep a catalogue's index alive.
+    pub fn services_for_provider(
+        env: Env,
+        provider: Address,
+        after: u32,
+        limit: u32,
+    ) -> Result<ProviderServicePage, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::InvalidLimit);
+        }
+        storage::get_provider_services(&env, &provider, after, limit)
+    }
+
     /// Fetch a lease. Pure read: never extends a TTL.
     ///
     /// Use [`Self::bump_lease`] to keep an entry alive.
     pub fn get_lease(env: Env, lease_id: u64) -> Result<Lease, Error> {
         storage::get_lease(&env, lease_id)
+    }
+
+    /// Predict what [`Self::create_lease`] would lock, without auth or a transfer.
+    ///
+    /// Consumers and SDKs used to re-derive the deposit and the expiry off-chain,
+    /// where any change to contract semantics turns into silent drift. This view
+    /// runs the same validation, in the same order, as `create_lease`, so every
+    /// error it returns is the error `create_lease` would return for the same
+    /// arguments — with the single exception of a balance the registry never
+    /// reads: a quote says nothing about whether `consumer` can actually pay.
+    ///
+    /// `expires_at` is derived from the current ledger time, so a quote goes
+    /// stale as soon as the ledger advances.
+    pub fn quote_lease(
+        env: Env,
+        service_id: u64,
+        requested_calls: u32,
+        duration_secs: u64,
+    ) -> Result<LeaseQuote, Error> {
+        if requested_calls == 0 {
+            return Err(Error::InvalidCalls);
+        }
+        if duration_secs == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        if duration_secs > MAX_LEASE_DURATION_SECS {
+            return Err(Error::DurationTooLong);
+        }
+
+        let service = storage::get_service(&env, service_id)?;
+        if !service.is_active {
+            return Err(Error::ServiceInactive);
+        }
+
+        let locked_deposit = service
+            .rate_per_call
+            .checked_mul(requested_calls as i128)
+            .ok_or(Error::Overflow)?;
+        if locked_deposit <= 0 {
+            return Err(Error::InvalidRate);
+        }
+        // Same position in create_lease's order, for the same reason: `Overflow`
+        // means the product does not fit `i128`, `DepositTooLarge` means it fits
+        // and is still more than one lease may lock.
+        if locked_deposit > MAX_LEASE_DEPOSIT {
+            return Err(Error::DepositTooLarge);
+        }
+
+        // Mirrors create_lease: a registry with no escrow token could never fund
+        // the lease this quote predicts.
+        if storage::get_token(&env).is_none() {
+            return Err(Error::TokenNotSet);
+        }
+
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration_secs)
+            .ok_or(Error::Overflow)?;
+
+        Ok(LeaseQuote {
+            locked_deposit,
+            expires_at,
+        })
     }
 
     /// Derive the lifecycle status of a lease at the current ledger time.
@@ -822,6 +1200,15 @@ impl KeyLeaseRegistry {
         }
         Ok(lease.locked_deposit)
     }
+}
+
+/// Ensure `caller` is the provider that owns the lease's service.
+fn require_lease_provider(env: &Env, lease: &Lease, caller: &Address) -> Result<(), Error> {
+    let service = storage::get_service(env, lease.service_id)?;
+    if service.provider != *caller {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
 }
 
 /// Ensure `caller` matches the stored admin.

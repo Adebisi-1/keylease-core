@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN, Vec};
 
 /// A provider-published API or RPC service that can be leased by consumers.
 ///
@@ -40,6 +40,46 @@ pub struct Lease {
     pub locked_deposit: i128,
     /// Whether funds have been released (settled by provider or reclaimed by consumer).
     pub settled: bool,
+}
+
+/// A proposed Wasm upgrade waiting out its mandatory delay.
+///
+/// Stored in instance storage so it survives as long as the registry's
+/// configuration. The delay is 24 hours, far inside the instance TTL horizon.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// Hash of the Wasm that will be installed on execution.
+    pub new_wasm_hash: BytesN<32>,
+    /// Ledger timestamp at which execution becomes legal.
+    pub execute_after: u64,
+}
+
+/// What [`crate::KeyLeaseRegistry::create_lease`] would lock, computed without
+/// authorization and without moving funds.
+///
+/// The field names match [`Lease`] so a quote can be compared field by field
+/// with the lease it predicted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseQuote {
+    /// Deposit that would be transferred: `rate_per_call * requested_calls`.
+    pub locked_deposit: i128,
+    /// `ledger.timestamp() + duration_secs` at the moment the quote was read.
+    pub expires_at: u64,
+}
+
+/// One page of a provider's service list, as returned by
+/// [`crate::KeyLeaseRegistry::services_for_provider`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderServicePage {
+    /// Ids the provider owns right now, oldest first.
+    pub service_ids: Vec<u64>,
+    /// How many index entries this call consumed. Pass it back as `after`.
+    pub next: u32,
+    /// `true` once the provider's index is exhausted; `next == 0` means no index.
+    pub done: bool,
 }
 
 /// Derived lifecycle state of a [`Lease`]. Discriminants are stable on the wire.
@@ -102,4 +142,18 @@ pub struct UsageAttestation {
     pub valid_until: u64,
     /// Ed25519 signature over [`crate::usage_attestation_message`].
     pub signature: BytesN<64>,
+}
+
+/// A consumer's request to end a lease early with the provider's consent.
+///
+/// The request carries no refund amount: the provider approves it by reporting
+/// the calls actually served, and the contract derives the refund from the
+/// remaining calls at the stored rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelRequest {
+    /// Lease the consumer wants to end early.
+    pub lease_id: u64,
+    /// Ledger timestamp at which the consumer requested cancellation.
+    pub requested_at: u64,
 }

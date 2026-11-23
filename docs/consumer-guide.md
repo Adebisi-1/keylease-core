@@ -46,6 +46,16 @@ curl "https://friendbot.stellar.org?addr=$(stellar keys address consumer)"
 export REGISTRY=<your registry contract id>
 export CONSUMER=$(stellar keys address consumer)
 
+# optional: price it first. quote_lease is a view — no auth, no transfer — and
+# it runs the same validation as create_lease, so these are the numbers the next
+# transaction locks.
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  -- quote_lease \
+     --service_id 1 \
+     --requested_calls 500 \
+     --duration_secs 3600
+
 stellar contract invoke \
   --id $REGISTRY --source-account consumer --network testnet \
   --send=yes -- create_lease \
@@ -108,6 +118,24 @@ stellar contract invoke --id $REGISTRY --source-account consumer \
 
 `lease_status` is `0` (Active), `1` (Expired) or `2` (Settled).
 
+### End the lease early
+
+If you stop using the service before expiry, ask the provider to release your
+unused balance instead of waiting for expiry + 24 hours:
+
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  --send=yes -- request_early_cancel --consumer $CONSUMER --lease_id 1
+```
+
+The provider either approves — reporting the calls it actually served — or
+rejects the request. On approval you are refunded `rate × unused_calls`
+immediately and the lease ends; on rejection the lease keeps running exactly as
+before. You can withdraw a pending request with `withdraw_early_cancel`. Early
+cancellation is only available before `expires_at`; after expiry, use the revoke
+path below.
+
 ## 6. Get your money back
 
 **Normal path — automatic.** When the provider settles, the unused balance is
@@ -140,6 +168,8 @@ constant in the contract (`SETTLE_GRACE_PERIOD_SECS = 86_400`).
 | Provider settles with `verified_calls = 0` | You get the entire deposit back |
 | Provider never settles, `now ≥ expiry + 24h` | You `revoke` and get the entire deposit |
 | Provider never settles, inside the 24h window | Nothing yet — wait |
+| You request early cancel and the provider approves | `rate × unused_calls`, immediately |
+| You request early cancel and the provider rejects | Lease continues; nothing moves |
 
 ## Costs
 
