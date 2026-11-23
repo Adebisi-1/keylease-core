@@ -65,9 +65,7 @@ fn collect_spec_entries() -> Vec<ScSpecEntry> {
     }
 
     // Errors
-    entries.push(
-        ScSpecEntry::from_xdr(crate::Error::spec_xdr(), Limits::none()).unwrap(),
-    );
+    entries.push(ScSpecEntry::from_xdr(crate::Error::spec_xdr(), Limits::none()).unwrap());
 
     entries
 }

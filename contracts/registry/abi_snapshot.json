@@ -1,7 +1,7 @@
 [
   {
     "function_v0": {
-      "doc": "Initialize the registry and appoint `admin`.\\n\\nCan only be called once. The admin is the only account allowed to\\nconfigure the escrow token via [`Self::set_token`] or manage upgrades via\\n[`Self::propose_upgrade`], [`Self::execute_upgrade`] and\\n[`Self::cancel_upgrade`].",
+      "doc": "Initialize the registry and appoint `admin`.\\n\\nCan only be called once. The admin is the only account allowed to\\nconfigure the escrow token via [`KeyLeaseRegistry::set_token`] or manage upgrades via\\n[`KeyLeaseRegistry::propose_upgrade`], [`KeyLeaseRegistry::execute_upgrade`] and\\n[`KeyLeaseRegistry::cancel_upgrade`].",
       "name": "init",
       "inputs": [
         {
@@ -48,7 +48,7 @@
   },
   {
     "function_v0": {
-      "doc": "Queue a Wasm upgrade behind the mandatory [`UPGRADE_DELAY_SECS`] delay.\\n\\nAdmin only. `new_wasm_hash` is the hash produced by\\n`stellar contract upload`. A new proposal replaces a pending one and\\nrestarts the delay, so the exit window can never be shortened. The hash\\nand the execution ledger timestamp are stored and reported by\\n[`UpgradeProposed`]; clients can read them with\\n[`Self::get_pending_upgrade`].",
+      "doc": "Queue a Wasm upgrade behind the mandatory [`UPGRADE_DELAY_SECS`] delay.\\n\\nAdmin only. `new_wasm_hash` is the hash produced by\\n`stellar contract upload`. A new proposal replaces a pending one and\\nrestarts the delay, so the exit window can never be shortened. The hash\\nand the execution ledger timestamp are stored and reported by\\n[`UpgradeProposed`]; clients can read them with\\n[`KeyLeaseRegistry::get_pending_upgrade`].",
       "name": "propose_upgrade",
       "inputs": [
         {
@@ -120,7 +120,7 @@
   },
   {
     "function_v0": {
-      "doc": "Publish a new leasable service and return its `service_id`.\\n\\n`rate_per_call` is denominated in the escrow token's smallest unit and\\nmust be strictly positive. `endpoint_hash` commits to the off-chain\\nendpoint descriptor.",
+      "doc": "Publish a new leasable service and return its `service_id`.\\n\\n`rate_per_call` is denominated in the escrow token's smallest unit and\\nmust be in `1..=MAX_RATE_PER_CALL`. `endpoint_hash` commits to the\\noff-chain endpoint descriptor.",
       "name": "register_service",
       "inputs": [
         {
@@ -186,7 +186,7 @@
   },
   {
     "function_v0": {
-      "doc": "Update the rate_per_call and/or endpoint_hash for a service.\\nOnly the owning provider may call this.\\n\\nExisting leases keep their original rate \\xe2\\x80\\x94 `locked_deposit` is escrowed\\nat the old rate and is not altered. Only *new* leases will use the\\nupdated rate.\\n\\nNon-positive `rate_per_call` values are rejected with `Error::InvalidRate`.",
+      "doc": "Update the rate_per_call and/or endpoint_hash for a service.\\nOnly the owning provider may call this.\\n\\nExisting leases keep their original rate \\xe2\\x80\\x94 `locked_deposit` is escrowed\\nat the old rate and is not altered. Only *new* leases will use the\\nupdated rate.\\n\\nNon-positive `rate_per_call` values are rejected with `Error::InvalidRate`.\\nValues above [`MAX_RATE_PER_CALL`] are rejected with `Error::RateTooHigh`,\\nso an update cannot publish a price the listing path would have refused.",
       "name": "update_service",
       "inputs": [
         {
@@ -226,7 +226,7 @@
   },
   {
     "function_v0": {
-      "doc": "Opt a service into, out of, or onto a different settlement attestor.\\nOnly the owning provider may call this.\\n\\n`attestor` is an ed25519 public key. Once set, this service's leases can\\nonly be settled through [`Self::settle_lease_attested`] with a payload\\nsigned by that key; [`Self::settle_lease`] fails with\\n`AttestationRequired`. Passing `None` removes the requirement and restores\\nthe default trust model, so the no-attestor mode is one call away at all\\ntimes.\\n\\nOpting in or out takes effect for **every** unsettled lease of the\\nservice, not only for leases created afterwards: the requirement lives on\\nthe service, so a provider that mints leases and then opts in must have\\nthose leases attested too (or let the consumer reclaim them after the\\ngrace window). Opting out is the reverse and is always permitted, which\\nmeans a provider cannot strand a lease behind an attestor that stops\\nanswering: it can, and eventually must, choose between attesting and\\ndropping the requirement.\\n\\nThe attestor is chosen by the provider, ",
+      "doc": "Opt a service into, out of, or onto a different settlement attestor.\\nOnly the owning provider may call this.\\n\\n`attestor` is an ed25519 public key. Once set, this service's leases can\\nonly be settled through [`KeyLeaseRegistry::settle_lease_attested`] with a payload\\nsigned by that key; [`KeyLeaseRegistry::settle_lease`] fails with\\n`AttestationRequired`. Passing `None` removes the requirement and restores\\nthe default trust model, so the no-attestor mode is one call away at all\\ntimes.\\n\\nOpting in or out takes effect for **every** unsettled lease of the\\nservice, not only for leases created afterwards: the requirement lives on\\nthe service, so a provider that mints leases and then opts in must have\\nthose leases attested too (or let the consumer reclaim them after the\\ngrace window). Opting out is the reverse and is always permitted, which\\nmeans a provider cannot strand a lease behind an attestor that stops\\nanswering: it can, and eventually must, choose between attesting and\\ndropping the requirement.\\n\\nThe attestor is ",
       "name": "set_service_attestor",
       "inputs": [
         {
@@ -301,7 +301,7 @@
   },
   {
     "function_v0": {
-      "doc": "Settle a lease, paying the provider for `verified_calls` consumed calls\\nand refunding the remainder to the consumer. Requires provider auth.\\n\\nA lease may only be settled when it has **expired** or when\\n`verified_calls == allocated_calls` (the consumer got everything it\\npaid for, so there is no reason to wait). Settling pays out\\n`verified_calls * rate_per_call` and returns\\n`locked_deposit - payout` to the consumer. A lease can be settled once.",
+      "doc": "Settle a lease, paying the provider for `verified_calls` consumed calls\\nand refunding the remainder to the consumer. Requires provider auth.\\n\\nA lease may only be settled when it has **expired** or when\\n`verified_calls == allocated_calls` (the consumer got everything it\\npaid for, so there is no reason to wait). Settling pays out\\n`verified_calls * rate_per_call` and returns\\n`locked_deposit - payout` to the consumer. A lease can be settled once.\\nThe settlement is added to the service's cumulative totals, which\\n[`KeyLeaseRegistry::service_stats`] reports.",
       "name": "settle_lease",
       "inputs": [
         {
@@ -332,7 +332,7 @@
   },
   {
     "function_v0": {
-      "doc": "Settle a lease using a signed usage attestation. Requires provider auth.\\n\\nThe attestation must be signed by the service's registered attestor over\\n[`usage_attestation_message`], and it must name this lease, this service\\nand this exact `verified_calls` (`AttestationMismatch`, `AttestationStale`\\notherwise). Verification happens before any state changes or token\\ntransfers, so a rejected attestation costs the caller nothing but the fee.\\n\\nEvery non-attestation rule of [`Self::settle_lease`] still applies: the\\nlease must be settleable, the caller must own the service, and the lease\\ncan only be settled once. A service with no attestor configured is\\nrejected with `AttestorNotConfigured` rather than treated as\\nattested \\xe2\\x80\\x94 there would be no key to check the signature against.",
+      "doc": "Settle a lease using a signed usage attestation. Requires provider auth.\\n\\nThe attestation must be signed by the service's registered attestor over\\n[`usage_attestation_message`], and it must name this lease, this service\\nand this exact `verified_calls` (`AttestationMismatch`, `AttestationStale`\\notherwise). Verification happens before any state changes or token\\ntransfers, so a rejected attestation costs the caller nothing but the fee.\\n\\nEvery non-attestation rule of [`KeyLeaseRegistry::settle_lease`] still applies: the\\nlease must be settleable, the caller must own the service, and the lease\\ncan only be settled once. A service with no attestor configured is\\nrejected with `AttestorNotConfigured` rather than treated as\\nattested \\xe2\\x80\\x94 there would be no key to check the signature against.",
       "name": "settle_lease_attested",
       "inputs": [
         {
@@ -372,7 +372,7 @@
   },
   {
     "function_v0": {
-      "doc": "Reclaim the full deposit for a lease the provider never settled.\\n\\nThe lease must be expired and at least [`SETTLE_GRACE_PERIOD_SECS`]\\n(24 hours) must have elapsed since expiry. Requires `consumer` auth.\\nThis is the consumer's escape hatch: a provider that goes offline cannot\\nstrand escrowed funds.",
+      "doc": "Reclaim the full deposit for a lease the provider never settled.\\n\\nThe lease must be expired and at least [`SETTLE_GRACE_PERIOD_SECS`]\\n(24 hours) must have elapsed since expiry. Requires `consumer` auth.\\nThis is the consumer's escape hatch: a provider that goes offline cannot\\nstrand escrowed funds.\\n\\nThe lease ends as [`LeaseStatus::Revoked`], distinct from a provider\\nsettlement, and `used_calls` stays `0` because the provider earned\\nnothing. Revocation leaves the service's revenue totals untouched.",
       "name": "revoke_expired_lease",
       "inputs": [
         {
@@ -543,7 +543,7 @@
   },
   {
     "function_v0": {
-      "doc": "List the services `provider` owns, oldest first, one bounded page at a time.\\n\\nReads `limit` entries from the provider's index starting at `after` and\\nreturns them with the cursor to pass back for the next page. Keep paging\\nwhile `done` is `false`; `next` counts index entries consumed, not ids\\nreturned, so a page can be legitimately short when an entry no longer\\nbelongs to the provider.\\n\\nOwnership is re-checked against each `Service` record, which is the\\nauthority: the index is derived state that is appended to on write but\\npruned only on read. A provider with no index yet returns an empty page\\nrather than an error, so a new account can page before it registers.\\n\\nPure read: like every other view, it extends no TTL, its own index entry\\nincluded. Use [`Self::register_service`] or [`Self::set_service_active`]\\nto keep a catalogue's index alive.",
+      "doc": "List the services `provider` owns, oldest first, one bounded page at a time.\\n\\nReads `limit` entries from the provider's index starting at `after` and\\nreturns them with the cursor to pass back for the next page. Keep paging\\nwhile `done` is `false`; `next` counts index entries consumed, not ids\\nreturned, so a page can be legitimately short when an entry no longer\\nbelongs to the provider.\\n\\nOwnership is re-checked against each `Service` record, which is the\\nauthority: the index is derived state that is appended to on write but\\npruned only on read. A provider with no index yet returns an empty page\\nrather than an error, so a new account can page before it registers.\\n\\nPure read: like every other view, it extends no TTL, its own index entry\\nincluded. Use [`KeyLeaseRegistry::register_service`] or [`KeyLeaseRegistry::set_service_active`]\\nto keep a catalogue's index alive.",
       "name": "services_for_provider",
       "inputs": [
         {
@@ -578,7 +578,7 @@
   },
   {
     "function_v0": {
-      "doc": "Fetch a lease. Pure read: never extends a TTL.\\n\\nUse [`Self::bump_lease`] to keep an entry alive.",
+      "doc": "Fetch a lease. Pure read: never extends a TTL.\\n\\nUse [`KeyLeaseRegistry::bump_lease`] to keep an entry alive.",
       "name": "get_lease",
       "inputs": [
         {
@@ -603,7 +603,7 @@
   },
   {
     "function_v0": {
-      "doc": "Predict what [`Self::create_lease`] would lock, without auth or a transfer.\\n\\nConsumers and SDKs used to re-derive the deposit and the expiry off-chain,\\nwhere any change to contract semantics turns into silent drift. This view\\nruns the same validation, in the same order, as `create_lease`, so every\\nerror it returns is the error `create_lease` would return for the same\\narguments \\xe2\\x80\\x94 with the single exception of a balance the registry never\\nreads: a quote says nothing about whether `consumer` can actually pay.\\n\\n`expires_at` is derived from the current ledger time, so a quote goes\\nstale as soon as the ledger advances.",
+      "doc": "Predict what [`KeyLeaseRegistry::create_lease`] would lock, without auth or a transfer.\\n\\nConsumers and SDKs used to re-derive the deposit and the expiry off-chain,\\nwhere any change to contract semantics turns into silent drift. This view\\nruns the same validation, in the same order, as `create_lease`, so every\\nerror it returns is the error `create_lease` would return for the same\\narguments \\xe2\\x80\\x94 with the single exception of a balance the registry never\\nreads: a quote says nothing about whether `consumer` can actually pay.\\n\\n`expires_at` is derived from the current ledger time, so a quote goes\\nstale as soon as the ledger advances.",
       "name": "quote_lease",
       "inputs": [
         {
@@ -638,7 +638,7 @@
   },
   {
     "function_v0": {
-      "doc": "Derive the lifecycle status of a lease at the current ledger time.\\nPure read.",
+      "doc": "Derive the lifecycle status of a lease at the current ledger time.\\nDerive the lifecycle status of a lease at the current ledger time.\\nPure read.\\n\\nA lease whose escrow was reclaimed by the consumer reports\\n[`LeaseStatus::Revoked`]; one the provider was paid for reports\\n[`LeaseStatus::Settled`]. Both are final.",
       "name": "lease_status",
       "inputs": [
         {
@@ -663,7 +663,7 @@
   },
   {
     "function_v0": {
-      "doc": "Number of calls still available on a lease (zero once settled/expired).\\nPure read.",
+      "doc": "Number of calls still available on a lease (zero once settled/expired).\\nNumber of calls still available on a lease (zero once settled/expired).\\nPure read.\\n\\nA revoked lease reports `0` like any other final lease: its allotment\\nexpired unused and the deposit is gone, so there is nothing left to\\nauthorize. The provider's earned count for a revoked lease is the\\n`used_calls` field itself, which revocation leaves at `0`.",
       "name": "remaining_calls",
       "inputs": [
         {
@@ -1201,7 +1201,7 @@
   },
   {
     "udt_error_enum_v0": {
-      "doc": "Contract-level error codes returned by [`crate::KeyLeaseRegistry`].\\n\\nCodes are stable and start at 1 (`0` is reserved by the host for success).",
+      "doc": "Contract-level error codes returned by [`crate::KeyLeaseRegistry`].\\n * Codes are stable and start at 1 (`0` is reserved by the host for success).\\n * New codes must be appended; codes are part of the ABI.\\n * The full mapping is pinned by `ERROR_ABI` in `test.rs`; extend it on append.",
       "lib": "",
       "name": "Error",
       "cases": [
@@ -1324,6 +1324,26 @@
           "doc": "A page size outside `1..=MAX_PAGE_SIZE`, so serving it would read an\\nunbounded number of ledger entries in one transaction.",
           "name": "InvalidLimit",
           "value": 24
+        },
+        {
+          "doc": "No early-cancellation request exists for the lease.",
+          "name": "CancellationNotRequested",
+          "value": 25
+        },
+        {
+          "doc": "The lease already has a pending early-cancellation request.",
+          "name": "CancellationAlreadyRequested",
+          "value": 26
+        },
+        {
+          "doc": "Early cancellation is only available before the lease expires.",
+          "name": "LeaseExpired",
+          "value": 27
+        },
+        {
+          "doc": "Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`. Appended after the\\nearly-cancellation codes, so every number already published keeps its\\nmeaning.",
+          "name": "RateTooHigh",
+          "value": 28
         }
       ]
     }
