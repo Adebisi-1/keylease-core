@@ -487,10 +487,20 @@ fn test_create_lease_requires_configured_token() {
     // Note: no set_token call.
 
     let service_id = registry.register_service(&provider, &RATE, &endpoint_hash(&env));
+    let leases_before = registry.lease_count();
 
     assert_eq!(
         registry.try_create_lease(&consumer, &service_id, &10, &3_600),
         Err(Ok(Error::TokenNotSet))
+    );
+
+    // The token lookup runs before the lease id is allocated, so the failed
+    // call must not consume an id, bump the counter, or leave a readable
+    // draft lease behind.
+    assert_eq!(registry.lease_count(), leases_before);
+    assert_eq!(
+        registry.try_get_lease(&(leases_before + 1)),
+        Err(Ok(Error::LeaseNotFound))
     );
 }
 
@@ -1380,6 +1390,94 @@ fn test_revoked_lease_does_not_count_toward_service_stats() {
         }
     );
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
+}
+
+#[test]
+fn test_mixed_batch_conserves_value_across_settle_revoke_and_active() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+
+    // Three services with different prices, so the batch's leases have
+    // different call counts and different per-call rates. Each service keeps
+    // the rate its lease was priced at, so every deposit is exact.
+    let settled_service = register_default_service(&env, &ctx);
+    let revoked_service = ctx
+        .registry
+        .register_service(&ctx.provider, &250, &endpoint_hash(&env));
+    let active_service = ctx
+        .registry
+        .register_service(&ctx.provider, &300, &endpoint_hash(&env));
+
+    let settled_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &settled_service, &10, &100);
+    let settled_deposit = RATE * 10;
+
+    let revoked_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &revoked_service, &6, &100);
+    let revoked_deposit = 250 * 6;
+
+    let active_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &active_service, &4, &200_000);
+    let active_deposit = 300 * 4;
+
+    let total_deposits = settled_deposit + revoked_deposit + active_deposit;
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), total_deposits);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - total_deposits);
+
+    // Settle the first in full: payout equals its deposit and nothing is
+    // refunded.
+    ctx.registry.settle_lease(&ctx.provider, &settled_id, &10);
+    let payout = settled_deposit;
+
+    // The second expires with the first; reclaim it once the provider's grace
+    // window has elapsed.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry
+        .revoke_expired_lease(&ctx.consumer, &revoked_id);
+    let refund = revoked_deposit;
+
+    // The third has a long term and is still active at this ledger time.
+    let active = ctx.registry.get_lease(&active_id);
+    assert_eq!(ctx.registry.lease_status(&active_id), LeaseStatus::Active);
+    assert_eq!(ctx.registry.remaining_calls(&active_id), 4);
+    assert_eq!(ctx.registry.locked_balance(&active_id), active_deposit);
+
+    // Payout plus refund equals every deposit released from escrow, and the
+    // contract still holds exactly the active lease's escrow.
+    assert_eq!(payout + refund, settled_deposit + revoked_deposit);
+    assert_eq!(ctx.token.balance(&ctx.provider), payout);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - total_deposits + refund
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), active_deposit);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), active.locked_deposit);
+
+    // The accounts we can observe add back up to the token's minted supply.
+    assert_eq!(
+        ctx.token.balance(&ctx.provider)
+            + ctx.token.balance(&ctx.consumer)
+            + ctx.token.balance(&ctx.registry_id()),
+        FUNDING
+    );
+
+    // Only the settled lease contributed revenue; the revocation did not.
+    assert_eq!(
+        ctx.registry.service_stats(&settled_service),
+        ServiceStats {
+            settled_leases: 1,
+            settled_calls: 10,
+            total_payout: payout,
+        }
+    );
+    assert_eq!(ctx.registry.lease_status(&settled_id), LeaseStatus::Settled);
+    assert_eq!(ctx.registry.lease_status(&revoked_id), LeaseStatus::Revoked);
+    assert_eq!(ctx.registry.locked_balance(&settled_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&revoked_id), 0);
 }
 
 #[test]
