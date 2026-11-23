@@ -56,6 +56,20 @@ jobs:
           printf '  %s\n' "${scripts[@]}"
           shellcheck "${scripts[@]}"
 
+  shell-tests:
+    name: Shell Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats
+      # The suite lives in tests/ and stubs gh, stellar, cargo and rustup on
+      # PATH (tests/stubs), so it needs no network, credentials or toolchain.
+      - name: Run the shell script tests
+        run: bats --tap tests
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
