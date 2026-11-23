@@ -46,6 +46,16 @@ curl "https://friendbot.stellar.org?addr=$(stellar keys address consumer)"
 export REGISTRY=<your registry contract id>
 export CONSUMER=$(stellar keys address consumer)
 
+# optional: price it first. quote_lease is a view — no auth, no transfer — and
+# it runs the same validation as create_lease, so these are the numbers the next
+# transaction locks.
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  -- quote_lease \
+     --service_id 1 \
+     --requested_calls 500 \
+     --duration_secs 3600
+
 stellar contract invoke \
   --id $REGISTRY --source-account consumer --network testnet \
   --send=yes -- create_lease \
@@ -57,13 +67,20 @@ stellar contract invoke \
 
 This escrows `rate_per_call × 500` and prints the new `lease_id`. The transaction
 emits `lease_created { lease_id, service_id, consumer, allocated_calls,
-expires_at, locked_deposit }`; keep the transaction hash as proof of purchase.
+expires_at, locked_deposit, rate_per_call }`; keep the transaction hash as
+proof of purchase.
 
 **Choose your numbers deliberately.** If your lease expires while you still have
 unused calls, those calls are not usable — `remaining_calls` drops to `0` at
 `expires_at`. The maximum duration is 30 days (`MAX_LEASE_DURATION_SECS`).
 Under-buy with a generous duration, then renew, rather than over-buying with a
 short one.
+
+`rate_per_call × requested_calls` also has a ceiling: `MAX_LEASE_DEPOSIT`
+(1,000,000,000,000 base units, so 100,000 of a seven-decimal token). A lease
+above it reverts with `DepositTooLarge` before the token is called, so an
+over-typed call count cannot escrow the wrong amount even when your balance
+would cover it.
 
 > **Order of arguments matters.** `consumer` is the first argument. This is the
 > exact ABI; older documentation that shows `service` first is wrong.
@@ -101,6 +118,24 @@ stellar contract invoke --id $REGISTRY --source-account consumer \
 
 `lease_status` is `0` (Active), `1` (Expired) or `2` (Settled).
 
+### End the lease early
+
+If you stop using the service before expiry, ask the provider to release your
+unused balance instead of waiting for expiry + 24 hours:
+
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  --send=yes -- request_early_cancel --consumer $CONSUMER --lease_id 1
+```
+
+The provider either approves — reporting the calls it actually served — or
+rejects the request. On approval you are refunded `rate × unused_calls`
+immediately and the lease ends; on rejection the lease keeps running exactly as
+before. You can withdraw a pending request with `withdraw_early_cancel`. Early
+cancellation is only available before `expires_at`; after expiry, use the revoke
+path below.
+
 ## 6. Get your money back
 
 **Normal path — automatic.** When the provider settles, the unused balance is
@@ -133,6 +168,8 @@ constant in the contract (`SETTLE_GRACE_PERIOD_SECS = 86_400`).
 | Provider settles with `verified_calls = 0` | You get the entire deposit back |
 | Provider never settles, `now ≥ expiry + 24h` | You `revoke` and get the entire deposit |
 | Provider never settles, inside the 24h window | Nothing yet — wait |
+| You request early cancel and the provider approves | `rate × unused_calls`, immediately |
+| You request early cancel and the provider rejects | Lease continues; nothing moves |
 
 ## Costs
 
