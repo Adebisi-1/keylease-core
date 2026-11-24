@@ -11,7 +11,7 @@
 ## 1. Problem
 
 `init` stores the admin once and nothing can change it. The admin is the only
-account that can call `set_token` and `upgrade`, so a key that has to be
+account that can call `set_token` and the upgrade entry points, so a key that has to be
 rotated (a departing operator, a suspected leak, a move from a single key to a
 multisig) cannot be rotated: the deployment must keep trusting the old key
 forever, or be abandoned along with its contract id and in-flight escrow.
@@ -82,8 +82,8 @@ New events (no topics, matching the other admin events; payloads carry
 `admin_transfer_accepted { previous_admin, new_admin }`. Adding events does not
 change any existing payload, so `EVENT_SCHEMA_VERSION` stays at `1`.
 
-New errors are appended: `NoPendingAdminTransfer = 18`,
-`AdminTransferExpired = 19`, `InvalidAdmin = 20` (proposing the current admin).
+New errors are appended: `NoPendingAdminTransfer = 29`,
+`AdminTransferExpired = 30`, `InvalidAdmin = 31` (proposing the current admin).
 
 ### Rejected alternatives
 
@@ -123,8 +123,9 @@ All in `contracts/registry/src/test.rs`:
 
 - Happy path: propose → accept, with an exact event for each step, the single
   authorizer for each step, and `get_pending_admin` before and after.
-- Every admin right moves: the old admin is rejected by `set_token`, `upgrade`
-  and `propose_admin`, the new admin can set the token and rotate again.
+- Every admin right moves: the old admin is rejected by `set_token`,
+  `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` and `propose_admin`;
+  the new admin can set the token and rotate again.
 - Third-party, outgoing-admin and no-proposal `accept_admin` calls are rejected.
 - **Real-auth adversarial test** (`mock_auths`, not `mock_all_auths`): an
   attacker's signature cannot propose for the admin, and neither the attacker's
