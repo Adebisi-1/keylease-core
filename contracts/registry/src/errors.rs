@@ -70,12 +70,26 @@ pub enum Error {
     CancellationAlreadyRequested = 26,
     /// Early cancellation is only available before the lease expires.
     LeaseExpired = 27,
+    /// No settlement has been proposed for the given `lease_id`.
+    SettlementNotFound = 28,
+    /// The settlement has already been finalized; funds have been released.
+    SettlementFinalized = 29,
+    /// The consumer challenge window has closed (or was never open).
+    ChallengeWindowClosed = 30,
+    /// The settlement is already under an active consumer challenge.
+    SettlementChallenged = 31,
+    /// There is no active challenge to cancel or resolve.
+    NoActiveChallenge = 32,
+    /// The challenge window has not closed yet, so the payout stays locked.
+    ChallengeWindowStillOpen = 33,
+    /// The challenge evidence hash is all zeroes.
+    InvalidEvidence = 34,
     /// The lease is already settled or revoked and cannot change hands.
-    LeaseNotTransferable = 28,
+    LeaseNotTransferable = 35,
     /// The transfer target is the current consumer.
-    InvalidConsumer = 29,
+    InvalidConsumer = 36,
     /// Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`. Appended after the
-    /// transferable-lease codes, so every number already published keeps its
-    /// meaning.
-    RateTooHigh = 30,
+    /// challenge-window and transfer codes so every number already published
+    /// keeps its meaning.
+    RateTooHigh = 37,
 }

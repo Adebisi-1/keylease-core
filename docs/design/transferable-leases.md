@@ -74,8 +74,8 @@ Updating that one field is the atomic move the acceptance criteria ask for. A
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
-| 25 | `LeaseNotTransferable` | lease is settled or revoked |
-| 26 | `InvalidConsumer` | `new_consumer` equals the current consumer |
+| 35 | `LeaseNotTransferable` | lease is settled or revoked |
+| 36 | `InvalidConsumer` | `new_consumer` equals the current consumer |
 
 `Unauthorized` still covers a caller that is not the current consumer.
 

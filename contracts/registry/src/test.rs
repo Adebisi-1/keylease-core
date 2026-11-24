@@ -4,16 +4,18 @@ use soroban_sdk::{
         storage::{Instance as _, Persistent as _},
         Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
     },
-    token, xdr, Address, BytesN, Env, Event, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
+    token, xdr, Address, BytesN, Env, Event, IntoVal, Map, Symbol, TryFromVal, Val, Vec,
 };
 
 use keylease_mock_token::{MockToken, MockTokenClient};
 
 use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
-    LeaseCancellationWithdrawn, LeaseCancelled, LeaseCreated, LeaseDelegated, LeaseRevoked,
-    LeaseSettled, LeaseTransferred, RegistryInitialized, ServiceRateUpdated, ServiceRegistered,
-    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
+    LeaseCancellationWithdrawn, LeaseCancelled, LeaseChallengeCancelled, LeaseChallengeResolved,
+    LeaseChallenged, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled,
+    LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, ServiceRateUpdated,
+    ServiceRegistered, ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
+    EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{
     self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS,
@@ -21,8 +23,9 @@ use crate::storage::{
 use crate::test_wasm::UPGRADE_TEST_WASM;
 use crate::types::{Service, ServiceStats};
 use crate::{
-    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE, MAX_RATE_PER_CALL, UPGRADE_DELAY_SECS,
+    Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, SettlementState,
+    CHALLENGE_WINDOW_SECS, MAX_LEASE_DEPOSIT, MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE,
+    MAX_RATE_PER_CALL, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -110,6 +113,16 @@ fn assert_single_event<E: Event>(env: &Env, contract: &Address, event: &E) {
         [(contract.clone(), event.topics(env), event.data(env))],
     );
     assert_eq!(env.events().all(), expected);
+}
+
+/// Finalize a proposed settlement without changing the ledger time the caller
+/// is testing. The challenge window has to close before funds can move.
+fn finalize_after_challenge_window(env: &Env, ctx: &Ctx, lease_id: &u64) {
+    let now = env.ledger().timestamp();
+    let until = ctx.registry.get_settlement(lease_id).challengeable_until;
+    env.ledger().set_timestamp(until);
+    ctx.registry.finalize_settlement(lease_id);
+    env.ledger().set_timestamp(now);
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1122,11 @@ fn test_full_usage_can_settle_before_expiry() {
     // Not expired, but fully consumed -> settlement is allowed.
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
 
+    // Funds stay escrowed for the consumer's challenge window, then anyone may
+    // finalize the proposal and release them.
+    env.ledger().set_timestamp(1_000 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
     assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
     assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
@@ -1131,6 +1149,8 @@ fn test_partial_settle_after_expiry_refunds_remainder() {
     // Move past expiry (4_600) with a small buffer.
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
 
     // Provider paid for 6 calls; consumer refunded the remaining 4.
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 6);
@@ -1161,6 +1181,7 @@ fn test_zero_call_settlement_after_expiry_refunds_entire_deposit() {
 
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &0);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
 
     assert_single_event(
         &env,
@@ -1217,7 +1238,15 @@ fn test_lease_cannot_be_settled_twice() {
         ctx.registry.try_settle_lease(&ctx.provider, &lease_id, &10),
         Err(Ok(Error::LeaseAlreadySettled))
     );
-    // Provider was paid exactly once.
+
+    // The lease is committed at proposal time; the single payout happens when
+    // the proposal is finalized, and it happens exactly once.
+    env.ledger().set_timestamp(1_000 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+    assert_eq!(
+        ctx.registry.try_finalize_settlement(&lease_id),
+        Err(Ok(Error::SettlementFinalized))
+    );
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
 }
 
@@ -1359,18 +1388,21 @@ fn test_provider_can_settle_within_grace_window() {
     env.ledger().set_timestamp(1_100 + GRACE / 2);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &3);
 
-    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 3);
-    assert_eq!(
-        ctx.token.balance(&ctx.consumer),
-        FUNDING - RATE * 10 + RATE * 7
-    );
-
     // Consumer can no longer reclaim what was already settled.
     env.ledger().set_timestamp(1_100 + GRACE + 1);
     assert_eq!(
         ctx.registry
             .try_revoke_expired_lease(&ctx.consumer, &lease_id),
         Err(Ok(Error::LeaseAlreadySettled))
+    );
+
+    // The proposal pays out once its challenge window has closed.
+    env.ledger().set_timestamp(1_100 + GRACE / 2 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 3);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - RATE * 10 + RATE * 7
     );
 }
 
@@ -1407,6 +1439,7 @@ fn test_service_stats_accumulate_settled_leases_calls_and_payouts() {
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
     ctx.registry.settle_lease(&ctx.provider, &first, &10);
+    finalize_after_challenge_window(&env, &ctx, &first);
 
     // ...and a partial settlement after expiry on the second, so the counter
     // must record the calls the provider was paid for, not the allotment.
@@ -1415,6 +1448,7 @@ fn test_service_stats_accumulate_settled_leases_calls_and_payouts() {
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &second, &4);
+    finalize_after_challenge_window(&env, &ctx, &second);
 
     assert_eq!(
         ctx.registry.service_stats(&service_id),
@@ -1442,6 +1476,7 @@ fn test_service_stats_record_a_zero_call_settlement() {
     // the whole deposit and still counts as having settled the lease.
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &0);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
 
     assert_eq!(
         ctx.registry.service_stats(&service_id),
@@ -1464,6 +1499,7 @@ fn test_revoked_lease_does_not_count_toward_service_stats() {
         .registry
         .create_lease(&ctx.consumer, &service_id, &10, &3_600);
     ctx.registry.settle_lease(&ctx.provider, &settled, &10);
+    finalize_after_challenge_window(&env, &ctx, &settled);
 
     // A second lease the provider never settles: the consumer reclaims it in
     // full after expiry plus the grace window.
@@ -1524,6 +1560,9 @@ fn test_mixed_batch_conserves_value_across_settle_revoke_and_active() {
     // refunded.
     ctx.registry.settle_lease(&ctx.provider, &settled_id, &10);
     let payout = settled_deposit;
+    // The payout is only counted once the challenge window closes and funds
+    // actually leave escrow.
+    finalize_after_challenge_window(&env, &ctx, &settled_id);
 
     // The second expires with the first; reclaim it once the provider's grace
     // window has elapsed.
@@ -1615,6 +1654,7 @@ fn test_service_stats_are_scoped_per_service() {
         .registry
         .create_lease(&ctx.consumer, &first_service, &10, &3_600);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
 
     assert_eq!(ctx.registry.service_stats(&first_service).settled_leases, 1);
     assert_eq!(
@@ -1913,6 +1953,7 @@ fn test_max_rate_is_accepted_and_leasable() {
 
     // Settling the whole allotment pays the same figure back out.
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &1);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
     assert_eq!(ctx.token.balance(&ctx.provider), MAX_RATE_PER_CALL);
     assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
 }
@@ -1946,6 +1987,7 @@ fn test_smallest_lease_round_trip() {
 
     env.ledger().set_timestamp(1_001);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &1);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
 
     // The single unit of deposit pays out in full; nothing is refunded.
     assert_single_event(
@@ -2015,9 +2057,11 @@ fn test_error_codes_are_appended_not_renumbered() {
     assert_eq!(Error::Overflow as u32, 15);
     assert_eq!(Error::DurationTooLong as u32, 16);
     assert_eq!(Error::DepositTooLarge as u32, 17);
-    assert_eq!(Error::LeaseNotTransferable as u32, 28);
-    assert_eq!(Error::InvalidConsumer as u32, 29);
-    assert_eq!(Error::RateTooHigh as u32, 30);
+    assert_eq!(Error::SettlementNotFound as u32, 28);
+    assert_eq!(Error::InvalidEvidence as u32, 34);
+    assert_eq!(Error::LeaseNotTransferable as u32, 35);
+    assert_eq!(Error::InvalidConsumer as u32, 36);
+    assert_eq!(Error::RateTooHigh as u32, 37);
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,6 +2234,7 @@ fn test_revoke_after_settle_is_rejected() {
     // opens: the consumer must not be able to convert a paid lease into a
     // refund, and the status must remain `Settled`.
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
     env.ledger().set_timestamp(1_100 + GRACE);
 
     assert_eq!(
@@ -2294,9 +2339,15 @@ fn test_remaining_calls_and_locked_balance_are_zero_after_settle_lease() {
     env.ledger().set_timestamp(1_100);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
 
+    // The lease is settled from the consumer's point of view, but its escrow
+    // stays locked until the proposal is finalized.
     assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
-    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), RATE * 10);
     assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+
+    env.ledger().set_timestamp(1_100 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
     assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
 }
 
@@ -2594,6 +2645,23 @@ fn test_lease_lifecycle_emits_events() {
     assert_single_event(
         &env,
         &ctx.registry_id(),
+        &LeaseSettlementProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider: ctx.provider.clone(),
+            verified_calls: 6,
+            payout: RATE * 6,
+            refund: RATE * 4,
+            challengeable_until: 4_601 + WINDOW,
+        },
+    );
+
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
         &LeaseSettled {
             schema_version: EVENT_SCHEMA_VERSION,
             lease_id,
@@ -2692,7 +2760,9 @@ fn test_create_then_settle_events_are_ordered() {
     let lease_id =
         driver.create_then_settle(&ctx.registry_id(), &ctx.consumer, &service_id, &10, &3_600);
 
-    // Exactly two registry events, in lifecycle order: no third lease event.
+    // Exactly two registry events, in lifecycle order: creation then the
+    // settlement proposal. Funds do not leave escrow until the challenge
+    // window closes, which is a separate invocation.
     assert_two_events(
         &env,
         &ctx.registry_id(),
@@ -2706,13 +2776,14 @@ fn test_create_then_settle_events_are_ordered() {
             locked_deposit: RATE * 10,
             rate_per_call: RATE,
         },
-        &LeaseSettled {
+        &LeaseSettlementProposed {
             schema_version: EVENT_SCHEMA_VERSION,
             lease_id,
             provider: ctx.provider.clone(),
             verified_calls: 10,
             payout: RATE * 10,
             refund: 0,
+            challengeable_until: 1_000 + CHALLENGE_WINDOW_SECS,
         },
     );
 }
@@ -3151,6 +3222,9 @@ fn test_escrow_runs_on_the_stellar_asset_contract() {
 
     env.ledger().set_timestamp(4_601);
     registry.settle_lease(&provider, &lease_id, &4);
+    // The Stellar asset contract is only touched when the proposal finalizes.
+    env.ledger().set_timestamp(4_601 + CHALLENGE_WINDOW_SECS);
+    registry.finalize_settlement(&lease_id);
 
     assert_eq!(sac_client.balance(&provider), RATE * 4);
     assert_eq!(
@@ -3158,256 +3232,6 @@ fn test_escrow_runs_on_the_stellar_asset_contract() {
         FUNDING - RATE * 10 + RATE * 6
     );
     assert_eq!(sac_client.balance(&registry_id), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Custom SEP-41 token lifecycle
-// ---------------------------------------------------------------------------
-
-/// Storage keys for [`CustomSep41Token`], kept separate from `MockToken` on
-/// purpose: the two tokens must not be able to share an implementation by
-/// accident.
-#[contracttype]
-#[derive(Clone)]
-enum CustomTokenKey {
-    Admin,
-    Balance(Address),
-    Allowance(Address, Address),
-    AllowanceExpiry(Address, Address),
-}
-
-/// A custom SEP-41 token that exists only for this test.
-///
-/// The registry is deliberately token-agnostic: every deposit and payout is a
-/// `token::Client` call, so a deployment can escrow in the native SAC or in any
-/// contract that implements SEP-41. `MockToken` already implements that surface,
-/// but it is the token every other registry test is built on, so a compatibility
-/// regression in that one token would mask the same regression in the registry.
-/// This contract is an independent implementation with its own storage layout
-/// and a different number of decimals; the lifecycle test below is its only
-/// user.
-#[contract]
-pub struct CustomSep41Token;
-
-#[contractimpl]
-impl CustomSep41Token {
-    /// Initialize the token and appoint the sole minter. Requires admin auth.
-    pub fn init(env: Env, admin: Address) {
-        admin.require_auth();
-        env.storage().instance().set(&CustomTokenKey::Admin, &admin);
-    }
-
-    /// Mint `amount` to `to`. Admin only.
-    pub fn mint(env: Env, to: Address, amount: i128) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&CustomTokenKey::Admin)
-            .expect("token not initialized");
-        admin.require_auth();
-
-        let key = CustomTokenKey::Balance(to.clone());
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(
-            &key,
-            &balance.checked_add(amount).expect("balance overflow"),
-        );
-    }
-
-    /// Transfer `amount` from `from` to `to`. Requires `from` auth.
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        from.require_auth();
-        move_balance(&env, &from, &to, amount);
-    }
-
-    /// Transfer `amount` from `from` to `to` using `spender`'s allowance.
-    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
-        spender.require_auth();
-
-        let allowance = read_allowance(&env, &from, &spender);
-        assert!(allowance >= amount, "insufficient allowance");
-
-        move_balance(&env, &from, &to, amount);
-
-        env.storage().persistent().set(
-            &CustomTokenKey::Allowance(from, spender),
-            &(allowance - amount),
-        );
-    }
-
-    /// Approve `spender` for `amount` of `from`'s tokens until `live_until_ledger`.
-    ///
-    /// `live_until_ledger` of `0` means the allowance never expires.
-    pub fn approve(
-        env: Env,
-        from: Address,
-        spender: Address,
-        amount: i128,
-        live_until_ledger: u32,
-    ) {
-        from.require_auth();
-
-        env.storage().persistent().set(
-            &CustomTokenKey::Allowance(from.clone(), spender.clone()),
-            &amount,
-        );
-        env.storage().persistent().set(
-            &CustomTokenKey::AllowanceExpiry(from, spender),
-            &live_until_ledger,
-        );
-    }
-
-    /// Remaining allowance `spender` may draw from `from`.
-    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
-        read_allowance(&env, &from, &spender)
-    }
-
-    /// Balance of `id`.
-    pub fn balance(env: Env, id: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&CustomTokenKey::Balance(id))
-            .unwrap_or(0)
-    }
-
-    /// This custom token uses six decimals, unlike `MockToken`'s seven, so the
-    /// test also shows the registry treats rates as opaque base units.
-    pub fn decimals(_env: Env) -> u32 {
-        6
-    }
-
-    /// Human-readable token name.
-    pub fn name(env: Env) -> String {
-        String::from_str(&env, "Custom SEP-41 Test Token")
-    }
-
-    /// Token ticker symbol.
-    pub fn symbol(env: Env) -> String {
-        String::from_str(&env, "CST41")
-    }
-}
-
-fn move_balance(env: &Env, from: &Address, to: &Address, amount: i128) {
-    let from_key = CustomTokenKey::Balance(from.clone());
-    let to_key = CustomTokenKey::Balance(to.clone());
-
-    let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
-    assert!(from_balance >= amount, "insufficient balance");
-
-    let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
-
-    env.storage()
-        .persistent()
-        .set(&from_key, &(from_balance - amount));
-    env.storage().persistent().set(
-        &to_key,
-        &to_balance.checked_add(amount).expect("balance overflow"),
-    );
-}
-
-fn read_allowance(env: &Env, from: &Address, spender: &Address) -> i128 {
-    let live_until: u32 = env
-        .storage()
-        .persistent()
-        .get(&CustomTokenKey::AllowanceExpiry(
-            from.clone(),
-            spender.clone(),
-        ))
-        .unwrap_or(0);
-    if live_until != 0 && env.ledger().sequence() > live_until {
-        return 0;
-    }
-    env.storage()
-        .persistent()
-        .get(&CustomTokenKey::Allowance(from.clone(), spender.clone()))
-        .unwrap_or(0)
-}
-
-/// Drive the whole registry lifecycle with a deployed custom SEP-41 token.
-///
-/// Unlike the mock token every other test is seeded with, this asset is a
-/// separate contract implementation, so the test proves the registry's
-/// `token::Client` calls compose with an arbitrary conforming token: register a
-/// service, create a lease, partially settle it after expiry, then create a
-/// second lease and revoke it after the grace window. Token balances are
-/// asserted after every step, so escrow conservation is checked at the boundary
-/// the contract does not control.
-#[test]
-fn test_custom_sep41_token_full_lifecycle() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().set_timestamp(1_000);
-
-    let admin = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let consumer = Address::generate(&env);
-
-    // Deploy a token the registry has never seen: not `MockToken`, not the SAC.
-    let token_id = env.register(CustomSep41Token, ());
-    let token = CustomSep41TokenClient::new(&env, &token_id);
-    token.init(&admin);
-    token.mint(&consumer, &FUNDING);
-    assert_eq!(token.decimals(), 6);
-    assert_eq!(token.balance(&consumer), FUNDING);
-
-    let registry_id = env.register(KeyLeaseRegistry, ());
-    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
-    registry.init(&admin);
-    registry.set_token(&admin, &token_id);
-    assert_eq!(registry.get_token(), token_id);
-
-    // Register: the listing price is denominated in this token's base units.
-    let service_id = registry.register_service(&provider, &RATE, &endpoint_hash(&env));
-
-    // Create: the full deposit leaves the consumer and is held by the registry.
-    let lease_id = registry.create_lease(&consumer, &service_id, &10, &3_600);
-    assert_eq!(token.balance(&consumer), FUNDING - RATE * 10);
-    assert_eq!(token.balance(&registry_id), RATE * 10);
-    assert_eq!(token.balance(&provider), 0);
-    assert_eq!(registry.get_lease(&lease_id).locked_deposit, RATE * 10);
-    assert_eq!(registry.lease_status(&lease_id), LeaseStatus::Active);
-
-    // Partial settlement after expiry: the provider is paid for 4 of 10 calls
-    // and the consumer gets the 6 unused calls back. Escrow ends at zero.
-    env.ledger().set_timestamp(1_000 + 3_600 + 1);
-    registry.settle_lease(&provider, &lease_id, &4);
-
-    assert_eq!(token.balance(&provider), RATE * 4);
-    assert_eq!(token.balance(&consumer), FUNDING - RATE * 10 + RATE * 6);
-    assert_eq!(token.balance(&registry_id), 0);
-    assert_eq!(registry.lease_status(&lease_id), LeaseStatus::Settled);
-    assert_eq!(
-        registry.service_stats(&service_id),
-        ServiceStats {
-            settled_leases: 1,
-            settled_calls: 4,
-            total_payout: RATE * 4,
-        }
-    );
-
-    // Revoke: a second lease the provider never settles comes back in full once
-    // the lease has expired and the 24h grace window has elapsed.
-    let revoked_id = registry.create_lease(&consumer, &service_id, &10, &3_600);
-    assert_eq!(token.balance(&consumer), FUNDING - RATE * 14);
-    assert_eq!(token.balance(&registry_id), RATE * 10);
-
-    let revoked_expiry = 1_000 + 3_600 + 1 + 3_600;
-    env.ledger().set_timestamp(revoked_expiry + GRACE);
-    registry.revoke_expired_lease(&consumer, &revoked_id);
-
-    assert_eq!(token.balance(&consumer), FUNDING - RATE * 4);
-    assert_eq!(token.balance(&registry_id), 0);
-    assert_eq!(token.balance(&provider), RATE * 4);
-    assert_eq!(registry.lease_status(&revoked_id), LeaseStatus::Revoked);
-    // Revocation pays the provider nothing, so revenue totals are untouched.
-    assert_eq!(
-        registry.service_stats(&service_id),
-        ServiceStats {
-            settled_leases: 1,
-            settled_calls: 4,
-            total_payout: RATE * 4,
-        }
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3503,9 +3327,14 @@ fn test_reentrant_token_cannot_settle_a_lease_twice() {
     env.ledger().set_timestamp(4_601);
     registry.settle_lease(&provider, &lease_id, &10);
 
+    // Proposing moves no funds; the re-entrant token is exercised when the
+    // settlement is finalized.
+    env.ledger().set_timestamp(4_601 + CHALLENGE_WINDOW_SECS);
+    registry.finalize_settlement(&lease_id);
+
     assert!(
         token_client.blocked(),
-        "re-entrant settle_lease should have been rejected"
+        "re-entrant finalize_settlement should have been rejected"
     );
     assert!(registry.get_lease(&lease_id).settled);
 }
@@ -3748,6 +3577,7 @@ fn test_service_stats_read_never_extends_its_entry() {
 
     env.ledger().set_timestamp(1_100 + GRACE);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &4);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
 
     // `record_settlement` is the only thing that sizes the stats entry's
     // horizon, so a read at the moment it is due for a bump is the case that
@@ -4016,6 +3846,366 @@ fn test_lease_ttl_ask_follows_a_lowered_network_max_entry_ttl() {
 }
 
 // ---------------------------------------------------------------------------
+// Consumer challenge window
+// ---------------------------------------------------------------------------
+
+const WINDOW: u64 = CHALLENGE_WINDOW_SECS;
+
+fn evidence_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[3u8; 32])
+}
+
+/// Create a 10-call lease and propose a 6-call settlement after expiry.
+fn lease_with_proposed_settlement(env: &Env, ctx: &Ctx) -> u64 {
+    env.ledger().set_timestamp(1_000);
+    let service_id = register_default_service(env, ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
+    lease_id
+}
+
+#[test]
+fn test_no_challenge_fast_path() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    let settlement = ctx.registry.get_settlement(&lease_id);
+    assert_eq!(settlement.state, SettlementState::Pending);
+    assert_eq!(settlement.verified_calls, 6);
+    assert_eq!(settlement.payout, RATE * 6);
+    assert_eq!(settlement.refund, RATE * 4);
+    assert_eq!(settlement.proposed_at, 4_601);
+    assert_eq!(settlement.challengeable_until, 4_601 + WINDOW);
+    assert_eq!(
+        settlement.challenge_evidence,
+        BytesN::from_array(&env, &[0u8; 32])
+    );
+    assert_eq!(settlement.challenged_at, 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), RATE * 10);
+
+    // One second before the boundary the payout is still locked.
+    env.ledger().set_timestamp(4_601 + WINDOW - 1);
+    assert_eq!(
+        ctx.registry.try_finalize_settlement(&lease_id),
+        Err(Ok(Error::ChallengeWindowStillOpen))
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+
+    // At the exact boundary finalization succeeds without a challenge.
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+
+    assert_eq!(
+        ctx.registry.get_settlement(&lease_id).state,
+        SettlementState::Finalized
+    );
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 6);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - RATE * 10 + RATE * 4
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_challenge_window_boundary() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    // The last second of the window accepts a challenge.
+    env.ledger().set_timestamp(4_601 + WINDOW - 1);
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+    assert_eq!(
+        ctx.registry.get_settlement(&lease_id).state,
+        SettlementState::Challenged
+    );
+
+    // Withdrawing before the boundary re-opens the normal finalize path.
+    ctx.registry.cancel_challenge(&ctx.consumer, &lease_id);
+
+    // At the boundary the window is closed: no new challenge can be filed.
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    assert_eq!(
+        ctx.registry
+            .try_challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env)),
+        Err(Ok(Error::ChallengeWindowClosed))
+    );
+    ctx.registry.finalize_settlement(&lease_id);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 6);
+}
+
+#[test]
+fn test_consumer_can_cancel_challenge() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    env.ledger().set_timestamp(4_601 + 100);
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+
+    assert_eq!(
+        ctx.registry.try_cancel_challenge(&ctx.consumer, &lease_id),
+        Ok(Ok(()))
+    );
+
+    let settlement = ctx.registry.get_settlement(&lease_id);
+    assert_eq!(settlement.state, SettlementState::Pending);
+    assert_eq!(
+        settlement.challenge_evidence,
+        BytesN::from_array(&env, &[0u8; 32])
+    );
+    assert_eq!(settlement.challenged_at, 0);
+
+    // Cancelling twice is rejected, and cancellation never pays early.
+    assert_eq!(
+        ctx.registry.try_cancel_challenge(&ctx.consumer, &lease_id),
+        Err(Ok(Error::NoActiveChallenge))
+    );
+    assert_eq!(
+        ctx.registry.try_finalize_settlement(&lease_id),
+        Err(Ok(Error::ChallengeWindowStillOpen))
+    );
+
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 6);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - RATE * 10 + RATE * 4
+    );
+}
+
+#[test]
+fn test_challenge_requires_consumer_and_valid_evidence() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+    let impostor = Address::generate(&env);
+
+    assert_eq!(
+        ctx.registry
+            .try_challenge_settlement(&impostor, &lease_id, &evidence_hash(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        ctx.registry.try_challenge_settlement(
+            &ctx.consumer,
+            &lease_id,
+            &BytesN::from_array(&env, &[0u8; 32])
+        ),
+        Err(Ok(Error::InvalidEvidence))
+    );
+
+    // A lease with no proposal has nothing to challenge.
+    let other_service = register_default_service(&env, &ctx);
+    let other_lease = ctx
+        .registry
+        .create_lease(&ctx.consumer, &other_service, &10, &3_600);
+    assert_eq!(
+        ctx.registry
+            .try_challenge_settlement(&ctx.consumer, &other_lease, &evidence_hash(&env)),
+        Err(Ok(Error::SettlementNotFound))
+    );
+}
+
+#[test]
+fn test_active_challenge_blocks_finalization() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    env.ledger().set_timestamp(4_601 + 100);
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+
+    // A second challenge is rejected, and the payout cannot be released.
+    assert_eq!(
+        ctx.registry
+            .try_challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env)),
+        Err(Ok(Error::SettlementChallenged))
+    );
+
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    assert_eq!(
+        ctx.registry.try_finalize_settlement(&lease_id),
+        Err(Ok(Error::SettlementChallenged))
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
+
+    let settlement = ctx.registry.get_settlement(&lease_id);
+    assert_eq!(settlement.challenge_evidence, evidence_hash(&env));
+    assert_eq!(settlement.challenged_at, 4_601 + 100);
+}
+
+#[test]
+fn test_admin_can_uphold_challenge() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    env.ledger().set_timestamp(4_601 + 100);
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+
+    // Resolution can happen inside the window; it does not have to wait.
+    ctx.registry.resolve_challenge(&ctx.admin, &lease_id, &true);
+
+    let settlement = ctx.registry.get_settlement(&lease_id);
+    assert_eq!(settlement.state, SettlementState::Finalized);
+    assert_eq!(settlement.payout, 0);
+    assert_eq!(settlement.refund, RATE * 10);
+
+    // The consumer is made whole; the provider earns nothing.
+    assert_eq!(ctx.token.balance(&ctx.provider), 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+
+    assert_eq!(
+        ctx.registry.try_finalize_settlement(&lease_id),
+        Err(Ok(Error::SettlementFinalized))
+    );
+}
+
+#[test]
+fn test_admin_can_reject_challenge() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    env.ledger().set_timestamp(4_601 + 100);
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+    ctx.registry
+        .resolve_challenge(&ctx.admin, &lease_id, &false);
+
+    // The provider's original proposal is released unchanged.
+    assert_eq!(ctx.token.balance(&ctx.provider), RATE * 6);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - RATE * 10 + RATE * 4
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
+#[test]
+fn test_resolution_is_admin_only_and_needs_a_challenge() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+    let impostor = Address::generate(&env);
+
+    // No challenge yet: nothing to resolve.
+    assert_eq!(
+        ctx.registry
+            .try_resolve_challenge(&ctx.admin, &lease_id, &true),
+        Err(Ok(Error::NoActiveChallenge))
+    );
+
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+    assert_eq!(
+        ctx.registry
+            .try_resolve_challenge(&impostor, &lease_id, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // A non-consumer cannot cancel either.
+    assert_eq!(
+        ctx.registry.try_cancel_challenge(&impostor, &lease_id),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_challenge_events() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lease_id = lease_with_proposed_settlement(&env, &ctx);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseSettlementProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider: ctx.provider.clone(),
+            verified_calls: 6,
+            payout: RATE * 6,
+            refund: RATE * 4,
+            challengeable_until: 4_601 + WINDOW,
+        },
+    );
+
+    env.ledger().set_timestamp(4_601 + 100);
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseChallenged {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer: ctx.consumer.clone(),
+            evidence_hash: evidence_hash(&env),
+        },
+    );
+
+    ctx.registry.cancel_challenge(&ctx.consumer, &lease_id);
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseChallengeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer: ctx.consumer.clone(),
+        },
+    );
+
+    // Resolution emits the resolution event followed by the payout event.
+    ctx.registry
+        .challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env));
+    ctx.registry
+        .resolve_challenge(&ctx.admin, &lease_id, &false);
+
+    let resolved = LeaseChallengeResolved {
+        schema_version: EVENT_SCHEMA_VERSION,
+        lease_id,
+        admin: ctx.admin.clone(),
+        upheld: false,
+    };
+    let settled = LeaseSettled {
+        schema_version: EVENT_SCHEMA_VERSION,
+        lease_id,
+        provider: ctx.provider.clone(),
+        verified_calls: 6,
+        payout: RATE * 6,
+        refund: RATE * 4,
+    };
+    let expected = Vec::from_array(
+        &env,
+        [
+            (
+                ctx.registry_id(),
+                resolved.topics(&env),
+                resolved.data(&env),
+            ),
+            (ctx.registry_id(), settled.topics(&env), settled.data(&env)),
+        ],
+    );
+    assert_eq!(env.events().all(), expected);
+}
+
+// ---------------------------------------------------------------------------
 // Early consumer cancellation
 // ---------------------------------------------------------------------------
 
@@ -4131,6 +4321,8 @@ fn test_provider_can_refuse_early_cancel() {
     // The lease is untouched and still settles normally at expiry.
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &3);
+    env.ledger().set_timestamp(4_601 + CHALLENGE_WINDOW_SECS);
+    ctx.registry.finalize_settlement(&lease_id);
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 3);
     assert_eq!(
         ctx.token.balance(&ctx.consumer),
@@ -4390,11 +4582,9 @@ fn test_transfer_moves_access_and_refund_right() {
         },
     );
 
-    // The whole lease moved: one consumer field owns both access and refunds.
     assert_eq!(ctx.registry.get_lease(&lease_id).consumer, new_consumer);
     assert_eq!(ctx.registry.remaining_calls(&lease_id), 10);
 
-    // The previous consumer has no claim; the new consumer owns the refund path.
     env.ledger().set_timestamp(4_600 + GRACE);
     assert_eq!(
         ctx.registry
@@ -4422,8 +4612,9 @@ fn test_settlement_after_transfer_pays_new_consumer() {
 
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
+    env.ledger().set_timestamp(4_601 + WINDOW);
+    ctx.registry.finalize_settlement(&lease_id);
 
-    // The provider is paid for used calls; the refund follows the transfer.
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 6);
     assert_eq!(ctx.token.balance(&new_consumer), RATE * 4);
     assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
@@ -4463,7 +4654,6 @@ fn test_transfer_requires_the_current_consumer() {
         Err(Ok(Error::InvalidConsumer))
     );
 
-    // Every rejected attempt left ownership untouched.
     assert_eq!(ctx.registry.get_lease(&lease_id).consumer, ctx.consumer);
 }
 
@@ -4510,7 +4700,6 @@ fn test_transfer_after_expiry_moves_refund_right() {
         .create_lease(&ctx.consumer, &service_id, &10, &100);
     let new_consumer = Address::generate(&env);
 
-    // Access has lapsed, but the refund claim is still transferable.
     env.ledger().set_timestamp(1_100);
     ctx.registry
         .transfer_lease(&ctx.consumer, &lease_id, &new_consumer);
@@ -4520,6 +4709,40 @@ fn test_transfer_after_expiry_moves_refund_right() {
     ctx.registry.revoke_expired_lease(&new_consumer, &lease_id);
     assert_eq!(ctx.token.balance(&new_consumer), RATE * 10);
     assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - RATE * 10);
+}
+
+#[test]
+fn test_transfer_during_challenge_window_is_blocked() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let new_consumer = Address::generate(&env);
+
+    ctx.registry
+        .transfer_lease(&ctx.consumer, &lease_id, &new_consumer);
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &6);
+
+    assert_eq!(
+        ctx.registry
+            .try_transfer_lease(&new_consumer, &lease_id, &ctx.consumer),
+        Err(Ok(Error::LeaseNotTransferable))
+    );
+    assert_eq!(
+        ctx.registry
+            .try_challenge_settlement(&ctx.consumer, &lease_id, &evidence_hash(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+    ctx.registry
+        .challenge_settlement(&new_consumer, &lease_id, &evidence_hash(&env));
+    assert_eq!(
+        ctx.registry.get_settlement(&lease_id).state,
+        SettlementState::Challenged
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4573,6 +4796,7 @@ fn test_deposit_can_consume_the_consumers_entire_balance() {
     let used: u32 = 6;
     env.ledger().set_timestamp(4_601);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &used);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
 
     let refund = RATE * (calls - used) as i128;
     assert_eq!(ctx.token.balance(&consumer), refund);
@@ -4623,7 +4847,7 @@ fn test_fresh_counters_start_at_zero_and_move_only_on_success() {
 /// Every published error code with the variant it names, in order. This is the
 /// table in `docs/contract-reference.md`; the two must change together, and only
 /// by appending.
-const ERROR_ABI: [(u32, Error); 30] = [
+const ERROR_ABI: [(u32, Error); 37] = [
     (1, Error::AlreadyInitialized),
     (2, Error::NotInitialized),
     (3, Error::Unauthorized),
@@ -4651,9 +4875,16 @@ const ERROR_ABI: [(u32, Error); 30] = [
     (25, Error::CancellationNotRequested),
     (26, Error::CancellationAlreadyRequested),
     (27, Error::LeaseExpired),
-    (28, Error::LeaseNotTransferable),
-    (29, Error::InvalidConsumer),
-    (30, Error::RateTooHigh),
+    (28, Error::SettlementNotFound),
+    (29, Error::SettlementFinalized),
+    (30, Error::ChallengeWindowClosed),
+    (31, Error::SettlementChallenged),
+    (32, Error::NoActiveChallenge),
+    (33, Error::ChallengeWindowStillOpen),
+    (34, Error::InvalidEvidence),
+    (35, Error::LeaseNotTransferable),
+    (36, Error::InvalidConsumer),
+    (37, Error::RateTooHigh),
 ];
 
 #[test]

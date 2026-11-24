@@ -11,7 +11,8 @@ reporting a vulnerability, see
 | --- | --- |
 | The admin configures a well-behaved SEP-41 token. | A malicious token contract could revert transfers and stall settlement. It cannot be paid twice: `settled` is persisted before the transfer, and a re-entrant token is rejected (`LeaseAlreadySettled`). |
 | The admin does not upgrade to a malicious Wasm. | An upgrade can change the contract logic. The admin key should be cold or multisig. Upgrades now require a 24h on-ledger delay and emit `upgrade_proposed` with the hash and execution ledger, so consumers can exit; execution emits `contract_upgraded`. |
-| The provider reports `verified_calls` honestly. | It can under-report (it gets paid less) but never over-report past `allocated_calls`. |
+| The provider reports `verified_calls` honestly, or the consumer and admin can correct it. | It can under-report (it gets paid less) and can over-report up to `allocated_calls`; the consumer has 24h to challenge the report, and the admin resolves the dispute. |
+| The admin adjudicates challenges honestly. | A compromised admin can zero a legitimate payout by upholding a challenge, or refuse to resolve one. It cannot redirect funds to itself. Use a cold or multisig admin. |
 | Soroban ledger time is monotonic and honest. | Validity windows would be unreliable. |
 | Consumers keep their own key safe. | Anyone with the consumer key can create leases that spend its balance. |
 
@@ -29,20 +30,21 @@ take more than it is owed, and it cannot prevent the consumer's refund.
 3. **Only the consumer can revoke, and only after the grace window.** Combined
    checks for ownership, expiry and elapsed grace (`Unauthorized`,
    `LeaseNotExpired`, `RevokeWindowNotElapsed`).
-4. **Only the current consumer can transfer, and never after settlement.**
-   `transfer_lease` rewrites the single `Lease.consumer` field, so access and the
-   refund path always belong to the same address (`Unauthorized`,
-   `LeaseNotTransferable`, `InvalidConsumer`).
-5. **Early cancellation needs the provider's consent.** Only the consumer can
+4. **Early cancellation needs the provider's consent.** Only the consumer can
    request or withdraw, only the owning provider can approve or reject, and only
    approval moves funds (`Unauthorized`, `CancellationNotRequested`). A request
    never blocks use, settlement or revocation and expires with the lease.
-6. **A lease releases funds once.** Every money path checks `settled` first,
-   persists `settled = true`, and only then calls the token
-   (`LeaseAlreadySettled`). Checks-effects-interactions is enforced by
-   `test_reentrant_token_cannot_settle_a_lease_twice`; the service's running
-   totals are written in the same window, before the transfers, so a re-entrant
-   token cannot inflate them either.
+5. **A lease releases funds once.** A settlement is proposed once (`settled` is
+   persisted at proposal time), its state is persisted as `Finalized` before any
+   token call, and every payout path rejects an already-finalized settlement
+   (`LeaseAlreadySettled`, `SettlementFinalized`). Checks-effects-interactions is
+   enforced by `test_reentrant_token_cannot_settle_a_lease_twice`; the service's
+   running totals are written before the transfers, so a re-entrant token cannot
+   inflate them either.
+6. **The payout is locked during a dispute.** A pending settlement cannot be
+   finalized before `challengeable_until`, and a challenged one cannot be
+   finalized at all until the admin resolves it (`ChallengeWindowStillOpen`,
+   `SettlementChallenged`).
 7. **Overflow aborts.** Deposit, payout, refund and expiry arithmetic use
    `checked_mul`/`checked_add`/`checked_sub` and revert with `Overflow`.
 8. **Lease durations are storage-safe.** Durations above
@@ -59,25 +61,30 @@ take more than it is owed, and it cannot prevent the consumer's refund.
     therefore never be listed at a price that cannot fund even the smallest
     (one-call) lease, and the worst legal `rate × calls` product stays far inside
     `i128`, so a consumer's quote is always the amount that moves.
-11. **The admin cannot touch user funds.** It can only call `set_token` and
-    `upgrade`.
+11. **The admin cannot redirect user funds.** It can call `set_token`, `upgrade`,
+    and `resolve_challenge`. Resolution only chooses between the provider's
+    proposal and a full consumer refund; there is no path that pays an arbitrary
+    recipient.
 12. **Every mutation is authenticated.** No state-changing entry point trusts its
-    caller without `require_auth()`. A transfer is authorised only by the current
-    consumer, and the new consumer immediately owns the refund path.
+    caller without `require_auth()`. `finalize_settlement` is permissionless by
+    design: it can only release the exact split already recorded on chain.
 13. **A sponsor cannot spend your balance.** `create_lease_for` calls
     `require_auth()` on the delegate *and* the consumer, and the deposit is
     transferred from the consumer; the refund and revoke paths stay bound to the
     consumer alone. Missing either signature reverts before any state changes.
-    A later transfer changes that address by the current consumer's signature,
-    never by the sponsor's.
 14. **Revocation is not settlement.** A reclaimed lease reports
     `LeaseStatus::Revoked`, keeps `used_calls == 0`, pays the provider nothing,
     and is excluded from `service_stats`, so revenue reporting cannot be
     confused with a refund. An approved early cancellation is the opposite case:
     the provider was paid for served calls, so it is counted like any other
     settlement.
-15. **Every mutation is observable.** Each transition emits a typed Soroban
-    event with no secret material in it.
+15. **Every mutation is observable.** Each transition emits a typed Soroban event
+    with no secret material in it.
+16. **Only the current consumer can transfer, and never after settlement.**
+    `transfer_lease` rewrites the single `Lease.consumer` field, so access and the
+    refund path always belong to the same address (`Unauthorized`,
+    `LeaseNotTransferable`, `InvalidConsumer`). A pending early-cancellation
+    request is cleared so the previous owner cannot trigger a payout.
 
 ## Invariants
 
@@ -87,23 +94,29 @@ violation.
 
 - `payout + refund == locked_deposit` for every settlement and every approved
   early cancellation.
-- A settled lease never transitions again and cannot be transferred.
+- A settled lease never transitions again.
 - `settled` is true on-chain before any value leaves the contract.
-- No lease can leave more value than was escrowed.
-- Every lease has exactly one consumer, and it owns both access and the refund
-  path for its entire TTL.
+- A settlement is `Finalized` on-chain before any value leaves the contract.
+- No settlement can release more value than was escrowed.
+- A challenged settlement moves no value until the admin resolves it.
 - Every lease has a consumer path to a full refund, for its entire TTL.
 - `service_stats` advances only on provider settlement, and only by exactly
   `verified_calls` and the payout the transfers performed.
 - A revoked lease and a settled lease are distinguishable through
   `lease_status` alone.
+- Every lease has exactly one consumer, and it owns both access and the refund
+  path for its entire TTL; a proposed settlement freezes that ownership.
 
 ## Threats considered
 
 | Threat | Mitigation |
 | --- | --- |
 | Provider claims more calls than allocated | `InvalidCalls` |
+| Provider over-reports within the allotment | Consumer challenges inside the 24h window; admin can uphold a full refund |
 | Provider settles a lease twice | `settled` flag persisted before transfers + `LeaseAlreadySettled` |
+| Payout released while a challenge is open | `SettlementChallenged`; only the admin can resolve |
+| Finalize races the challenge deadline | `now < challengeable_until` → `ChallengeWindowStillOpen`; at the boundary challenges are closed |
+| Admin upholds every challenge to deny payouts | On-chain `lease_challenge_resolved` events; admin should be cold/multisig; consumer and provider can both observe |
 | Attacker settles someone else's lease | `service.provider == provider` check |
 | Attacker revokes someone else's lease | `lease.consumer == consumer` check |
 | Attacker transfers someone else's lease | `lease.consumer == consumer` check + `require_auth` on the current consumer |
@@ -261,17 +274,24 @@ These are real and tracked as Drips Wave issues rather than hidden.
 - **Upgrade trust.** The admin can replace the contract Wasm. While using a multisig
   admin prevents a single compromised key from executing an unauthorized upgrade,
   adding an on-chain timelock to upgrades remains future work.
-- **Transfers are final.** `transfer_lease` is a direct assignment: the recipient
-  does not accept, and there is no protocol-level reversal. A mistyped address
-  hands the lease (and its refund right) to an unreachable account. Verify the
-  destination before signing.
 - **No provider key rotation.** A service is bound to the address that registered
   it. Transferring a service is a `wave-medium` issue.
 - **No rate updates.** Changing `rate_per_call` requires registering a new
   service; in-flight leases keep their original escrow.
+- **Settlement disputes are adjudicated, not proven.** The contract trusts the
+  provider's `verified_calls` unless the consumer challenges it. The challenge is
+  a 32-byte evidence commitment, and the admin decides off chain; the contract
+  cannot verify usage or evidence. Consumers are still protected by the fixed
+  allotment and the refund path.
+- **Resolution depends on the admin.** A challenged settlement stays locked until
+  the admin acts. Settlement entries live for the standard ~30-day persistent TTL,
+  so disputes should be resolved well inside that horizon.
 - **Early cancellation depends on the provider.** A consumer cannot exit early
   unilaterally; if the provider never approves or rejects, the lease runs to
   expiry and the normal revoke path applies. There is no penalty scheme yet.
+- **Transfers are final.** `transfer_lease` is a direct assignment: the recipient
+  does not accept, and there is no protocol-level reversal. A mistyped address
+  hands the lease (and its refund right) to an unreachable account.
 - **Settlement is a single report.** The contract trusts the provider's
   `verified_calls`; it cannot independently observe HTTP usage. Consumers are
   protected by the fixed allotment and the refund path, not by proof of

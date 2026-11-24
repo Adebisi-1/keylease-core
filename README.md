@@ -69,7 +69,7 @@ flowchart LR
     S -- "claim used_calls × rate" --> REG
     REG -- "payout + refund" --> TOK
     R -- "full refund after 24h" --> REG
-    REG -. "lease_created / lease_settled / lease_revoked" .-> EV
+    REG -. "lease_created / settlement_proposed / challenged / lease_settled" .-> EV
     EV -. "index + verify" .-> I
 ```
 
@@ -113,11 +113,14 @@ keylease-core/
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
 | `update_service(provider, service_id, rate_per_call, endpoint_hash) -> service_id` | `provider` | Update rate and endpoint hash for a service. Emits `service_rate_updated`. Only the owning provider may call this. Existing leases keep their original rate. |
 | `create_lease(consumer, service_id, requested_calls, duration_secs) -> u64` | `consumer` | Lock `rate × calls` and mint a lease. Emits `lease_created`. |
-| `quote_lease(service_id, requested_calls, duration_secs) -> LeaseQuote` | — | Read-only deposit and expiry `create_lease` would produce, with the same validation. |
 | `transfer_lease(consumer, lease_id, new_consumer)` | `consumer` | Assign an unsettled lease, moving access and the refund path. Emits `lease_transferred`. |
+| `quote_lease(service_id, requested_calls, duration_secs) -> LeaseQuote` | — | Read-only deposit and expiry `create_lease` would produce, with the same validation. |
+| `settle_lease(provider, lease_id, verified_calls)` | `provider` | Propose the payout/refund split and open the 24h challenge window. Emits `lease_settlement_proposed`. |
+| `finalize_settlement(lease_id)` | anyone | Release the proposed split once the challenge window closes. Emits `lease_settled`. |
+| `challenge_settlement(consumer, lease_id, evidence_hash)` / `cancel_challenge(consumer, lease_id)` | `consumer` | Dispute or withdraw a dispute of the reported call count. |
+| `resolve_challenge(admin, lease_id, upheld)` | `admin` | Uphold (full consumer refund) or reject the challenge. |
 | `request_early_cancel(consumer, lease_id)` / `withdraw_early_cancel(consumer, lease_id)` | `consumer` | Ask to end an active lease early, or withdraw the request. |
 | `approve_early_cancel(provider, lease_id, verified_calls)` / `reject_early_cancel(provider, lease_id)` | `provider` | Consent to an early exit (paying served calls and refunding the rest) or decline it. |
-| `settle_lease(provider, lease_id, verified_calls)` | `provider` | Pay the provider, refund the remainder. Emits `lease_settled`. |
 | `revoke_expired_lease(consumer, lease_id)` | `consumer` | Reclaim the full deposit 24h after expiry. Emits `lease_revoked`. |
 | `bump_service(service_id)` | — | Extend a service entry's TTL to its standard horizon. Permissionless; the caller pays the rent. |
 | `bump_lease(lease_id)` | — | Extend a live lease entry using the lease TTL policy. Permissionless; rejects a settled lease. |
@@ -148,6 +151,10 @@ consumer of the stream should branch on it.
 | `lease_created` | `lease_id` | `schema_version`, `service_id`, `consumer`, `allocated_calls`, `expires_at`, `locked_deposit` |
 | `lease_delegated` | `lease_id` | `schema_version`, `delegate`, `consumer` |
 | `lease_transferred` | `lease_id` | `schema_version`, `from`, `to` |
+| `lease_settlement_proposed` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund`, `challengeable_until` |
+| `lease_challenged` | `lease_id` | `schema_version`, `consumer`, `evidence_hash` |
+| `lease_challenge_cancelled` | `lease_id` | `schema_version`, `consumer` |
+| `lease_challenge_resolved` | `lease_id` | `schema_version`, `admin`, `upheld` |
 | `lease_cancellation_requested` | `lease_id` | `schema_version`, `consumer` |
 | `lease_cancellation_rejected` | `lease_id` | `schema_version`, `provider` |
 | `lease_cancellation_withdrawn` | `lease_id` | `schema_version`, `consumer` |
@@ -168,24 +175,36 @@ stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 ### Lifecycle
 
 ```text
-Active ──(fully consumed + provider settles)────────────────────▶ Settled
-   │
-   └──(expires_at reached)──▶ Expired ──(provider settles)──────▶ Settled
-                                  │
-                                  └──(24h grace + consumer revokes)──▶ Revoked
+Active ──(expires_at reached)──▶ Expired ──(24h grace)──▶ revocable by consumer
+   │                                  │
+   └──(fully consumed)────────────────┴──settle_lease──▶ SettlementPending
+                                                       │  (24h challenge window)
+                          ┌────────────────────────────┤
+                          ▼                            ▼
+                    challenge_settlement         finalize_settlement
+                          │                            │
+                          └──▶ resolve_challenge (admin) ──▶ Settled
 ```
 
 A lease is **settleable** when it has expired **or** `verified_calls ==
-allocated_calls`. It is **revocable** only when expired **and** the 24-hour
-provider grace window has elapsed. Provider settlement ends the lease as
-`Settled`; consumer reclaim ends it as `Revoked`, and the two read differently
-to clients: a revoked lease reports `used_calls == 0`, earns the provider
-nothing, and never appears in `service_stats`. Either way a closed lease can
-never be settled or revoked again. Before expiry the consumer can ask the
-provider to end the lease early (`request_early_cancel`); if the provider
-approves, served calls are paid and unused calls are refunded immediately,
-ending the lease as `Settled` — and, because the provider earned those calls,
-the settlement does count toward `service_stats`.
+allocated_calls`. Settlement is two-phase: `settle_lease` proposes the payout and
+refund but moves nothing, the consumer has 24 hours to challenge the reported
+call count, and `finalize_settlement` releases the funds afterwards. A challenged
+settlement is resolved by the admin (uphold → full consumer refund, reject →
+proposal stands); only the finalized split is counted in `service_stats`. A lease
+the provider never settles is **revocable** once expired **and** the 24-hour
+provider grace window has elapsed; that path reports `Revoked`, keeps
+`used_calls == 0`, pays the provider nothing and never appears in
+`service_stats`. Either way a closed lease can never be settled or revoked again.
+Before expiry, the consumer can also ask the provider to end the lease early
+(`request_early_cancel`); if the provider approves, served calls are paid and
+unused calls are refunded immediately, and the calls the provider earned are
+counted in `service_stats`.
+
+An unsettled lease can change hands with `transfer_lease`: the single
+`Lease.consumer` field is rewritten, so access and the refund path move together.
+Once a settlement is proposed the lease is frozen and cannot be transferred
+during the challenge window.
 
 ---
 
@@ -300,16 +319,19 @@ invariants:
 1. **Checked arithmetic everywhere.** Deposit (`rate × calls`) and payout math
    use `checked_mul`/`checked_add`; overflow aborts the transaction instead of
    minting a cheap lease or a truncated refund.
-2. **Checks-effects-interactions.** Every money path persists the settlement
-   (`settled = true`) *before* calling the token, so a re-entrant SEP-41 token
-   cannot be paid twice. `test_reentrant_token_cannot_settle_a_lease_twice`
-   installs a hostile token that calls back into `settle_lease` and asserts the
-   second attempt is rejected.
+2. **Checks-effects-interactions.** Settlement is persisted (`settled = true`)
+   before any token call, and a settlement is marked finalized before its
+   transfers, so a re-entrant SEP-41 token cannot be paid twice.
+   `test_reentrant_token_cannot_settle_a_lease_twice` installs a hostile token
+   that calls back into `settle_lease` during the payout and asserts the second
+   attempt is rejected.
 3. **Bounded provider claims.** A provider can never withdraw more than
    `allocated_calls × rate_per_call`, and only for leases it owns
    (`InvalidCalls`, `Unauthorized`).
 4. **Guaranteed consumer exit.** A provider that never settles cannot strand
-   funds: after expiry + 24h the consumer reclaims the full deposit.
+   funds: after expiry + 24h the consumer reclaims the full deposit. Once a
+   settlement is proposed, the consumer's 24-hour challenge window and the
+   admin's resolution are the remedy.
 5. **TTL-safe leases.** `create_lease` caps `duration_secs` at
    `MAX_LEASE_DURATION_SECS` (30 days) and extends the lease's persistent entry
    for its whole term plus the grace window, so escrow cannot be evicted while
@@ -391,18 +413,20 @@ afternoon of redeploying.
 cargo test --all
 ```
 
-The 160 tests in `contracts/registry/src/test.rs` cover:
+The 171 tests in `contracts/registry/src/test.rs` cover:
 
 - service registration and ID monotonicity,
-- the happy path (lock → full-usage settle before expiry),
+- the happy path (lock → full-usage settle before expiry → finalize),
 - lease transfers (ownership move, refund right, settlement after transfer,
   unauthorized and settled-lease rejection),
 - early cancellation with provider consent, refusal, withdrawal, authorization,
   conservation at both extremes, and rejection after settlement,
 - partial settlement after expiry with correct refund,
+- the settlement challenge window (no-challenge fast path, boundary, challenge
+  and cancellation, admin uphold/reject, authorization and evidence checks),
 - expired, unsettled leases being fully reclaimed by the consumer,
 - the 24-hour grace window (boundary, early-settle, and post-settle cases),
-- unauthorized settle/revoke/upgrade attempts,
+- unauthorized settle/revoke/upgrade/resolve attempts,
 - rate-math, timestamp and duration overflow/rejection,
 - the deposit ceiling at the limit, one unit above it, and as a product,
 - the published-price bound, and the one-call lease it still has to fund,

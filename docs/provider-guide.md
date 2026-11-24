@@ -109,12 +109,24 @@ stellar contract invoke \
   --send=yes -- settle_lease --provider $PROVIDER --lease_id 1 --verified_calls 320
 ```
 
-The registry pays you `verified_calls × rate_per_call`, refunds the rest to the
-consumer, and emits `lease_settled { lease_id, provider, verified_calls, payout,
-refund }`.
+That call moves no funds. It records `verified_calls × rate_per_call` as your
+payout, records the rest as the consumer's refund, and emits
+`lease_settlement_proposed { lease_id, provider, verified_calls, payout, refund,
+challengeable_until }`. The funds stay in escrow for a 24-hour consumer
+challenge window. After it closes, anyone (including you, or a keeper) can
+release them:
 
-Settle with `verified_calls = 0` to return the entire deposit for a lease you
-could not serve.
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account provider --network testnet \
+  --send=yes -- finalize_settlement --lease_id 1
+```
+
+Finalization emits `lease_settled { lease_id, provider, verified_calls, payout,
+refund }` and transfers the payout to you and the refund to the consumer.
+
+Settle with `verified_calls = 0` to propose a full refund for a lease you could
+not serve.
 
 ### Settling rules
 
@@ -124,8 +136,11 @@ could not serve.
 | `verified_calls == allocated_calls`, any time | settle allowed |
 | `now < expires_at` and `verified_calls < allocated_calls` | `LeaseNotSettleable` |
 | `verified_calls > allocated_calls` | `InvalidCalls` |
-| lease already settled | `LeaseAlreadySettled` |
+| lease already settled or proposed | `LeaseAlreadySettled` |
 | you don't own the service | `Unauthorized` |
+| finalize before `challengeable_until` | `ChallengeWindowStillOpen` |
+| finalize while the consumer's challenge is active | `SettlementChallenged` |
+| finalize/resolve after payout | `SettlementFinalized` |
 
 ## 5. Early cancellation requests
 
@@ -158,29 +173,31 @@ settled cannot be cancelled early.
 
 ## 6. Accounting
 
-`settle_lease` pays you from escrow. Nothing else does. The registry never holds
-funds on your behalf after settlement, and there is no yield or custody to
-manage.
+`finalize_settlement` pays you from escrow. Nothing else does. The registry never
+holds funds on your behalf after finalization, and there is no yield or custody
+to manage.
 
 - **Revenue recognised:** `verified_calls × rate_per_call` per settlement,
-  published in the `lease_settled` event.
+  published in the `lease_settled` event at finalization.
 - **Lifetime totals:** `service_stats --service_id <id>` returns
   `settled_leases`, `settled_calls` and `total_payout` for one service without
-  replaying history. It counts every path that pays the provider — plain
+  replaying history. It counts every path that pays the provider — a finalized
   settlement and an approved early cancellation — and nothing else: a lease the
   consumer revoked contributed nothing, so a reclaimed lease never inflates
   reported revenue.
   Treat it as a convenience view and `lease_settled` as the book of record: the
   aggregate is stored with a TTL, so an entry nothing has settled or read for a
   long stretch can age out and read back as zero.
-- **Unused consumer balance:** refunded by you at settlement or on an approved
-  early cancellation, or by the consumer via `revoke_expired_lease` after the
-  24h grace window.
+- **Unused consumer balance:** refunded to the consumer at finalization, on an
+  approved early cancellation, or by the consumer via `revoke_expired_lease`
+  after the 24h grace window if you never settled.
 - **Early cancellation:** `lease_cancelled` publishes `verified_calls`, `payout`
   and `refund`. It is a consented early settlement; the same conservation rule
   holds (`payout + refund == locked_deposit`).
-- **Disputes:** there is no dispute mechanism. The consumer's protection is the
-  refund path; yours is the grace window. Report honestly.
+- **Disputes:** the consumer can challenge your reported count inside the
+  24-hour window with an evidence hash. The registry admin resolves it; an upheld
+  challenge refunds the whole deposit and pays you nothing. Report honestly and
+  keep the evidence that supports your count.
 
 ## Operational notes
 
