@@ -491,7 +491,7 @@ Publish a new leasable service.
   Both persistent entries are extended to the same clamped horizon, in the same
   call.
 - **Events:** `service_registered { service_id, provider, rate_per_call, endpoint_hash }`.
-- **Errors:** `InvalidRate`, `RateTooHigh`, `Overflow`.
+- **Errors:** `InvalidRate`, `RateTooHigh`, `InvalidEndpointHash`, `Overflow`.
 - **Notes:** the rate bound is enforced where the price is published, not where
   it is spent, so no consumer can ever be quoted a `rate_per_call` whose
   deposit (`rate × allocated_calls`) is not representable in `i128`. Because
@@ -1218,6 +1218,7 @@ recording it there fails `cargo test`. Add a new code by appending it to
 | 26 | `CancellationAlreadyRequested` | a request is already pending |
 | 27 | `LeaseExpired` | early cancellation requires `now < expires_at` |
 | 28 | `RateTooHigh` | published `rate_per_call` above `MAX_RATE_PER_CALL` |
+| 29 | `InvalidEndpointHash` | published `endpoint_hash` is all zeroes |
 
 ## Invoking with the Stellar CLI
 

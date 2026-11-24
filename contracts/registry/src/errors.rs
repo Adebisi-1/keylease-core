@@ -74,4 +74,8 @@ pub enum Error {
     /// early-cancellation codes, so every number already published keeps its
     /// meaning.
     RateTooHigh = 28,
+    /// The published `endpoint_hash` is all zeroes, so it commits to nothing.
+    /// Appended after `RateTooHigh`, so every number already published keeps
+    /// its meaning.
+    InvalidEndpointHash = 29,
 }
