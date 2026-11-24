@@ -525,6 +525,10 @@ fn test_lease_written_before_created_at_still_reads_and_settles() {
     // And escrow is still releasable: an upgrade must never strand funds.
     env.ledger().set_timestamp(10_000);
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &4);
+    // Settlement only proposes a payout; the funds leave escrow once the
+    // challenge window has closed.
+    env.ledger().set_timestamp(10_000 + CHALLENGE_WINDOW_SECS);
+    ctx.registry.finalize_settlement(&lease_id);
 
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 4);
     assert_eq!(
