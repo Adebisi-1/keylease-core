@@ -5,6 +5,11 @@ contract guarantees, what it assumes, and what is not yet hardened. For
 reporting a vulnerability, see
 [SECURITY.md](https://github.com/KeyLease-Security/keylease-core/blob/main/SECURITY.md).
 
+No mainnet deployment may begin until the maintainer-approved
+[mainnet runbook](mainnet-runbook.md) audit gate is complete. The runbook
+requires independent audit evidence, an exact release/Wasm hash, multisig
+custody, verification, monitoring, upgrade, and rollback records.
+
 ## Trust assumptions
 
 | Assumption | Consequence if violated |
