@@ -210,10 +210,10 @@ pub const ATTESTATION_MESSAGE_LEN: usize = ATTESTATION_DOMAIN.len() + 8 + 8 + 4 
 /// signature, which is what makes a mismatched or stale payload detectable
 /// on-chain instead of being a matter of trusting the caller.
 ///
-/// The attestor signs the SHA-256 digest of these bytes; that prehash rule is
-/// Soroban's, not this contract's (`Crypto::ed25519_verify` hashes the message it
-/// is given). Exposed so an attestor service and its callers build the message
-/// with the same code the contract verifies against.
+/// The attestor signs these bytes directly using Ed25519. Soroban's
+/// `Crypto::ed25519_verify` verifies the supplied message as-is, so callers
+/// must not pre-hash it. Exposed so an attestor service and its callers build
+/// the message with the same code the contract verifies against.
 pub fn usage_attestation_message(
     env: &Env,
     lease_id: u64,
@@ -1455,11 +1455,21 @@ fn verify_attestation(
 
     // Check that the service has an attestor configured.
     #[allow(clippy::needless_borrow)]
-    let _attestor = storage::get_service_attestor(&env, lease.service_id)
+    let attestor = storage::get_service_attestor(&env, lease.service_id)
         .ok_or(Error::AttestorNotConfigured)?;
 
-    // TODO: full ed25519 signature verification can be added here when
-    // the attestor service is integrated. For now, the structural checks
-    // above prevent replay and stale attacks.
+    // Bind the structural checks above to the configured public key. The host
+    // crypto primitive aborts the invocation when the signature is invalid,
+    // before settlement writes or token transfers are reached.
+    let message = usage_attestation_message(
+        env,
+        attestation.lease_id,
+        attestation.service_id,
+        attestation.verified_calls,
+        attestation.valid_until,
+    );
+    env.crypto()
+        .ed25519_verify(&attestor, &message, &attestation.signature);
+
     Ok(())
 }
