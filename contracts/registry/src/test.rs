@@ -432,6 +432,37 @@ fn test_create_lease_locks_deposit_and_records_terms() {
     assert_eq!(ctx.registry.locked_balance(&lease_id), RATE * 10);
 }
 
+/// A failed escrow transfer must roll back the lease counter and storage (#34).
+#[test]
+fn test_failed_create_lease_rolls_back_counter_and_reuses_id() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, service_id) = setup_with_service(&env);
+
+    // Drain the consumer *after* setup so the registry reaches the token
+    // transfer after allocating the lease id and writing the lease.
+    ctx.token.transfer(&ctx.consumer, &ctx.admin, &FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.consumer), 0);
+    assert_eq!(ctx.registry.lease_count(), 0);
+
+    let failed = ctx
+        .registry
+        .try_create_lease(&ctx.consumer, &service_id, &1, &3_600);
+    assert!(failed.is_err(), "an unfunded escrow transfer must fail");
+    assert_eq!(ctx.registry.lease_count(), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+
+    // Re-fund the consumer and prove the reverted attempt did not consume id 1.
+    ctx.token.mint(&ctx.consumer, &FUNDING);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &1, &3_600);
+    assert_eq!(lease_id, 1);
+    assert_eq!(ctx.registry.lease_count(), 1);
+    assert_eq!(ctx.registry.get_lease(&lease_id).lease_id, 1);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE);
+}
+
 #[test]
 fn test_create_lease_rejects_zero_calls() {
     let env = Env::default();
@@ -444,6 +475,29 @@ fn test_create_lease_rejects_zero_calls() {
         Err(Ok(Error::InvalidCalls))
     );
     assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+}
+
+/// Zero is a valid ledger timestamp, not an uninitialized expiry (#38).
+#[test]
+fn test_create_lease_at_timestamp_zero_is_active_until_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(0);
+    let (ctx, service_id) = setup_with_service(&env);
+    let duration_secs = 3_600;
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &duration_secs);
+
+    assert_eq!(env.ledger().timestamp(), 0);
+    assert_eq!(ctx.registry.get_lease(&lease_id).expires_at, duration_secs);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+    assert_eq!(
+        ctx.registry.try_settle_lease(&ctx.provider, &lease_id, &4),
+        Err(Ok(Error::LeaseNotSettleable))
+    );
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+    assert_eq!(ctx.registry.lease_count(), 1);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), RATE * 10);
 }
 
 #[test]
@@ -487,10 +541,20 @@ fn test_create_lease_requires_configured_token() {
     // Note: no set_token call.
 
     let service_id = registry.register_service(&provider, &RATE, &endpoint_hash(&env));
+    let leases_before = registry.lease_count();
 
     assert_eq!(
         registry.try_create_lease(&consumer, &service_id, &10, &3_600),
         Err(Ok(Error::TokenNotSet))
+    );
+
+    // The token lookup runs before the lease id is allocated, so the failed
+    // call must not consume an id, bump the counter, or leave a readable
+    // draft lease behind.
+    assert_eq!(registry.lease_count(), leases_before);
+    assert_eq!(
+        registry.try_get_lease(&(leases_before + 1)),
+        Err(Ok(Error::LeaseNotFound))
     );
 }
 
@@ -1081,6 +1145,44 @@ fn test_partial_settle_after_expiry_refunds_remainder() {
     assert!(lease.settled);
 }
 
+/// A zero-call settlement after expiry must refund the entire escrow (#36).
+#[test]
+fn test_zero_call_settlement_after_expiry_refunds_entire_deposit() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (ctx, service_id) = setup_with_service(&env);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let deposit = RATE * 10;
+
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - deposit);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), deposit);
+
+    env.ledger().set_timestamp(4_601);
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &0);
+
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &LeaseSettled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            provider: ctx.provider.clone(),
+            verified_calls: 0,
+            payout: 0,
+            refund: deposit,
+        },
+    );
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Settled);
+    let lease = ctx.registry.get_lease(&lease_id);
+    assert!(lease.settled);
+    assert_eq!(lease.used_calls, 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.provider), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+}
+
 #[test]
 fn test_partial_settle_before_expiry_is_rejected() {
     let env = Env::default();
@@ -1380,6 +1482,94 @@ fn test_revoked_lease_does_not_count_toward_service_stats() {
         }
     );
     assert_eq!(ctx.token.balance(&ctx.provider), RATE * 10);
+}
+
+#[test]
+fn test_mixed_batch_conserves_value_across_settle_revoke_and_active() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+
+    // Three services with different prices, so the batch's leases have
+    // different call counts and different per-call rates. Each service keeps
+    // the rate its lease was priced at, so every deposit is exact.
+    let settled_service = register_default_service(&env, &ctx);
+    let revoked_service = ctx
+        .registry
+        .register_service(&ctx.provider, &250, &endpoint_hash(&env));
+    let active_service = ctx
+        .registry
+        .register_service(&ctx.provider, &300, &endpoint_hash(&env));
+
+    let settled_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &settled_service, &10, &100);
+    let settled_deposit = RATE * 10;
+
+    let revoked_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &revoked_service, &6, &100);
+    let revoked_deposit = 250 * 6;
+
+    let active_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &active_service, &4, &200_000);
+    let active_deposit = 300 * 4;
+
+    let total_deposits = settled_deposit + revoked_deposit + active_deposit;
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), total_deposits);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING - total_deposits);
+
+    // Settle the first in full: payout equals its deposit and nothing is
+    // refunded.
+    ctx.registry.settle_lease(&ctx.provider, &settled_id, &10);
+    let payout = settled_deposit;
+
+    // The second expires with the first; reclaim it once the provider's grace
+    // window has elapsed.
+    env.ledger().set_timestamp(1_100 + GRACE);
+    ctx.registry
+        .revoke_expired_lease(&ctx.consumer, &revoked_id);
+    let refund = revoked_deposit;
+
+    // The third has a long term and is still active at this ledger time.
+    let active = ctx.registry.get_lease(&active_id);
+    assert_eq!(ctx.registry.lease_status(&active_id), LeaseStatus::Active);
+    assert_eq!(ctx.registry.remaining_calls(&active_id), 4);
+    assert_eq!(ctx.registry.locked_balance(&active_id), active_deposit);
+
+    // Payout plus refund equals every deposit released from escrow, and the
+    // contract still holds exactly the active lease's escrow.
+    assert_eq!(payout + refund, settled_deposit + revoked_deposit);
+    assert_eq!(ctx.token.balance(&ctx.provider), payout);
+    assert_eq!(
+        ctx.token.balance(&ctx.consumer),
+        FUNDING - total_deposits + refund
+    );
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), active_deposit);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), active.locked_deposit);
+
+    // The accounts we can observe add back up to the token's minted supply.
+    assert_eq!(
+        ctx.token.balance(&ctx.provider)
+            + ctx.token.balance(&ctx.consumer)
+            + ctx.token.balance(&ctx.registry_id()),
+        FUNDING
+    );
+
+    // Only the settled lease contributed revenue; the revocation did not.
+    assert_eq!(
+        ctx.registry.service_stats(&settled_service),
+        ServiceStats {
+            settled_leases: 1,
+            settled_calls: 10,
+            total_payout: payout,
+        }
+    );
+    assert_eq!(ctx.registry.lease_status(&settled_id), LeaseStatus::Settled);
+    assert_eq!(ctx.registry.lease_status(&revoked_id), LeaseStatus::Revoked);
+    assert_eq!(ctx.registry.locked_balance(&settled_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&revoked_id), 0);
 }
 
 #[test]
@@ -2124,6 +2314,40 @@ fn test_remaining_calls_and_locked_balance_are_zero_after_revoke_expired_lease()
     assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
     assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
     assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Revoked);
+}
+
+/// Issue #37: a consumer revocation closes the lease without crediting the
+/// provider. The legacy settled flag remains true, but the distinct Revoked
+/// status must be preserved so clients do not mistake a refund for revenue.
+#[test]
+fn test_revoked_expired_lease_exposes_finalized_zero_balance_views() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &100);
+    let deposit = RATE * 10;
+
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Active);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 10);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), deposit);
+
+    env.ledger().set_timestamp(1_100 + GRACE);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Expired);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), deposit);
+
+    ctx.registry.revoke_expired_lease(&ctx.consumer, &lease_id);
+
+    assert!(ctx.registry.get_lease(&lease_id).settled);
+    assert_eq!(ctx.registry.lease_status(&lease_id), LeaseStatus::Revoked);
+    assert_eq!(ctx.registry.remaining_calls(&lease_id), 0);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 0);
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), 0);
+    assert_eq!(ctx.token.balance(&ctx.consumer), FUNDING);
+    assert_eq!(ctx.token.balance(&ctx.provider), 0);
 }
 
 #[test]
@@ -4051,4 +4275,193 @@ fn test_error_codes_are_contiguous_with_no_gap_or_insertion() {
         Error::try_from(soroban_sdk::Error::from_contract_error(next)).is_err(),
         "code {next} decodes: append the new variant to ERROR_ABI and the docs table"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Paged views
+// ---------------------------------------------------------------------------
+
+/// Persistent TTL of a service entry, read from outside the contract.
+fn service_ttl(env: &Env, registry_id: &Address, service_id: u64) -> u32 {
+    env.as_contract(registry_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&storage::DataKey::Service(service_id))
+    })
+}
+
+/// Instance TTL, read from outside the contract.
+fn instance_ttl(env: &Env, registry_id: &Address) -> u32 {
+    env.as_contract(registry_id, || env.storage().instance().get_ttl())
+}
+
+#[test]
+fn test_get_services_pages_to_the_end() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    for _ in 0..5 {
+        register_default_service(&env, &ctx);
+    }
+
+    let first = ctx.registry.get_services(&1, &2);
+    assert_eq!(first.services.len(), 2);
+    assert_eq!(first.services.get(0).unwrap().service_id, 1);
+    assert_eq!(first.services.get(1).unwrap().service_id, 2);
+    assert_eq!(first.next_start, 3);
+    assert!(!first.done);
+
+    let second = ctx.registry.get_services(&first.next_start, &2);
+    assert_eq!(second.services.len(), 2);
+    assert_eq!(second.services.get(1).unwrap().service_id, 4);
+    assert_eq!(second.next_start, 5);
+    assert!(!second.done);
+
+    let last = ctx.registry.get_services(&second.next_start, &2);
+    assert_eq!(last.services.len(), 1);
+    assert_eq!(last.services.get(0).unwrap().service_id, 5);
+    assert!(last.done);
+    assert_eq!(last.next_start, 6);
+}
+
+#[test]
+fn test_get_services_bounds_the_page_size() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    register_default_service(&env, &ctx);
+
+    assert_eq!(
+        ctx.registry.try_get_services(&1, &0),
+        Err(Ok(Error::InvalidLimit))
+    );
+    assert_eq!(
+        ctx.registry.try_get_services(&1, &(MAX_PAGE_SIZE + 1)),
+        Err(Ok(Error::InvalidLimit))
+    );
+    assert_eq!(
+        ctx.registry.try_get_leases(&1, &0),
+        Err(Ok(Error::InvalidLimit))
+    );
+    assert_eq!(
+        ctx.registry.try_get_leases(&1, &(MAX_PAGE_SIZE + 1)),
+        Err(Ok(Error::InvalidLimit))
+    );
+
+    // The largest legal page is served, not just accepted.
+    let page = ctx.registry.get_services(&1, &MAX_PAGE_SIZE);
+    assert_eq!(page.services.len(), 1);
+    assert!(page.done);
+}
+
+#[test]
+fn test_paging_past_the_end_is_empty_and_done() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // Nothing registered yet: the id space is already exhausted.
+    let empty = ctx.registry.get_services(&1, &10);
+    assert_eq!(empty.services.len(), 0);
+    assert!(empty.done);
+
+    register_default_service(&env, &ctx);
+    let past = ctx.registry.get_services(&2, &10);
+    assert_eq!(past.services.len(), 0);
+    assert!(past.done);
+    assert_eq!(past.next_start, 2);
+
+    let past_leases = ctx.registry.get_leases(&2, &10);
+    assert_eq!(past_leases.leases.len(), 0);
+    assert!(past_leases.done);
+}
+
+#[test]
+fn test_get_services_skips_an_evicted_entry_and_keeps_going() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    for _ in 0..4 {
+        register_default_service(&env, &ctx);
+    }
+
+    let registry_id = ctx.registry_id();
+    env.as_contract(&registry_id, || {
+        env.storage()
+            .persistent()
+            .remove(&storage::DataKey::Service(2));
+    });
+
+    let first = ctx.registry.get_services(&1, &2);
+    assert_eq!(first.services.len(), 1);
+    assert_eq!(first.services.get(0).unwrap().service_id, 1);
+    assert_eq!(first.next_start, 3);
+    assert!(!first.done, "a short page is not the end of the catalogue");
+
+    let rest = ctx.registry.get_services(&first.next_start, &2);
+    assert_eq!(rest.services.len(), 2);
+    assert_eq!(rest.services.get(1).unwrap().service_id, 4);
+    assert!(rest.done);
+
+    // The page skipped the gap; the single lookup still reports it.
+    assert_eq!(
+        ctx.registry.try_get_service(&2),
+        Err(Ok(Error::ServiceNotFound))
+    );
+    assert_eq!(ctx.registry.service_count(), 4);
+}
+
+#[test]
+fn test_get_leases_pages_across_services_in_id_order() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let first_service = register_default_service(&env, &ctx);
+    let second_service = register_default_service(&env, &ctx);
+
+    ctx.registry
+        .create_lease(&ctx.consumer, &first_service, &10, &3_600);
+    ctx.registry
+        .create_lease(&ctx.consumer, &second_service, &10, &3_600);
+    ctx.registry
+        .create_lease(&ctx.consumer, &first_service, &5, &3_600);
+
+    let page = ctx.registry.get_leases(&1, &2);
+    assert_eq!(page.leases.len(), 2);
+    assert_eq!(page.leases.get(0).unwrap().lease_id, 1);
+    assert_eq!(page.leases.get(1).unwrap().lease_id, 2);
+    assert_eq!(page.next_start, 3);
+    assert!(!page.done);
+
+    let tail = ctx.registry.get_leases(&page.next_start, &2);
+    assert_eq!(tail.leases.len(), 1);
+    assert_eq!(tail.leases.get(0).unwrap().lease_id, 3);
+    assert_eq!(tail.leases.get(0).unwrap().service_id, first_service);
+    assert!(tail.done);
+}
+
+#[test]
+fn test_paged_views_extend_no_ttl() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    for _ in 0..3 {
+        register_default_service(&env, &ctx);
+    }
+    let registry_id = ctx.registry_id();
+
+    let before = [
+        service_ttl(&env, &registry_id, 1),
+        service_ttl(&env, &registry_id, 2),
+        service_ttl(&env, &registry_id, 3),
+    ];
+    let instance_before = instance_ttl(&env, &registry_id);
+
+    let page = ctx.registry.get_services(&1, &MAX_PAGE_SIZE);
+    assert_eq!(page.services.len(), 3);
+    let lease_page = ctx.registry.get_leases(&1, &MAX_PAGE_SIZE);
+    assert_eq!(lease_page.leases.len(), 0);
+
+    for (index, id) in (1..=3u64).enumerate() {
+        assert_eq!(
+            service_ttl(&env, &registry_id, id),
+            before[index],
+            "reading a page must not charge rent on entry {id}"
+        );
+    }
+    assert_eq!(instance_ttl(&env, &registry_id), instance_before);
 }
