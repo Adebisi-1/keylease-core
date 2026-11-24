@@ -4883,7 +4883,7 @@ fn test_fresh_counters_start_at_zero_and_move_only_on_success() {
 /// Every published error code with the variant it names, in order. This is the
 /// table in `docs/contract-reference.md`; the two must change together, and only
 /// by appending.
-const ERROR_ABI: [(u32, Error); 37] = [
+const ERROR_ABI: [(u32, Error); 38] = [
     (1, Error::AlreadyInitialized),
     (2, Error::NotInitialized),
     (3, Error::Unauthorized),
@@ -4921,6 +4921,7 @@ const ERROR_ABI: [(u32, Error); 37] = [
     (35, Error::LeaseNotTransferable),
     (36, Error::InvalidConsumer),
     (37, Error::RateTooHigh),
+    (38, Error::InvalidEndpointHash),
 ];
 
 #[test]

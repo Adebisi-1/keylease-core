@@ -92,4 +92,8 @@ pub enum Error {
     /// challenge-window and transfer codes so every number already published
     /// keeps its meaning.
     RateTooHigh = 37,
+    /// The `endpoint_hash` supplied to `register_service` is all zeroes, so it
+    /// commits to no off-chain descriptor. Appended after `RateTooHigh` so every
+    /// number already published keeps its meaning.
+    InvalidEndpointHash = 38,
 }

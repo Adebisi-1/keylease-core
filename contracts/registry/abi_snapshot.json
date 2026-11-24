@@ -1759,6 +1759,11 @@
           "doc": "Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`. Appended after the\\nchallenge-window and transfer codes so every number already published\\nkeeps its meaning.",
           "name": "RateTooHigh",
           "value": 37
+        },
+        {
+          "doc": "The `endpoint_hash` supplied to `register_service` is all zeroes, so it\\ncommits to no off-chain descriptor. Appended after `RateTooHigh` so every\\nnumber already published keeps its meaning.",
+          "name": "InvalidEndpointHash",
+          "value": 38
         }
       ]
     }

@@ -1380,6 +1380,7 @@ recording it there fails `cargo test`. Add a new code by appending it to
 | 35 | `LeaseNotTransferable` | lease already settled or revoked |
 | 36 | `InvalidConsumer` | transfer target is the current consumer |
 | 37 | `RateTooHigh` | published `rate_per_call` above `MAX_RATE_PER_CALL` |
+| 38 | `InvalidEndpointHash` | `endpoint_hash` is all zeroes and commits to nothing |
 
 ## Invoking with the Stellar CLI
 
