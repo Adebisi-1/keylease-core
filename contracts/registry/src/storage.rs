@@ -22,6 +22,7 @@
 //! | [`crate::KeyLeaseRegistry::bump_service`] | — | extend | — |
 //! | [`crate::KeyLeaseRegistry::bump_lease`] | — | — | extend |
 //! | `get_service`, `get_lease`, `lease_status`, `remaining_calls`, `locked_balance`, `services_for_provider` | — | — | — |
+//! | [`crate::KeyLeaseRegistry::get_services`], [`crate::KeyLeaseRegistry::get_leases`] | — | — | — |
 //!
 //! The last row is the read-only surface: it never extends anything, so a
 //! simulation of it costs instructions and no rent. A lease or service that is
@@ -38,7 +39,8 @@ use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
 use crate::errors::Error;
 use crate::types::{
-    CancelRequest, Lease, PendingUpgrade, ProviderServicePage, Service, ServiceStats,
+    CancelRequest, Lease, LeasePage, PendingUpgrade, ProviderServicePage, Service, ServicePage,
+    ServiceStats, Settlement,
 };
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
@@ -127,6 +129,8 @@ pub enum DataKey {
     ProviderServices(Address),
     /// Pending early-cancellation request by lease id (persistent storage).
     CancelRequest(u64),
+    /// `Settlement` by lease id (persistent storage).
+    Settlement(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +300,33 @@ pub fn get_service(env: &Env, service_id: u64) -> Result<Service, Error> {
         .ok_or(Error::ServiceNotFound)
 }
 
+/// Read up to `limit` service entries from `start`, ascending by id.
+///
+/// Id spaces are monotonic from 1, and an id whose entry was evicted is
+/// skipped, so `done` rather than the page length is the end marker. Looking
+/// at a service extends no TTL; callers that need an entry to stay alive use
+/// [`crate::KeyLeaseRegistry::bump_service`].
+pub fn services_page(env: &Env, start: u64, limit: u32) -> ServicePage {
+    let count = service_count(env);
+    let first = start.max(1);
+    let end = first.saturating_add(limit as u64);
+    let mut services = Vec::new(env);
+    let mut next = first;
+
+    while next < end && next <= count {
+        if let Some(service) = env.storage().persistent().get(&DataKey::Service(next)) {
+            services.push_back(service);
+        }
+        next += 1;
+    }
+
+    ServicePage {
+        services,
+        next_start: next,
+        done: next > count,
+    }
+}
+
 /// Append `service.service_id` to its provider's index and keep that index alive.
 ///
 /// Idempotence comes from the index itself rather than from comparing against the
@@ -451,6 +482,18 @@ pub fn get_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Settlements
+// ---------------------------------------------------------------------------
+
+pub fn save_settlement(env: &Env, settlement: &Settlement) {
+    let key = DataKey::Settlement(settlement.lease_id);
+    env.storage().persistent().set(&key, settlement);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+}
+
+// ---------------------------------------------------------------------------
 // Derived per-entity state: settlement stats and revocation markers
 // ---------------------------------------------------------------------------
 //
@@ -563,6 +606,19 @@ pub fn save_cancel_request(env: &Env, request: &CancelRequest) {
         .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
 }
 
+pub fn get_settlement(env: &Env, lease_id: u64) -> Result<Settlement, Error> {
+    let key = DataKey::Settlement(lease_id);
+    let settlement = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::SettlementNotFound)?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    Ok(settlement)
+}
+
 pub fn get_cancel_request(env: &Env, lease_id: u64) -> Option<CancelRequest> {
     let key = DataKey::CancelRequest(lease_id);
     let request = env.storage().persistent().get(&key);
@@ -578,4 +634,31 @@ pub fn remove_cancel_request(env: &Env, lease_id: u64) {
     env.storage()
         .persistent()
         .remove(&DataKey::CancelRequest(lease_id));
+}
+
+/// Read up to `limit` lease entries from `start`, ascending by id.
+///
+/// Same bounded-window shape as [`services_page`]: the ids are `1..=
+/// lease_count`, a lease whose entry was evicted is skipped, and no TTL is
+/// extended by looking at one. Callers that need a lease to stay readable use
+/// [`crate::KeyLeaseRegistry::bump_lease`].
+pub fn leases_page(env: &Env, start: u64, limit: u32) -> LeasePage {
+    let count = lease_count(env);
+    let first = start.max(1);
+    let end = first.saturating_add(limit as u64);
+    let mut leases = Vec::new(env);
+    let mut next = first;
+
+    while next < end && next <= count {
+        if let Some(lease) = env.storage().persistent().get(&DataKey::Lease(next)) {
+            leases.push_back(lease);
+        }
+        next += 1;
+    }
+
+    LeasePage {
+        leases,
+        next_start: next,
+        done: next > count,
+    }
 }

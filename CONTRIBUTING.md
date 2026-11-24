@@ -106,6 +106,17 @@ ignore entry** — so an ignore is a reviewed security decision, not a mute butt
 The malware scan and the build do not replace this check: `Dependency Policy`
 is the only job that inspects the dependency graph.
 
+### Where the findings are shown
+
+The `Clippy` and `Dependency Policy` jobs also export their findings as SARIF
+and upload them to GitHub code scanning (categories `clippy` and `cargo-deny`).
+Maintainers see them under the repository's **Security → Code scanning** tab,
+filtered by tool, and a pull request from a branch of this repository shows new
+alerts as annotations on its diff. Pull requests from forks get a read-only
+token, so their results stay in the job logs; the alerts appear once the change
+reaches `main`. The upload is informational: the jobs still pass or fail on the
+`cargo clippy` and `cargo deny check` steps that run first.
+
 ### Review requirements for any dependency PR
 
 A dependency PR is merged when all of the following hold:
@@ -155,18 +166,25 @@ SDK pin:
 
 ## Text and documentation checks
 
-Three non-Rust checks run in CI, and each reads its configuration from this
-repository, so the local command below is the same check and fails the same way:
+Six checks run in CI outside the Rust build, and each reads its configuration
+from this repository, so the local command below is the same check and fails the
+same way:
 
 | Check | Command | Config | CI job |
 | --- | --- | --- | --- |
 | Spell check | `typos` | [`_typos.toml`](./_typos.toml) | `Spell Check` |
 | Markdown lint | `npx markdownlint-cli2@0.24.0` | [`.markdownlint-cli2.jsonc`](./.markdownlint-cli2.jsonc) | `Markdown Lint` |
+| Workflow lint | `actionlint` | none; it lints every file under `.github/workflows/` | `Action Lint` |
+| Crate documentation | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` | the doc comments themselves | `Rustdoc` |
+| Missing public docs | `./scripts/check-missing-docs.sh` | `keylease_doc_lint` cfg in each contract `lib.rs` | `Rustdoc` |
 | Nav, anchors, links | `mkdocs build --strict` | [`mkdocs.yml`](./mkdocs.yml) | `Docs → Build preview` (PR), `Build & deploy` (`main`) |
 
 ```bash
 cargo install typos-cli --locked            # one-time
 typos
+
+brew install actionlint shellcheck          # one-time; see the note below
+actionlint                                  # every file in .github/workflows
 
 pip install -r requirements-docs.txt        # one-time
 mkdocs build --strict
@@ -180,6 +198,26 @@ arguments lints exactly what CI lints. `mkdocs build --strict` promotes a broken
 nav entry or a missing in-page anchor to an error, which is why internal links
 must target real heading slugs.
 
+`actionlint` checks the workflow files themselves: expression syntax, `needs:`
+targets, and, through `shellcheck`, every inline `run:` script. That last part is
+delegated, so `actionlint` skips it silently when `shellcheck` is not on `PATH`;
+the CI job installs both, and so must you if the local run is to match.
+`cargo doc` with `RUSTDOCFLAGS=-D warnings` turns an intra-doc link that does not
+resolve, or a manifest field cargo calls redundant, into a build failure. It does
+not enable `missing_docs`: the Soroban macros generate items nobody can annotate,
+and silencing them would weaken the check instead of documenting the contract.
+
+`scripts/check-missing-docs.sh` is the missing-docs check instead. Each contract
+crate turns `missing_docs` on only under `--cfg keylease_doc_lint`; the script
+builds with that cfg and fails on every undocumented public item **except** the
+ones a Soroban `#[contract]`, `#[contractimpl]`, `#[contracttype]`,
+`#[contractevent]` or `#[contracterror]` expansion generates (`spec_xdr`, event
+`publish`, and the client's `new`, `env` and `address`). Those are the only
+exceptions, they are filtered by the macro that produced them rather than by
+file or name, and nothing in the source carries `#[allow(missing_docs)]`. So a
+new public function, type, constant, field or enum variant without a `///`
+comment fails the `Rustdoc` job.
+
 The Docs workflow gates a pull request through its `Build preview` job, but only
 when the PR touches `docs/**`, `mkdocs.yml`, `requirements-docs.txt` or the
 workflow file itself. A documentation change therefore fails on the anchor
@@ -187,8 +225,8 @@ before it merges — which is why the local command above is still worth running
 since it is the same build and it answers in seconds. A change that touches none
 of those paths gets no Docs job on the PR at all, so if you edit `nav:` in a
 branch that only changes Rust, run it yourself. The checks that guard your branch
-are the CI jobs `Format`, `Clippy`, `Test`, `Build (wasm32v1-none)`,
-`Spell Check`, `Markdown Lint`, `Dependency Policy` and the required
+are the CI jobs `Format`, `Clippy`, `Test`, `Build (wasm32v1-none)`, `Rustdoc`,
+`Spell Check`, `Markdown Lint`, `Action Lint`, `Dependency Policy` and the required
 `Malware Scan`.
 
 ## Repository layout
@@ -230,6 +268,10 @@ verify leases.
   recoverable conditions.
 - **Don't reuse error codes.** Append new variants; codes are part of the ABI.
 - Keep `lib.rs` entry points documented, including their auth and preconditions.
+- Document every public item, including struct fields and enum variants:
+  `scripts/check-missing-docs.sh` fails on any that has no `///` comment. Do
+  not add `#[allow(missing_docs)]`; if an item truly cannot carry docs, extend
+  the macro filter in that script and say why in the PR.
 
 ## Unsafe code and std
 

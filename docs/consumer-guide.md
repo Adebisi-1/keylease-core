@@ -46,6 +46,27 @@ Returns the `provider`, `rate_per_call`, `is_active` and `endpoint_hash`. Confir
 the `endpoint_hash` matches the endpoint descriptor the provider published
 off-chain before you escrow anything.
 
+### Rate units: base units, not XLM
+
+`rate_per_call` is an integer in the escrow token's **smallest unit**. It is not
+a whole-token amount and not necessarily XLM. The registry never converts it, so
+the human-readable price depends entirely on the token's decimals.
+
+For the native SAC, XLM has 7 decimals: `1 XLM = 10,000,000 stroops`. The demo
+service's `rate_per_call = 1_000_000` therefore means:
+
+```text
+1,000,000 stroops / 10,000,000 stroops per XLM = 0.1 XLM per call
+500 calls -> 1,000,000 × 500 = 500,000,000 stroops = 50 XLM
+```
+
+For a custom SEP-41 token, use its `decimals()`: the same `1,000,000` is 1.0
+token at 6 decimals and 0.000000000001 token at 18 decimals. Check the token's
+decimals before you create the lease — assuming 7 when the token has 6 makes
+this lease ten times more expensive than you expect. See
+[Rate units and stroops](contract-reference.md#rate-units-and-stroops) for the
+conversion table.
+
 ## 2. Fund your account
 
 Any SEP-41 token the registry is configured with can be escrowed. On Testnet the
@@ -152,14 +173,32 @@ stellar contract invoke --id $REGISTRY --source-account consumer \
   --network testnet -- lease_status --lease_id 1
 ```
 
-`lease_status` is `0` (Active), `1` (Expired), `2` (Settled — the provider was
-paid) or `3` (Revoked — you reclaimed the deposit, so the provider earned
-nothing and `used_calls` stays `0`).
+`lease_status` is `0` (Active), `1` (Expired), `2` (Settled) or `3` (Revoked —
+you reclaimed the deposit, so the provider earned nothing and `used_calls`
+stays `0`). A lease becomes `Settled` as soon as the provider proposes a
+settlement; read `get_settlement` to see whether the payout is still in the
+challenge window or has been released. Only a finalized settlement is counted
+in `service_stats`.
+
+### Hand the lease to another account
+
+You can transfer an unsettled lease to any Stellar address. The recipient gets
+the remaining access **and** the refund right; your account loses both.
+
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  --send=yes -- transfer_lease \
+     --consumer $CONSUMER --lease_id 1 --new_consumer <NEW_ADDRESS>
+```
+
+This is a direct assignment — the recipient does not need to accept — and it
+emits `lease_transferred { lease_id, from, to }`. A settled or revoked lease
+cannot be transferred, and neither can a lease whose settlement is pending under
+a challenge window. An expired, unsettled lease can still be transferred: you
+are selling the refund claim, not access.
 
 ### End the lease early
-
-If you stop using the service before expiry, ask the provider to release your
-unused balance instead of waiting for expiry + 24 hours:
 
 ```bash
 stellar contract invoke \
@@ -177,7 +216,32 @@ path below.
 ## 6. Get your money back
 
 **Normal path — automatic.** When the provider settles, the unused balance is
-transferred back to you in the same transaction. Nothing to claim.
+returned to you once the challenge window closes. Nothing to claim.
+
+A settlement is a two-phase flow: `settle_lease` only proposes the split and
+locks the funds for 24 hours. If you disagree with the reported call count, you
+can dispute it inside that window with a 32-byte evidence hash:
+
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  --send=yes -- challenge_settlement \
+     --consumer $CONSUMER --lease_id 1 \
+     --evidence_hash <sha256-of-your-evidence>
+```
+
+The challenge freezes the payout until the registry admin resolves it. If the
+dispute is upheld you get the entire deposit back; if it is rejected the original
+proposal is released. You can withdraw a challenge with `cancel_challenge`; the
+settlement returns to pending and the original deadline is unchanged.
+
+Otherwise the payout can be released by anyone after the window closes:
+
+```bash
+stellar contract invoke \
+  --id $REGISTRY --source-account consumer --network testnet \
+  --send=yes -- finalize_settlement --lease_id 1
+```
 
 **Provider went dark.** After `expires_at + 24 hours`, reclaim everything:
 
@@ -201,11 +265,14 @@ constant in the contract (`SETTLE_GRACE_PERIOD_SECS = 86_400`).
 
 | Lease state | What happens |
 | --- | --- |
-| Provider settles before/at expiry | You get `locked_deposit − used × rate` back |
-| Provider settles after expiry within 24h | Same as above |
-| Provider settles with `verified_calls = 0` | You get the entire deposit back |
+| Provider proposes a settlement | Funds stay locked; you have 24h to challenge |
+| You challenge inside 24h | Payout frozen until the admin resolves it |
+| Dispute upheld | You get the entire deposit back |
+| Dispute rejected or no challenge | `locked_deposit − used × rate` returns to you at finalization |
+| Provider proposes `verified_calls = 0` | You get the entire deposit back |
 | Provider never settles, `now ≥ expiry + 24h` | You `revoke` and get the entire deposit |
 | Provider never settles, inside the 24h window | Nothing yet — wait |
+| You transferred the lease | The new consumer receives all later refunds |
 | You request early cancel and the provider approves | `rate × unused_calls`, immediately |
 | You request early cancel and the provider rejects | Lease continues; nothing moves |
 

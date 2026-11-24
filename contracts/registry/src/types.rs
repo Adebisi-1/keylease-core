@@ -111,6 +111,34 @@ pub struct ProviderServicePage {
     pub done: bool,
 }
 
+/// One page of the service catalogue, as returned by
+/// [`crate::KeyLeaseRegistry::get_services`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServicePage {
+    /// The services read on this call, ascending by id.
+    pub services: Vec<Service>,
+    /// The lowest id this call did not read. Pass it back as `start`.
+    pub next_start: u64,
+    /// `true` once the id space has been read to the end. A page shorter than
+    /// the requested `limit` with `done == false` means ids were skipped, not
+    /// that the catalogue ended.
+    pub done: bool,
+}
+
+/// One page of the lease record, as returned by
+/// [`crate::KeyLeaseRegistry::get_leases`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeasePage {
+    /// The leases read on this call, ascending by id.
+    pub leases: Vec<Lease>,
+    /// The lowest id this call did not read. Pass it back as `start`.
+    pub next_start: u64,
+    /// `true` once the id space has been read to the end.
+    pub done: bool,
+}
+
 /// Derived lifecycle state of a [`Lease`]. Discriminants are stable on the wire.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +147,9 @@ pub enum LeaseStatus {
     Active = 0,
     /// Past `expires_at` but not yet settled or revoked.
     Expired = 1,
-    /// Funds have been released; no further state transitions are possible.
+    /// No further lease transitions are possible: the lease was settled,
+    /// revoked, or committed to a proposed settlement. Check `get_settlement`
+    /// to see whether the escrow has actually been released.
     Settled = 2,
     /// Funds were reclaimed by the consumer after the provider failed to
     /// settle. Final, like [`LeaseStatus::Settled`], but economically the
@@ -134,7 +164,7 @@ impl LeaseStatus {
     /// field of [`Lease`]: the lease struct's on-chain layout is frozen, so the
     /// distinction between "settled by the provider" and "reclaimed by the
     /// consumer" is stored beside the lease instead of inside it (see
-    /// [`crate::storage`]). A revoked lease is always also `settled`, which is
+    /// `storage`). A revoked lease is always also `settled`, which is
     /// what keeps its escrow from being released twice; therefore a settled lease
     /// must be classified by the marker before it can be reported as
     /// [`LeaseStatus::Settled`].
@@ -188,6 +218,52 @@ pub struct UsageAttestation {
     pub valid_until: u64,
     /// Ed25519 signature over [`crate::usage_attestation_message`].
     pub signature: BytesN<64>,
+}
+
+/// Lifecycle of a settlement inside the consumer challenge window.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettlementState {
+    /// Proposed and waiting for `challengeable_until`; funds are still locked.
+    Pending = 0,
+    /// The consumer disputed the reported call count; the admin must resolve it.
+    Challenged = 1,
+    /// Funds have been released (paid out or refunded) and nothing can change.
+    Finalized = 2,
+}
+
+/// A provider's proposed split of a lease's escrow, held until the challenge
+/// window closes.
+///
+/// Kept in its own storage entry so the [`Lease`] layout is unchanged by the
+/// challenge-window upgrade.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    /// Lease being settled.
+    pub lease_id: u64,
+    /// Service the lease belongs to, used to attribute finalized revenue.
+    pub service_id: u64,
+    /// Consumer that receives `refund` and may challenge the proposal.
+    pub consumer: Address,
+    /// Provider that receives `payout`.
+    pub provider: Address,
+    /// Calls the provider reported as consumed.
+    pub verified_calls: u32,
+    /// Amount the provider would receive when finalized.
+    pub payout: i128,
+    /// Amount the consumer would receive when finalized.
+    pub refund: i128,
+    /// Ledger timestamp at which the settlement was proposed.
+    pub proposed_at: u64,
+    /// First ledger timestamp at which the proposal may be finalized.
+    pub challengeable_until: u64,
+    /// Current state of the settlement.
+    pub state: SettlementState,
+    /// Commitment to the active challenge's evidence (all zeroes when none).
+    pub challenge_evidence: BytesN<32>,
+    /// Ledger timestamp at which the active challenge was filed (0 when none).
+    pub challenged_at: u64,
 }
 
 /// A consumer's request to end a lease early with the provider's consent.

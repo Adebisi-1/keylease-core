@@ -1,4 +1,11 @@
 #![no_std]
+// Documentation coverage (CONTRIBUTING.md#text-and-documentation-checks).
+// `missing_docs` cannot simply be on: the Soroban `#[contract*]` macros emit
+// public items (`spec_xdr`, event `publish`, the client's `new`/`env`/`address`)
+// that carry no docs and cannot be given any, and a lint level cannot be scoped
+// to one macro expansion. scripts/check-missing-docs.sh builds with this cfg and
+// fails on every finding outside those expansions; the Rustdoc job runs it.
+#![cfg_attr(keylease_doc_lint, warn(missing_docs))]
 // No unsafe code in contract crates (CONTRIBUTING.md#unsafe-code-and-std).
 // `forbid` on the deployed Wasm. On the host, soroban-sdk's `testutils`
 // feature registers contracts through `ctor`, whose expansion carries its own
@@ -23,7 +30,11 @@
 //!     |                            |<-- create_lease(calls, secs) --|
 //!     |                            |    (escrow = rate * calls)     |
 //!     |                            |                                |
-//!     |-- settle_lease(used) ----->|  pay provider, refund rest --->|
+//!     |-- settle_lease(used) ----->|  propose payout + refund       |
+//!     |                            |  (24h challenge window opens)  |
+//!                                  |<-- challenge_settlement ------ |
+//!                                  |-- resolve_challenge (admin) -->|
+//!     |                            |  finalize after window         |
 //!                                  |<-- request_early_cancel ------- |
 //!     |-- approve/reject --------->|  consent releases unused funds |
 //!     |                            |                                |
@@ -40,6 +51,9 @@
 //! * A consumer can always reclaim the full deposit if the provider fails to
 //!   settle within [`SETTLE_GRACE_PERIOD_SECS`] of expiry. A reclaimed lease
 //!   ends as `LeaseStatus::Revoked`, so a refund is never mistaken for revenue.
+//! * A settlement does not pay out immediately: the consumer has
+//!   [`CHALLENGE_WINDOW_SECS`] to dispute the reported call count, and the
+//!   admin resolves a raised challenge.
 //! * A published price is bounded by [`MAX_RATE_PER_CALL`], which equals the
 //!   per-lease deposit cap, so the deposit a consumer is quoted can always be
 //!   computed and the cheapest lease of any listed service can always be funded.
@@ -57,14 +71,14 @@
 //! * **`Address` auth** — every actor is a Stellar account (`G...`) or contract
 //!   (`C...`) address authenticated by the host's `require_auth()`.
 //! * **Contract events** — every transition emits a typed Soroban event (see
-//!   [`events`]) so indexers can follow escrow without polling. Every payload
+//!   [`LeaseCreated`]) so indexers can follow escrow without polling. Every payload
 //!   carries a `schema_version` key so a stream that spans an upgrade stays
 //!   decodable.
 //! * **Ledger time** — expiry is measured in ledger timestamps, not wall clocks.
 //! * **Persistent storage TTL** — a lease entry is extended for its full
 //!   duration plus the grace period whenever it is written, so escrow cannot
 //!   fall off the ledger. Reads never extend: `bump_lease` and `bump_service`
-//!   keep an entry alive on their own terms (see [`storage`]).
+//!   keep an entry alive on their own terms (see `storage`).
 //! * **Wasm upgrades** — the admin proposes a new Wasm through the Soroban
 //!   deployer and may only execute it after a 24-hour on-ledger delay, giving
 //!   consumers time to exit; `contractmeta!` identifies the running version.
@@ -78,22 +92,25 @@ mod types;
 mod test;
 
 #[cfg(test)]
+mod test_abi;
+
+#[cfg(test)]
 mod test_wasm;
 
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String};
 
-use crate::types::CancelRequest;
-
 pub use crate::errors::Error;
 pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
-    LeaseCancellationWithdrawn, LeaseCancelled, LeaseCreated, LeaseDelegated, LeaseRevoked,
-    LeaseSettled, RegistryInitialized, ServiceAttestorSet, ServiceRateUpdated, ServiceRegistered,
-    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
+    LeaseCancellationWithdrawn, LeaseCancelled, LeaseChallengeCancelled, LeaseChallengeResolved,
+    LeaseChallenged, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled,
+    LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, ServiceAttestorSet,
+    ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
+    EVENT_SCHEMA_VERSION,
 };
 pub use crate::types::{
-    Lease, LeaseQuote, LeaseStatus, PendingUpgrade, ProviderServicePage, Service, ServiceStats,
-    UsageAttestation,
+    CancelRequest, Lease, LeasePage, LeaseQuote, LeaseStatus, PendingUpgrade, ProviderServicePage,
+    Service, ServicePage, ServiceStats, Settlement, SettlementState, UsageAttestation,
 };
 
 // On-chain contract metadata, readable from the ledger without the source.
@@ -121,6 +138,10 @@ pub const SETTLE_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60;
 /// on-ledger before any new rules can take effect, so a lease created under the
 /// current code can be settled before the contract changes underneath it.
 pub const UPGRADE_DELAY_SECS: u64 = 24 * 60 * 60;
+
+/// Window after a settlement is proposed during which the consumer may dispute
+/// the provider's reported call count. The payout stays locked until it closes.
+pub const CHALLENGE_WINDOW_SECS: u64 = 24 * 60 * 60;
 
 /// Longest lease the TTL policy is guaranteed to keep alive.
 ///
@@ -175,10 +196,15 @@ pub const MAX_LEASE_DEPOSIT: i128 = 1_000_000_000_000;
 /// pricing.
 pub const MAX_RATE_PER_CALL: i128 = MAX_LEASE_DEPOSIT;
 
-/// Largest page [`KeyLeaseRegistry::services_for_provider`] will serve.
+/// Largest page [`KeyLeaseRegistry::services_for_provider`], [`KeyLeaseRegistry::get_services`]
+/// and [`KeyLeaseRegistry::get_leases`] will serve in one call.
 ///
 /// Every entry on a page costs one ledger read, so an unbounded `limit` would let
-/// a single call read a provider's whole index and blow the transaction budget.
+/// a single call read a provider's whole index or catalogue and blow the transaction budget.
+///
+/// Asking for more is rejected with [`Error::InvalidLimit`] rather than
+/// silently clamped, so a caller cannot mistake a truncated page for the whole
+/// answer.
 pub const MAX_PAGE_SIZE: u32 = 100;
 
 /// Domain separator prefixed to every usage-attestation message.
@@ -202,10 +228,10 @@ pub const ATTESTATION_MESSAGE_LEN: usize = ATTESTATION_DOMAIN.len() + 8 + 8 + 4 
 /// signature, which is what makes a mismatched or stale payload detectable
 /// on-chain instead of being a matter of trusting the caller.
 ///
-/// The attestor signs the SHA-256 digest of these bytes; that prehash rule is
-/// Soroban's, not this contract's (`Crypto::ed25519_verify` hashes the message it
-/// is given). Exposed so an attestor service and its callers build the message
-/// with the same code the contract verifies against.
+/// The attestor signs these bytes directly using Ed25519. Soroban's
+/// `Crypto::ed25519_verify` verifies the supplied message as-is, so callers
+/// must not pre-hash it. Exposed so an attestor service and its callers build
+/// the message with the same code the contract verifies against.
 pub fn usage_attestation_message(
     env: &Env,
     lease_id: u64,
@@ -227,6 +253,7 @@ pub fn usage_attestation_message(
     Bytes::from_slice(env, &buf)
 }
 
+/// The KeyLease registry contract: services, escrowed leases and settlement.
 #[contract]
 pub struct KeyLeaseRegistry;
 
@@ -239,9 +266,9 @@ impl KeyLeaseRegistry {
     /// Initialize the registry and appoint `admin`.
     ///
     /// Can only be called once. The admin is the only account allowed to
-    /// configure the escrow token via [`Self::set_token`] or manage upgrades via
-    /// [`Self::propose_upgrade`], [`Self::execute_upgrade`] and
-    /// [`Self::cancel_upgrade`].
+    /// configure the escrow token via [`KeyLeaseRegistry::set_token`] or manage upgrades via
+    /// [`KeyLeaseRegistry::propose_upgrade`], [`KeyLeaseRegistry::execute_upgrade`] and
+    /// [`KeyLeaseRegistry::cancel_upgrade`].
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         if storage::is_initialized(&env) {
@@ -297,7 +324,7 @@ impl KeyLeaseRegistry {
     /// restarts the delay, so the exit window can never be shortened. The hash
     /// and the execution ledger timestamp are stored and reported by
     /// [`UpgradeProposed`]; clients can read them with
-    /// [`Self::get_pending_upgrade`].
+    /// [`KeyLeaseRegistry::get_pending_upgrade`].
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -509,8 +536,8 @@ impl KeyLeaseRegistry {
     /// Only the owning provider may call this.
     ///
     /// `attestor` is an ed25519 public key. Once set, this service's leases can
-    /// only be settled through [`Self::settle_lease_attested`] with a payload
-    /// signed by that key; [`Self::settle_lease`] fails with
+    /// only be settled through [`KeyLeaseRegistry::settle_lease_attested`] with a payload
+    /// signed by that key; [`KeyLeaseRegistry::settle_lease`] fails with
     /// `AttestationRequired`. Passing `None` removes the requirement and restores
     /// the default trust model, so the no-attestor mode is one call away at all
     /// times.
@@ -526,7 +553,7 @@ impl KeyLeaseRegistry {
     ///
     /// The attestor is chosen by the provider, so this is a self-binding
     /// commitment rather than a protocol-level guarantee; a consumer should read
-    /// [`Self::get_service_attestor`] before leasing if it wants one.
+    /// `get_service_attestor` before leasing if it wants one.
     pub fn set_service_attestor(
         env: Env,
         provider: Address,
@@ -638,11 +665,11 @@ impl KeyLeaseRegistry {
     /// The consumer is asking the provider to release the unused balance now
     /// instead of waiting for expiry and the full grace window. The request
     /// alone moves no funds and changes no balances; the provider decides by
-    /// calling [`Self::approve_early_cancel`] or [`Self::reject_early_cancel`].
+    /// calling [`KeyLeaseRegistry::approve_early_cancel`] or [`KeyLeaseRegistry::reject_early_cancel`].
     ///
     /// Only an unsettled, unexpired lease can be cancelled early, and a lease
     /// can have at most one pending request. The consumer may withdraw the
-    /// request with [`Self::withdraw_early_cancel`].
+    /// request with [`KeyLeaseRegistry::withdraw_early_cancel`].
     pub fn request_early_cancel(env: Env, consumer: Address, lease_id: u64) -> Result<(), Error> {
         consumer.require_auth();
 
@@ -814,16 +841,71 @@ impl KeyLeaseRegistry {
         Ok(())
     }
 
-    /// Settle a lease, paying the provider for `verified_calls` consumed calls
-    /// and refunding the remainder to the consumer. Requires provider auth.
+    /// Transfer a lease to a new consumer, moving the access right and the
+    /// refund path together. Requires the current consumer's auth.
+    ///
+    /// The transfer is a direct assignment: the new consumer does not have to
+    /// accept it. Because the provider and every settlement path read
+    /// `lease.consumer`, a later settlement refunds `new_consumer` and the old
+    /// consumer loses both the access right and any claim on the deposit.
+    ///
+    /// Only an unsettled, unrevoked lease can change hands. A settled lease has
+    /// no rights left to transfer, and a settled lease is exactly what a
+    /// proposed settlement produces, so a lease inside a challenge window cannot
+    /// be moved out from under its dispute.
+    pub fn transfer_lease(
+        env: Env,
+        consumer: Address,
+        lease_id: u64,
+        new_consumer: Address,
+    ) -> Result<(), Error> {
+        consumer.require_auth();
+
+        let mut lease = storage::get_lease(&env, lease_id)?;
+        if lease.consumer != consumer {
+            return Err(Error::Unauthorized);
+        }
+        if lease.settled {
+            return Err(Error::LeaseNotTransferable);
+        }
+        if lease.consumer == new_consumer {
+            return Err(Error::InvalidConsumer);
+        }
+
+        let previous = lease.consumer.clone();
+        lease.consumer = new_consumer.clone();
+        storage::save_lease(&env, &lease);
+        storage::remove_cancel_request(&env, lease.lease_id);
+
+        LeaseTransferred {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            from: previous,
+            to: new_consumer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Propose a settlement and open the consumer challenge window. Requires
+    /// provider auth.
     ///
     /// A lease may only be settled when it has **expired** or when
     /// `verified_calls == allocated_calls` (the consumer got everything it
-    /// paid for, so there is no reason to wait). Settling pays out
-    /// `verified_calls * rate_per_call` and returns
-    /// `locked_deposit - payout` to the consumer. A lease can be settled once.
-    /// The settlement is added to the service's cumulative totals, which
-    /// [`Self::service_stats`] reports.
+    /// paid for, so there is no reason to wait). The proposal records
+    /// `verified_calls * rate_per_call` as the provider's payout and
+    /// `locked_deposit - payout` as the consumer's refund, but moves no funds.
+    ///
+    /// The lease can no longer be settled again or revoked from this point. The
+    /// payout stays locked in escrow for [`CHALLENGE_WINDOW_SECS`] (24 hours),
+    /// during which the consumer may call
+    /// [`crate::KeyLeaseRegistry::challenge_settlement`]. Once the window closes,
+    /// anyone may call [`crate::KeyLeaseRegistry::finalize_settlement`] to release
+    /// the funds. A raised challenge is decided by the admin through
+    /// [`crate::KeyLeaseRegistry::resolve_challenge`]. The finalized split is
+    /// added to the service's cumulative totals, which
+    /// [`KeyLeaseRegistry::service_stats`] reports.
     pub fn settle_lease(
         env: Env,
         provider: Address,
@@ -848,7 +930,7 @@ impl KeyLeaseRegistry {
     /// otherwise). Verification happens before any state changes or token
     /// transfers, so a rejected attestation costs the caller nothing but the fee.
     ///
-    /// Every non-attestation rule of [`Self::settle_lease`] still applies: the
+    /// Every non-attestation rule of [`KeyLeaseRegistry::settle_lease`] still applies: the
     /// lease must be settleable, the caller must own the service, and the lease
     /// can only be settled once. A service with no attestor configured is
     /// rejected with `AttestorNotConfigured` rather than treated as
@@ -901,42 +983,197 @@ impl KeyLeaseRegistry {
             .locked_deposit
             .checked_sub(payout)
             .ok_or(Error::Overflow)?;
+        let challengeable_until = now
+            .checked_add(CHALLENGE_WINDOW_SECS)
+            .ok_or(Error::Overflow)?;
 
-        // checks-effects-interactions: persist the settlement before any token
-        // transfer, so a re-entrant token sees a settled lease and reverts.
+        // The lease is committed to this settlement: it can no longer be settled
+        // again or revoked, even though the funds stay in escrow.
         lease.used_calls = verified_calls;
         lease.settled = true;
         storage::save_lease(&env, &lease);
         // A pending early-cancellation request is moot once the lease settles.
         storage::remove_cancel_request(&env, lease.lease_id);
 
-        // The cumulative totals are part of the settlement, not a report about
-        // it: they are written with the lease and before the payout, so no
-        // path can move tokens without counting them.
-        storage::record_settlement(&env, service.service_id, verified_calls, payout)?;
+        storage::save_settlement(
+            &env,
+            &Settlement {
+                lease_id: lease.lease_id,
+                service_id: lease.service_id,
+                consumer: lease.consumer.clone(),
+                provider: service.provider.clone(),
+                verified_calls,
+                payout,
+                refund,
+                proposed_at: now,
+                challengeable_until,
+                state: SettlementState::Pending,
+                challenge_evidence: BytesN::from_array(&env, &[0u8; 32]),
+                challenged_at: 0,
+            },
+        );
 
-        let token_addr = storage::get_token(&env).ok_or(Error::TokenNotSet)?;
-        let client = token::Client::new(&env, &token_addr);
-        let contract = env.current_contract_address();
-
-        if payout > 0 {
-            client.transfer(&contract, &service.provider, &payout);
-        }
-        if refund > 0 {
-            client.transfer(&contract, &lease.consumer, &refund);
-        }
-
-        LeaseSettled {
-            lease_id: lease.lease_id,
+        LeaseSettlementProposed {
             schema_version: EVENT_SCHEMA_VERSION,
-            provider,
+            lease_id: lease.lease_id,
+            provider: service.provider,
             verified_calls,
             payout,
             refund,
+            challengeable_until,
         }
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Release a proposed settlement after its challenge window has closed.
+    ///
+    /// Permissionless: the provider, the consumer or any keeper can call it once
+    /// `now >= challengeable_until` and no challenge is active. Funds move to
+    /// the provider and consumer exactly as proposed by the provider.
+    pub fn finalize_settlement(env: Env, lease_id: u64) -> Result<(), Error> {
+        let mut settlement = storage::get_settlement(&env, lease_id)?;
+        match settlement.state {
+            SettlementState::Finalized => return Err(Error::SettlementFinalized),
+            SettlementState::Challenged => return Err(Error::SettlementChallenged),
+            SettlementState::Pending => {}
+        }
+
+        if env.ledger().timestamp() < settlement.challengeable_until {
+            return Err(Error::ChallengeWindowStillOpen);
+        }
+
+        let (payout, refund) = (settlement.payout, settlement.refund);
+        pay_settlement(&env, &mut settlement, payout, refund)
+    }
+
+    /// Dispute a proposed settlement with an evidence hash. Requires consumer
+    /// auth and must happen inside the challenge window.
+    ///
+    /// The settlement is frozen until the admin resolves the challenge; the
+    /// payout cannot be finalized while it is active. A consumer may withdraw
+    /// the challenge with
+    /// [`crate::KeyLeaseRegistry::cancel_challenge`].
+    pub fn challenge_settlement(
+        env: Env,
+        consumer: Address,
+        lease_id: u64,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        consumer.require_auth();
+
+        let mut settlement = storage::get_settlement(&env, lease_id)?;
+        if settlement.consumer != consumer {
+            return Err(Error::Unauthorized);
+        }
+        match settlement.state {
+            SettlementState::Finalized => return Err(Error::SettlementFinalized),
+            SettlementState::Challenged => return Err(Error::SettlementChallenged),
+            SettlementState::Pending => {}
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= settlement.challengeable_until {
+            return Err(Error::ChallengeWindowClosed);
+        }
+        if evidence_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidEvidence);
+        }
+
+        settlement.challenge_evidence = evidence_hash.clone();
+        settlement.challenged_at = now;
+        settlement.state = SettlementState::Challenged;
+        storage::save_settlement(&env, &settlement);
+
+        LeaseChallenged {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer,
+            evidence_hash,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Withdraw an active challenge, returning the settlement to `Pending`.
+    /// Requires consumer auth.
+    ///
+    /// Cancelling does not pay out immediately: the original challenge window
+    /// still has to close before
+    /// [`crate::KeyLeaseRegistry::finalize_settlement`] can release the funds.
+    /// While the window remains open the consumer may challenge again.
+    pub fn cancel_challenge(env: Env, consumer: Address, lease_id: u64) -> Result<(), Error> {
+        consumer.require_auth();
+
+        let mut settlement = storage::get_settlement(&env, lease_id)?;
+        if settlement.consumer != consumer {
+            return Err(Error::Unauthorized);
+        }
+        match settlement.state {
+            SettlementState::Finalized => return Err(Error::SettlementFinalized),
+            SettlementState::Pending => return Err(Error::NoActiveChallenge),
+            SettlementState::Challenged => {}
+        }
+
+        settlement.challenge_evidence = BytesN::from_array(&env, &[0u8; 32]);
+        settlement.challenged_at = 0;
+        settlement.state = SettlementState::Pending;
+        storage::save_settlement(&env, &settlement);
+
+        LeaseChallengeCancelled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            consumer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Resolve an active challenge. Admin only.
+    ///
+    /// `upheld = true` refunds the entire deposit to the consumer and pays the
+    /// provider nothing. `upheld = false` releases the proposal unchanged. The
+    /// admin may resolve before or after the challenge window closes.
+    pub fn resolve_challenge(
+        env: Env,
+        admin: Address,
+        lease_id: u64,
+        upheld: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+
+        let mut settlement = storage::get_settlement(&env, lease_id)?;
+        match settlement.state {
+            SettlementState::Finalized => return Err(Error::SettlementFinalized),
+            SettlementState::Pending => return Err(Error::NoActiveChallenge),
+            SettlementState::Challenged => {}
+        }
+
+        let (payout, refund) = if upheld {
+            (
+                0,
+                settlement
+                    .payout
+                    .checked_add(settlement.refund)
+                    .ok_or(Error::Overflow)?,
+            )
+        } else {
+            (settlement.payout, settlement.refund)
+        };
+
+        LeaseChallengeResolved {
+            schema_version: EVENT_SCHEMA_VERSION,
+            lease_id,
+            admin: admin.clone(),
+            upheld,
+        }
+        .publish(&env);
+
+        pay_settlement(&env, &mut settlement, payout, refund)
     }
 
     /// Reclaim the full deposit for a lease the provider never settled.
@@ -1121,7 +1358,7 @@ impl KeyLeaseRegistry {
     /// rather than an error, so a new account can page before it registers.
     ///
     /// Pure read: like every other view, it extends no TTL, its own index entry
-    /// included. Use [`Self::register_service`] or [`Self::set_service_active`]
+    /// included. Use [`KeyLeaseRegistry::register_service`] or [`KeyLeaseRegistry::set_service_active`]
     /// to keep a catalogue's index alive.
     pub fn services_for_provider(
         env: Env,
@@ -1137,12 +1374,12 @@ impl KeyLeaseRegistry {
 
     /// Fetch a lease. Pure read: never extends a TTL.
     ///
-    /// Use [`Self::bump_lease`] to keep an entry alive.
+    /// Use [`KeyLeaseRegistry::bump_lease`] to keep an entry alive.
     pub fn get_lease(env: Env, lease_id: u64) -> Result<Lease, Error> {
         storage::get_lease(&env, lease_id)
     }
 
-    /// Predict what [`Self::create_lease`] would lock, without auth or a transfer.
+    /// Predict what [`KeyLeaseRegistry::create_lease`] would lock, without auth or a transfer.
     ///
     /// Consumers and SDKs used to re-derive the deposit and the expiry off-chain,
     /// where any change to contract semantics turns into silent drift. This view
@@ -1250,15 +1487,112 @@ impl KeyLeaseRegistry {
         Ok(lease.allocated_calls.saturating_sub(lease.used_calls))
     }
 
+    /// Fetch the settlement proposed for a lease.
+    pub fn get_settlement(env: Env, lease_id: u64) -> Result<Settlement, Error> {
+        storage::get_settlement(&env, lease_id)
+    }
+
     /// Escrow balance owed to a lease, in token stroops, at the current ledger
-    /// time. Pure read.
+    /// time. Includes a proposed settlement's payout and refund until it is
+    /// finalized.
     pub fn locked_balance(env: Env, lease_id: u64) -> Result<i128, Error> {
         let lease = storage::get_lease(&env, lease_id)?;
-        if lease.settled {
-            return Ok(0);
+        if !lease.settled {
+            return Ok(lease.locked_deposit);
         }
-        Ok(lease.locked_deposit)
+        match storage::get_settlement(&env, lease_id) {
+            Ok(settlement) if settlement.state != SettlementState::Finalized => settlement
+                .payout
+                .checked_add(settlement.refund)
+                .ok_or(Error::Overflow),
+            // Revoked leases never have a settlement, and finalized ones hold nothing.
+            _ => Ok(0),
+        }
     }
+
+    /// One bounded page of the service catalogue, ascending by id.
+    ///
+    /// This exists so a dashboard or indexer does not have to replay the whole
+    /// event history to learn what is registered. `start` is the first id to
+    /// read (ids begin at 1, so `start` of 0 reads from the beginning) and
+    /// `limit` is at most [`MAX_PAGE_SIZE`]. Pass `next_start` back as `start`
+    /// until `done` is `true`.
+    ///
+    /// `done`, not the page length, is the end of the catalogue: ids whose
+    /// entry has been evicted are skipped, so a short page with `done == false`
+    /// just means the walk passed entries that are no longer on the ledger.
+    /// [`KeyLeaseRegistry::service_count`] still counts them.
+    ///
+    /// Pure read: extends no TTL, including the entries it walks over.
+    pub fn get_services(env: Env, start: u64, limit: u32) -> Result<ServicePage, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::InvalidLimit);
+        }
+        Ok(storage::services_page(&env, start, limit))
+    }
+
+    /// One bounded page of the lease record, ascending by id.
+    ///
+    /// Same paging contract as [`KeyLeaseRegistry::get_services`]: page until `done`, and
+    /// treat a short page as evicted entries rather than as the end. Lease ids
+    /// are global and monotonic across services, so a page mixes services;
+    /// filter by `service_id` client side.
+    ///
+    /// Pure read: extends no TTL. Use [`KeyLeaseRegistry::bump_lease`] to keep an entry
+    /// readable.
+    pub fn get_leases(env: Env, start: u64, limit: u32) -> Result<LeasePage, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::InvalidLimit);
+        }
+        Ok(storage::leases_page(&env, start, limit))
+    }
+}
+
+/// Release the funds recorded in `settlement` and mark it finalized.
+///
+/// checks-effects-interactions: the finalized state is persisted before any
+/// token transfer, so a re-entrant token cannot release the same funds twice.
+fn pay_settlement(
+    env: &Env,
+    settlement: &mut Settlement,
+    payout: i128,
+    refund: i128,
+) -> Result<(), Error> {
+    let token_addr = storage::get_token(env).ok_or(Error::TokenNotSet)?;
+
+    // Revenue is counted once funds actually leave escrow, not when the
+    // proposal is made: a challenged settlement can still be overturned.
+    let paid_calls = if payout == 0 {
+        0
+    } else {
+        settlement.verified_calls
+    };
+    storage::record_settlement(env, settlement.service_id, paid_calls, payout)?;
+
+    settlement.payout = payout;
+    settlement.refund = refund;
+    settlement.state = SettlementState::Finalized;
+    storage::save_settlement(env, settlement);
+
+    let client = token::Client::new(env, &token_addr);
+    let contract = env.current_contract_address();
+    if payout > 0 {
+        client.transfer(&contract, &settlement.provider, &payout);
+    }
+    if refund > 0 {
+        client.transfer(&contract, &settlement.consumer, &refund);
+    }
+
+    LeaseSettled {
+        schema_version: EVENT_SCHEMA_VERSION,
+        lease_id: settlement.lease_id,
+        provider: settlement.provider.clone(),
+        verified_calls: settlement.verified_calls,
+        payout,
+        refund,
+    }
+    .publish(env);
+    Ok(())
 }
 
 /// Ensure `caller` is the provider that owns the lease's service.
@@ -1404,11 +1738,21 @@ fn verify_attestation(
 
     // Check that the service has an attestor configured.
     #[allow(clippy::needless_borrow)]
-    let _attestor = storage::get_service_attestor(&env, lease.service_id)
+    let attestor = storage::get_service_attestor(&env, lease.service_id)
         .ok_or(Error::AttestorNotConfigured)?;
 
-    // TODO: full ed25519 signature verification can be added here when
-    // the attestor service is integrated. For now, the structural checks
-    // above prevent replay and stale attacks.
+    // Bind the structural checks above to the configured public key. The host
+    // crypto primitive aborts the invocation when the signature is invalid,
+    // before settlement writes or token transfers are reached.
+    let message = usage_attestation_message(
+        env,
+        attestation.lease_id,
+        attestation.service_id,
+        attestation.verified_calls,
+        attestation.valid_until,
+    );
+    env.crypto()
+        .ed25519_verify(&attestor, &message, &attestation.signature);
+
     Ok(())
 }
