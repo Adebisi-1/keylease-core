@@ -21,6 +21,67 @@ token (checks-effects-interactions).
 
 ---
 
+## Rate units and stroops
+
+`rate_per_call`, `locked_deposit`, `payout` and `refund` are `i128` amounts in
+the escrow token's **smallest unit** — base units, never whole tokens and never
+XLM. The contract does not convert, scale or round: it multiplies and adds
+integers. A lease therefore locks `rate_per_call × allocated_calls` base units,
+and reading that integer as XLM is the most common integration mistake.
+
+### Native SAC (XLM)
+
+The native Stellar Asset Contract fixes the asset at 7 decimals, so one base
+unit is one stroop:
+
+```text
+1 XLM    = 10,000,000 stroops
+1 stroop = 0.0000001 XLM
+```
+
+The demo service on Testnet is registered at `rate_per_call = 1_000_000`. The
+worked conversion is:
+
+```text
+rate_per_call = 1,000,000 stroops
+             = 1,000,000 / 10,000,000 XLM
+             = 0.1 XLM per call
+
+500 calls -> locked_deposit = 1,000,000 × 500
+                            = 500,000,000 stroops
+                            = 50 XLM
+```
+
+Those are the numbers in
+[How the protocol works — Worked economics](protocol.md#worked-economics);
+[Deployments](deployments.md) records the same `1000000` rate on the live
+Testnet service.
+
+### Custom SEP-41 tokens
+
+Any SEP-41 token can be configured with `set_token`. Its `decimals()` sets the
+scale, and the registry never reads it: the same integer `rate_per_call` means a
+different human price per token.
+
+| Token decimals | `rate_per_call = 1,000,000` means |
+| --- | --- |
+| 7 — native XLM, classic wrapped assets | 0.1 token per call |
+| 6 — USDC-style tokens | 1.0 token per call |
+| 18 — EVM-style tokens | 0.000000000001 token per call |
+
+Convert with `human_amount = base_units / 10^decimals`. Read `decimals()` from
+the token contract, or the issuer's documentation, before pricing a lease: a
+deployment that assumes 7 decimals for a 6-decimal token overcharges by 10x, and
+one that assumes 7 for an 18-decimal token undercharges by 10^11. The demo rate
+`1000000` is 0.1 XLM only because the native asset has 7 decimals.
+
+The two amount caps, [`MAX_RATE_PER_CALL`](#constants) and
+[`MAX_LEASE_DEPOSIT`](#constants), are also denominated in base units, so a
+token with more decimals has a lower real-world ceiling. The escrow token is
+therefore part of the deployment's pricing decision, not just its plumbing.
+
+---
+
 ## Constants
 
 Nine values decide how much money a lease may lock, how much a service may
@@ -419,8 +480,10 @@ Publish a new leasable service.
 - **Caller / auth:** `provider` must authorize.
 - **Trigger:** when a provider lists an API or RPC endpoint.
 - **Parameters:**
-  - `rate_per_call` — price per metered call in token stroops; must satisfy
-    `0 < rate_per_call ≤ MAX_RATE_PER_CALL`.
+  - `rate_per_call` — price per metered call in the escrow token's smallest
+    unit (stroops for the native SAC); must satisfy
+    `0 < rate_per_call ≤ MAX_RATE_PER_CALL`. See
+    [Rate units and stroops](#rate-units-and-stroops).
   - `endpoint_hash` — 32-byte commitment to the off-chain descriptor.
 - **Returns:** the new `service_id` (monotonic, starts at `1`).
 - **State:** writes `Service(service_id)` and appends it to
@@ -483,7 +546,9 @@ Lock a deposit and mint a time-bound lease.
   MAX_LEASE_DURATION_SECS`, `rate_per_call × requested_calls ≤
   MAX_LEASE_DEPOSIT`, the service exists and `is_active`, and `Token` is
   set.
-- **Effects:** `transfer(consumer → contract, rate_per_call × requested_calls)`.
+- **Effects:** `transfer(consumer → contract, rate_per_call × requested_calls)`,
+  all in the escrow token's smallest unit (see
+  [Rate units and stroops](#rate-units-and-stroops)).
 - **Returns:** the new `lease_id` (monotonic, starts at `1`).
 - **State:** writes `Lease(lease_id)` with `expires_at = ledger.timestamp() +
   duration_secs` and a TTL covering the term plus grace; increments `LeaseCount`.
@@ -825,6 +890,8 @@ performed one could not be used to price a read.
 | `remaining_calls` | `(env, lease_id: u64) -> Result<u32, Error>` | calls left; `0` once settled **or** expired |
 | `locked_balance` | `(env, lease_id: u64) -> Result<i128, Error>` | `locked_deposit`; `0` once settled |
 | `service_stats` | `(env, service_id: u64) -> Result<ServiceStats, Error>` | cumulative settled leases / calls / payout, else `ServiceNotFound` |
+| `get_services` | `(env, start: u64, limit: u32) -> Result<ServicePage, Error>` | up to `limit` services, ascending from `start` |
+| `get_leases` | `(env, start: u64, limit: u32) -> Result<LeasePage, Error>` | up to `limit` leases, ascending from `start` |
 
 > `remaining_calls` returns `0` as soon as the lease expires, even if calls were
 > never consumed. A caller that wants the raw allotment should read
@@ -849,6 +916,24 @@ performed one could not be used to price a read.
 > `next == 0` and `done == true`, not an error. This is a pure read: it extends no
 > TTL at all, neither the listed `Service` records nor the provider's own index
 > entry — see [protocol.md](protocol.md#the-provider-index).
+
+### Paging the catalogue
+
+`get_services` and `get_leases` exist so a dashboard does not have to replay the
+event history to learn what exists. Ids are monotonic from 1 and are never
+reused, so a page is a window over `1..=service_count` (or `1..=lease_count`):
+
+- `limit` is at most `MAX_PAGE_SIZE` (`100`), because the page reads one ledger
+  entry per id it walks over. `0` or anything above the cap is `InvalidLimit`,
+  not a silent clamp.
+- `done`, not the page length, ends the walk. `next_start` is the first id the
+  call did not read, so the next request is `get_services(next_start, limit)`.
+- An id whose entry has been evicted is skipped rather than reported, which is
+  why a page can be short while `done` is still `false`. `service_count` and
+  `lease_count` still count those ids, and `get_service`/`get_lease` on them
+  still return `ServiceNotFound`/`LeaseNotFound`.
+- Like every other view, a page extends no TTL — not its own counters and not
+  the entries it reads. Use `bump_service`/`bump_lease` to keep something alive.
 
 ## Events
 
@@ -934,6 +1019,19 @@ pub struct ProviderServicePage {
 pub struct CancelRequest {
     pub lease_id: u64,
     pub requested_at: u64,
+}
+
+pub struct ServicePage {
+    pub services: Vec<Service>,
+    pub next_start: u64,
+    pub done: bool,
+}
+
+pub struct LeasePage {
+    pub leases: Vec<Lease>,
+    pub next_start: u64,
+    pub done: bool,
+}
 }
 ```
 
@@ -1181,13 +1279,19 @@ stellar contract invoke --id $REGISTRY --source-account provider --network testn
 # upgrade (after `stellar contract upload`)
 stellar contract invoke --id $REGISTRY --source-account admin --network testnet \
   -- upgrade --admin $ADMIN --new_wasm_hash <64_HEX_CHARS>
+
+# page the catalogue (a read view, but the CLI still needs a fee payer)
+stellar contract invoke --id $REGISTRY --source-account reader --network testnet \
+  -- get_services --start 1 --limit 100
 ```
 
 ## MockToken (test only)
 
 `contracts/mock_token` implements a minimal SEP-41 surface — `init`, `mint`,
 `transfer`, `transfer_from`, `approve`, `allowance`, `balance`, `decimals` (7),
-`name`, `symbol`, `admin` — with an **unlimited mint**.
+`name`, `symbol`, `admin` — with an **unlimited mint**: the admin chooses every
+amount, and the only ceiling is `i128`, where a mint or a recipient credit
+returns `Overflow` (7) instead of trapping.
 
 It exists so local sandboxes do not depend on a live SAC, but it must **never**
 be deployed to a network holding value. The registry's own tests escrow against
