@@ -267,6 +267,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --document-private-items
+      # Fails on any undocumented public item outside the Soroban contract
+      # macros' generated code; see the script header for why the lint is
+      # enabled through a cfg instead of in the source. jq ships on the runner.
+      - name: Check for missing public docs
+        run: ./scripts/check-missing-docs.sh
 
   spellcheck:
     name: Spell Check
