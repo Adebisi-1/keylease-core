@@ -3,6 +3,7 @@ use soroban_sdk::contracterror;
 /** Contract-level error codes returned by [`crate::KeyLeaseRegistry`].
  * Codes are stable and start at 1 (`0` is reserved by the host for success).
  * New codes must be appended; codes are part of the ABI.
+ * The full mapping is pinned by `ERROR_ABI` in `test.rs`; extend it on append.
  */
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -69,4 +70,15 @@ pub enum Error {
     CancellationAlreadyRequested = 26,
     /// Early cancellation is only available before the lease expires.
     LeaseExpired = 27,
+    /// Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`. Appended after the
+    /// early-cancellation codes, so every number already published keeps its
+    /// meaning.
+    RateTooHigh = 28,
+    /// No admin transfer is pending, so there is nothing to accept or cancel.
+    NoPendingAdminTransfer = 29,
+    /// The pending admin transfer is past its `expires_at` and can no longer
+    /// be accepted. The current admin must propose again.
+    AdminTransferExpired = 30,
+    /// The proposed admin is the current admin; a transfer must change hands.
+    InvalidAdmin = 31,
 }
