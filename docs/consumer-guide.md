@@ -1,5 +1,25 @@
 # Consumer guide
 
+## Command-line helper
+
+The helper under `examples/consumer/` validates the configured service before
+every operation and keeps signing in the Stellar CLI keystore:
+
+```bash
+cp .env.example .env
+# Set KEYLEASE_CONTRACT_ID, KEYLEASE_SERVICE_ID, KEYLEASE_NETWORK,
+# KEYLEASE_CONSUMER_IDENTITY, KEYLEASE_REQUESTED_CALLS and KEYLEASE_DURATION_SECS.
+
+./examples/consumer/keylease-consumer.sh create --env .env
+./examples/consumer/keylease-consumer.sh status --lease-id 1 --env .env
+./examples/consumer/keylease-consumer.sh revoke --lease-id 1 --env .env
+```
+
+`create` first calls `get_service`, then `create_lease`, and prints `lease_id`
+and `lease_expiry`. `status` calls `get_lease`. `revoke` applies the contract's
+expiry plus 24-hour grace window by calling `revoke_expired_lease`; it does not
+bypass that window. The script never accepts or writes a secret seed.
+
 You want metered access to an API or RPC endpoint without a permanent static key.
 This guide walks through buying, using and reclaiming a lease with Stellar.
 
