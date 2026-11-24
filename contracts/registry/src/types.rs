@@ -24,7 +24,7 @@ pub struct Service {
 ///
 /// `created_at` was **appended** to the persisted shape, so entries written by an
 /// earlier release (which lack the field) are decoded by a legacy fallback in
-/// [`crate::storage::get_lease`] rather than trapping. Never reorder or remove an
+/// `crate::storage::get_lease` rather than trapping. Never reorder or remove an
 /// existing field: the field list is the storage key set.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,7 +49,7 @@ pub struct Lease {
     /// is readable from storage instead of being reconstructed from events.
     ///
     /// `0` only ever appears on entries written before this field existed; see
-    /// [`crate::storage::get_lease`] for how those are read.
+    /// `crate::storage::get_lease` for how those are read.
     pub created_at: u64,
 }
 
