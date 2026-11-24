@@ -172,6 +172,71 @@ pub struct LeaseCreated {
     pub rate_per_call: i128,
 }
 
+/// Emitted when a provider proposes a settlement and the consumer challenge
+/// window opens. No funds move yet.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseSettlementProposed {
+    /// Schema version of this payload; see [`EVENT_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Lease being settled.
+    #[topic]
+    pub lease_id: u64,
+    /// Provider that proposed the settlement.
+    pub provider: Address,
+    /// Calls the provider reported as consumed.
+    pub verified_calls: u32,
+    /// Amount the provider receives if the proposal is finalized.
+    pub payout: i128,
+    /// Amount the consumer receives if the proposal is finalized.
+    pub refund: i128,
+    /// First ledger timestamp at which the proposal may be finalized.
+    pub challengeable_until: u64,
+}
+
+/// Emitted when a consumer disputes a proposed settlement.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseChallenged {
+    /// Schema version of this payload; see [`EVENT_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Lease whose settlement was challenged.
+    #[topic]
+    pub lease_id: u64,
+    /// Consumer that filed the challenge.
+    pub consumer: Address,
+    /// Commitment to the consumer's evidence.
+    pub evidence_hash: BytesN<32>,
+}
+
+/// Emitted when a consumer withdraws their challenge.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseChallengeCancelled {
+    /// Schema version of this payload; see [`EVENT_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Lease whose challenge was withdrawn.
+    #[topic]
+    pub lease_id: u64,
+    /// Consumer that withdrew the challenge.
+    pub consumer: Address,
+}
+
+/// Emitted when the admin resolves a challenge.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseChallengeResolved {
+    /// Schema version of this payload; see [`EVENT_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Lease whose challenge was resolved.
+    #[topic]
+    pub lease_id: u64,
+    /// Admin that resolved the challenge.
+    pub admin: Address,
+    /// `true` if the consumer's dispute was upheld.
+    pub upheld: bool,
+}
+
 /// Emitted in addition to `lease_created` when a delegate minted the lease for
 /// a consumer.
 ///
@@ -253,7 +318,25 @@ pub struct LeaseCancelled {
     pub refund: i128,
 }
 
-/// Emitted when a provider settles a lease from escrow.
+/// Emitted when a lease is transferred to a new consumer.
+///
+/// The access right and the refund path move together, so an indexer can follow
+/// who is entitled to use the lease and reclaim its deposit.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseTransferred {
+    /// Schema version of this payload; see [`EVENT_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Lease that changed hands.
+    #[topic]
+    pub lease_id: u64,
+    /// Previous consumer, which authorized the transfer.
+    pub from: Address,
+    /// New consumer and owner of the refund path.
+    pub to: Address,
+}
+
+/// Emitted when a settlement is finalized and funds leave escrow.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseSettled {
