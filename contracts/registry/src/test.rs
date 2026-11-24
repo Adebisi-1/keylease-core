@@ -2134,6 +2134,7 @@ fn test_lease_status_of_separates_revocation_from_settlement() {
         consumer: consumer.clone(),
         allocated_calls: 10,
         used_calls: 0,
+        created_at: 0,
         expires_at: 4_600,
         locked_deposit: RATE * 10,
         settled,
