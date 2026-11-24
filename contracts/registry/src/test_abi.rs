@@ -23,8 +23,13 @@ fn collect_spec_entries() -> Vec<ScSpecEntry> {
         crate::KeyLeaseRegistry::spec_xdr_update_service().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_set_service_attestor().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_create_lease().to_vec(),
+        crate::KeyLeaseRegistry::spec_xdr_transfer_lease().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_settle_lease().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_settle_lease_attested().to_vec(),
+        crate::KeyLeaseRegistry::spec_xdr_finalize_settlement().to_vec(),
+        crate::KeyLeaseRegistry::spec_xdr_challenge_settlement().to_vec(),
+        crate::KeyLeaseRegistry::spec_xdr_cancel_challenge().to_vec(),
+        crate::KeyLeaseRegistry::spec_xdr_resolve_challenge().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_revoke_expired_lease().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_bump_service().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_bump_lease().to_vec(),
@@ -43,6 +48,7 @@ fn collect_spec_entries() -> Vec<ScSpecEntry> {
         crate::KeyLeaseRegistry::spec_xdr_lease_status().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_remaining_calls().to_vec(),
         crate::KeyLeaseRegistry::spec_xdr_locked_balance().to_vec(),
+        crate::KeyLeaseRegistry::spec_xdr_get_settlement().to_vec(),
     ];
     for xdr in fns {
         entries.push(ScSpecEntry::from_xdr(xdr, Limits::none()).unwrap());
@@ -57,6 +63,11 @@ fn collect_spec_entries() -> Vec<ScSpecEntry> {
         crate::events::ServiceRateUpdated::spec_xdr().to_vec(),
         crate::events::ServiceAttestorSet::spec_xdr().to_vec(),
         crate::events::LeaseCreated::spec_xdr().to_vec(),
+        crate::events::LeaseTransferred::spec_xdr().to_vec(),
+        crate::events::LeaseSettlementProposed::spec_xdr().to_vec(),
+        crate::events::LeaseChallenged::spec_xdr().to_vec(),
+        crate::events::LeaseChallengeCancelled::spec_xdr().to_vec(),
+        crate::events::LeaseChallengeResolved::spec_xdr().to_vec(),
         crate::events::LeaseSettled::spec_xdr().to_vec(),
         crate::events::LeaseRevoked::spec_xdr().to_vec(),
         crate::events::UpgradeProposed::spec_xdr().to_vec(),
