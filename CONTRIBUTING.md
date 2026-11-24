@@ -106,6 +106,17 @@ ignore entry** — so an ignore is a reviewed security decision, not a mute butt
 The malware scan and the build do not replace this check: `Dependency Policy`
 is the only job that inspects the dependency graph.
 
+### Where the findings are shown
+
+The `Clippy` and `Dependency Policy` jobs also export their findings as SARIF
+and upload them to GitHub code scanning (categories `clippy` and `cargo-deny`).
+Maintainers see them under the repository's **Security → Code scanning** tab,
+filtered by tool, and a pull request from a branch of this repository shows new
+alerts as annotations on its diff. Pull requests from forks get a read-only
+token, so their results stay in the job logs; the alerts appear once the change
+reaches `main`. The upload is informational: the jobs still pass or fail on the
+`cargo clippy` and `cargo deny check` steps that run first.
+
 ### Review requirements for any dependency PR
 
 A dependency PR is merged when all of the following hold:
