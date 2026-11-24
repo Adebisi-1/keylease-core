@@ -12,7 +12,12 @@ EOF
 
 ENV_FILE=".env"
 COMMAND="${1:-}"
-[ -n "$COMMAND" ] && shift || { usage >&2; exit 2; }
+if [ -n "$COMMAND" ]; then
+  shift
+else
+  usage >&2
+  exit 2
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
