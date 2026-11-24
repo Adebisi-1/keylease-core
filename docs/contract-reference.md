@@ -381,7 +381,8 @@ Initialize the registry and appoint `admin`.
 - **Preconditions:** the registry must not already be initialized.
 - **State:** sets `Admin` and `SchemaVersion = SCHEMA_VERSION`; extends instance TTL.
 - **Events:** `registry_initialized { admin }`.
-- **Errors:** `AlreadyInitialized`.
+- **Errors:** `AlreadyInitialized`, also returned when a `SchemaVersion`
+  entry already exists without an admin (state this contract did not write).
 - **Notes:** the admin can only call `set_token` and manage upgrades through the
   propose/execute/cancel flow below. It cannot move user funds.
 
@@ -474,7 +475,7 @@ Migrate stored data to the running Wasm's storage schema (`SCHEMA_VERSION`) and
 return the version now in force.
 
 - **Caller / auth:** `admin`, and `admin` must match the stored admin.
-- **Trigger:** immediately after every `upgrade`.
+- **Trigger:** immediately after every `execute_upgrade`.
 - **Effects:** applies each bounded `storage::migrate_step` from the stored
   version up to `SCHEMA_VERSION`, writes the new `SchemaVersion` and extends
   the instance TTL, all atomically. When the schema is already current, nothing
@@ -487,12 +488,16 @@ return the version now in force.
 
 ### Schema gate
 
-`set_token`, `register_service`, `set_service_active`, `create_lease`,
-`settle_lease` and `revoke_expired_lease` first check that the stored schema
-equals `SCHEMA_VERSION`. Otherwise they return `SchemaMigrationRequired` (data
-older than the code) or `SchemaVersionUnsupported` (data newer than the code).
-`init`, `upgrade`, `migrate`, `bump_service`, `bump_lease` and every view are
-not gated.
+Every state-changing entry point other than the ones listed below — `set_token`,
+`register_service`, `set_service_active`, `update_service`,
+`set_service_attestor`, `create_lease`, `create_lease_for`,
+`request_early_cancel`, `withdraw_early_cancel`, `reject_early_cancel`,
+`approve_early_cancel`, `settle_lease`, `settle_lease_attested` and
+`revoke_expired_lease` — first checks that the stored schema equals
+`SCHEMA_VERSION`. Otherwise it returns `SchemaMigrationRequired` (data older than
+the code) or `SchemaVersionUnsupported` (data newer than the code). `init`,
+`propose_upgrade`, `cancel_upgrade`, `execute_upgrade`, `migrate`,
+`bump_service`, `bump_lease` and every view are not gated.
 
 ---
 
@@ -1092,6 +1097,7 @@ pub enum DataKey {
     PendingUpgrade,            // instance (appended)
     ProviderServices(Address), // persistent: service ids, oldest first
     CancelRequest(u64),        // persistent: pending early-cancellation request
+    SchemaVersion,             // instance, u32: see SCHEMA_VERSION
 }
 ```
 
@@ -1255,6 +1261,8 @@ recording it there fails `cargo test`. Add a new code by appending it to
 | 26 | `CancellationAlreadyRequested` | a request is already pending |
 | 27 | `LeaseExpired` | early cancellation requires `now < expires_at` |
 | 28 | `RateTooHigh` | published `rate_per_call` above `MAX_RATE_PER_CALL` |
+| 29 | `SchemaMigrationRequired` | stored data predates this Wasm's schema; run `migrate` |
+| 30 | `SchemaVersionUnsupported` | stored data is newer than this Wasm (downgrade), or no migration path |
 
 ## Invoking with the Stellar CLI
 

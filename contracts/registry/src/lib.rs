@@ -68,6 +68,8 @@
 //! * **Wasm upgrades** — the admin proposes a new Wasm through the Soroban
 //!   deployer and may only execute it after a 24-hour on-ledger delay, giving
 //!   consumers time to exit; `contractmeta!` identifies the running version.
+//!   The storage schema is versioned: state-changing calls stop until the
+//!   admin runs `migrate` after an upgrade, and a downgrade is rejected.
 
 mod errors;
 mod events;
@@ -91,9 +93,11 @@ pub use crate::errors::Error;
 pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
     LeaseCancellationWithdrawn, LeaseCancelled, LeaseCreated, LeaseDelegated, LeaseRevoked,
-    LeaseSettled, RegistryInitialized, ServiceAttestorSet, ServiceRateUpdated, ServiceRegistered,
-    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
+    LeaseSettled, RegistryInitialized, SchemaMigrated, ServiceAttestorSet, ServiceRateUpdated,
+    ServiceRegistered, ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
+    EVENT_SCHEMA_VERSION,
 };
+pub use crate::storage::SCHEMA_VERSION;
 pub use crate::types::{
     Lease, LeasePage, LeaseQuote, LeaseStatus, PendingUpgrade, ProviderServicePage, Service,
     ServicePage, ServiceStats, UsageAttestation,
@@ -314,6 +318,13 @@ impl KeyLeaseRegistry {
     /// and the execution ledger timestamp are stored and reported by
     /// [`UpgradeProposed`]; clients can read them with
     /// [`KeyLeaseRegistry::get_pending_upgrade`].
+    ///
+    /// The upgrade entry points are deliberately **not** gated on the schema
+    /// check: if an upgrade installs the wrong Wasm (for example an older
+    /// schema, which stops the registry with `SchemaVersionUnsupported`), the
+    /// admin must still be able to propose and execute the right one. After an
+    /// upgrade that raises the schema, every state-changing entry point returns
+    /// `SchemaMigrationRequired` until [`KeyLeaseRegistry::migrate`] runs.
     pub fn propose_upgrade(
         env: Env,
         admin: Address,
@@ -374,7 +385,8 @@ impl KeyLeaseRegistry {
     /// and the ledger timestamp that had to be reached.
     ///
     /// The contract id stays the same; storage, balances and in-flight leases
-    /// are preserved, which is why upgrades must never change the storage layout.
+    /// are preserved, which is why a layout change must bump [`SCHEMA_VERSION`]
+    /// and ship a migration.
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         require_admin(&env, &admin)?;
@@ -541,6 +553,7 @@ impl KeyLeaseRegistry {
         endpoint_hash: BytesN<32>,
     ) -> Result<(), Error> {
         provider.require_auth();
+        storage::check_schema(&env)?;
 
         let mut service = storage::get_service(&env, service_id)?;
         if service.provider != provider {
@@ -595,6 +608,7 @@ impl KeyLeaseRegistry {
         attestor: Option<BytesN<32>>,
     ) -> Result<(), Error> {
         provider.require_auth();
+        storage::check_schema(&env)?;
 
         let service = storage::get_service(&env, service_id)?;
         if service.provider != provider {
@@ -681,6 +695,7 @@ impl KeyLeaseRegistry {
     ) -> Result<u64, Error> {
         delegate.require_auth();
         consumer.require_auth();
+        storage::check_schema(&env)?;
 
         let lease_id = mint_lease(&env, &consumer, service_id, requested_calls, duration_secs)?;
 
@@ -707,6 +722,7 @@ impl KeyLeaseRegistry {
     /// request with [`KeyLeaseRegistry::withdraw_early_cancel`].
     pub fn request_early_cancel(env: Env, consumer: Address, lease_id: u64) -> Result<(), Error> {
         consumer.require_auth();
+        storage::check_schema(&env)?;
 
         let lease = storage::get_lease(&env, lease_id)?;
         if lease.consumer != consumer {
@@ -745,6 +761,7 @@ impl KeyLeaseRegistry {
     /// Withdraw a pending early-cancellation request. Requires consumer auth.
     pub fn withdraw_early_cancel(env: Env, consumer: Address, lease_id: u64) -> Result<(), Error> {
         consumer.require_auth();
+        storage::check_schema(&env)?;
 
         let lease = storage::get_lease(&env, lease_id)?;
         if lease.consumer != consumer {
@@ -770,6 +787,7 @@ impl KeyLeaseRegistry {
     /// provider's auth; the lease stays active and unchanged.
     pub fn reject_early_cancel(env: Env, provider: Address, lease_id: u64) -> Result<(), Error> {
         provider.require_auth();
+        storage::check_schema(&env)?;
 
         let lease = storage::get_lease(&env, lease_id)?;
         require_lease_provider(&env, &lease, &provider)?;
@@ -806,6 +824,7 @@ impl KeyLeaseRegistry {
         verified_calls: u32,
     ) -> Result<(), Error> {
         provider.require_auth();
+        storage::check_schema(&env)?;
 
         let mut lease = storage::get_lease(&env, lease_id)?;
         require_lease_provider(&env, &lease, &provider)?;
@@ -924,6 +943,7 @@ impl KeyLeaseRegistry {
         attestation: UsageAttestation,
     ) -> Result<(), Error> {
         provider.require_auth();
+        storage::check_schema(&env)?;
 
         let lease = storage::get_lease(&env, lease_id)?;
         verify_attestation(&env, &lease, verified_calls, &attestation)?;
@@ -1304,8 +1324,8 @@ impl KeyLeaseRegistry {
     /// Storage schema the stored data conforms to. Pure read.
     ///
     /// `0` for a registry deployed before the schema was versioned. When this
-    /// differs from [`Self::code_schema_version`], state-changing calls are
-    /// stopped until the admin runs [`Self::migrate`]. `NotInitialized` before
+    /// differs from [`KeyLeaseRegistry::code_schema_version`], state-changing calls are
+    /// stopped until the admin runs [`KeyLeaseRegistry::migrate`]. `NotInitialized` before
     /// `init`.
     pub fn schema_version(env: Env) -> Result<u32, Error> {
         storage::stored_schema_version(&env).ok_or(Error::NotInitialized)

@@ -409,6 +409,7 @@ These must hold for every reachable state. They are asserted in tests.
 | --- | --- | --- |
 | `Admin`, `Token` | instance | configuration; instance TTL is bumped on every state change |
 | `ServiceCount`, `LeaseCount` | instance | monotonic id counters |
+| `SchemaVersion` | instance | storage schema the data conforms to; state-changing calls stop while it differs from the running Wasm's |
 | `Service(u64)` | persistent | TTL extended on save, on `create_lease` and by `bump_service`, never by a read |
 | `Lease(u64)` | persistent | TTL extended on save and by `bump_lease`, never by a read |
 | `ProviderServices(Address)` | persistent | service-id index per provider; extended by `save_service`, never by a read |

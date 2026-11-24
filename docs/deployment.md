@@ -308,14 +308,20 @@ stellar contract invoke --id $REGISTRY --network testnet -- get_pending_upgrade
 stellar contract invoke --id $REGISTRY --source-account keylease-admin \
   --network testnet --send=yes -- execute_upgrade --admin $ADMIN
 
-# 4. confirm the new version and watch the event
+# 4. lift the post-upgrade stop (a no-op when the storage schema is unchanged)
+stellar contract invoke --id $REGISTRY --source-account keylease-admin \
+  --network testnet --send=yes -- migrate --admin $ADMIN
+
+# 5. confirm the new version and schema, and watch the events
 stellar contract invoke --id $REGISTRY --source-account keylease-admin --network testnet -- version
 stellar contract invoke --id $REGISTRY --source-account keylease-admin --network testnet -- schema_version
 stellar events --id $REGISTRY --network testnet --start-ledger <ledger>
 ```
 
-Guard rails for an upgrade: keep the storage layout unchanged, append error
-codes instead of renumbering, and keep event names and payload fields
+Guard rails for an upgrade: keep the storage layout unchanged unless you bump
+the storage schema and ship a migration (see
+[Storage schema migrations](#storage-schema-migrations)), append error codes
+instead of renumbering, and keep event names and payload fields
 backwards-compatible. The `execute_after` timestamp and proposed hash are
 public via `get_pending_upgrade` and `upgrade_proposed`; announce them so clients
 can exit in time. Settle or revoke in-flight leases before changing token
@@ -335,11 +341,12 @@ can move.
 | Stored vs. code | State | Error | Way out |
 | --- | --- | --- | --- |
 | equal | running | — | — |
-| stored older | stopped | `SchemaMigrationRequired` (18) | admin runs `migrate` |
-| stored newer (a downgrade) | stopped | `SchemaVersionUnsupported` (19) | reinstall the newer Wasm; `migrate` refuses |
+| stored older | stopped | `SchemaMigrationRequired` (29) | admin runs `migrate` |
+| stored newer (a downgrade) | stopped | `SchemaVersionUnsupported` (30) | reinstall the newer Wasm; `migrate` refuses |
 
-`upgrade`, `migrate`, `bump_service`, `bump_lease` and every read-only view stay
-available while stopped, so a bad install can always be rolled back and entries
+`propose_upgrade`, `cancel_upgrade`, `execute_upgrade`, `migrate`,
+`bump_service`, `bump_lease` and every read-only view stay available while
+stopped, so a bad install can always be rolled back and entries
 can be kept alive during the window. A registry deployed before versioning
 reports schema `0`. Its layout is identical to schema `1`, and the first
 `migrate` after upgrading to a versioned Wasm only writes the stamp.
@@ -383,8 +390,9 @@ stellar contract info meta --wasm target/wasm32v1-none/release/keylease_registry
 
 1. Record the live state (step 2 of the checklist below), including
    `schema_version`.
-2. `upgrade`. From this transaction on the registry is stopped. Nothing can be
-   created, settled or revoked, and no value moves.
+2. `execute_upgrade`, once the 24h delay after `propose_upgrade` has passed.
+   From this transaction on the registry is stopped. Nothing can be created,
+   settled or revoked, and no value moves.
 3. `migrate --admin $ADMIN` in the very next transaction, to keep the stop
    short. It runs every step from the stored version to the code's version and
    stamps the new version atomically, then emits `schema_migrated`.
@@ -392,14 +400,16 @@ stellar contract info meta --wasm target/wasm32v1-none/release/keylease_registry
    leases and services read back unchanged, then resume traffic.
 
 If `migrate` fails, the registry stays stopped and nothing is written.
-Reinstall the previous Wasm hash with `upgrade`, which is valid until `migrate`
-succeeds, because the stored data is still in the old schema. After a
+Reinstall the previous Wasm hash with `propose_upgrade` and `execute_upgrade`,
+which is valid until `migrate` succeeds, because the stored data is still in the
+old schema. The upgrade time lock still applies, so a rollback keeps the
+registry stopped for at least 24 hours: rehearse the migration on Testnet first. After a
 successful migration, rolling back to the old Wasm leaves the registry stopped
 with `SchemaVersionUnsupported`, which is the intended outcome. The old code
 cannot read the new data, and it must not write over it.
 
-`scripts/deploy-testnet.sh --upgrade` runs `upgrade` and `migrate` back to back
-and prints the resulting `schema_version`.
+`scripts/deploy-testnet.sh --execute-upgrade` runs `execute_upgrade` and
+`migrate` back to back and prints the resulting `schema_version`.
 
 ### Upgrading safety checklist
 
@@ -416,7 +426,7 @@ rails above exist; the full layout is in
 | `DataKey` variant names and arities: `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)` | A `#[contracttype]` enum key encodes as `Vec[Symbol("<variant>"), …]`, so renaming `Lease` to `Leases` orphans every existing entry. The registry then reads `LeaseNotFound` on leases that still hold escrow. |
 | Stored value shapes for `Service` and `Lease` | Entries decode by field name and type. Renaming `used_calls`, retyping `locked_deposit`, or removing `settled` reinterprets or loses live records. |
 | Field presence, not field order, for structs | Old entries are read by key, so adding a field is safe **only** if the accessor tolerates its absence in entries written before the upgrade. |
-| `Error` codes, append-only (1–18 today) | Callers and indexers branch on the number; a reused code changes what a past transaction meant. |
+| `Error` codes, append-only (1–30 today) | Callers and indexers branch on the number; a reused code changes what a past transaction meant. |
 | Event names, topics and payload fields, append-only | They are the indexing ABI. Dropping a `#[topic]` field shifts every subscriber's filter, including the base64 segments in [Topics, payloads and filters](integration.md#topics-payloads-and-filters). |
 | `LeaseStatus` discriminants (`0`/`1`/`2`/`3`) | Returned by `lease_status` and cached by clients. `Revoked = 3` was appended; reusing `2` for a reclaimed lease would rewrite what every cached `Settled` meant. |
 | The `settled`-before-token-call ordering in `settle_lease` and `revoke_expired_lease` | It is the double-payout guard; reordering it behind a transfer reintroduces the re-entrancy bug the suite proves closed. |

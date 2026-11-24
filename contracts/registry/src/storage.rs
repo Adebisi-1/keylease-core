@@ -35,6 +35,17 @@
 //! rather than the lease one: [`save_service`] extends it beside the record it
 //! indexes, so any write to any of a provider's services keeps that provider's
 //! catalogue alive, and no read extends it.
+//!
+//! # Schema version
+//!
+//! [`SCHEMA_VERSION`] names the `DataKey` layout and stored value shapes this
+//! Wasm reads and writes. `init` stamps it into instance storage, and every
+//! state-changing entry point refuses to run unless the stamp matches (see
+//! [`check_schema`]). After an upgrade to a Wasm with a newer schema the
+//! registry is therefore *stopped* until the admin runs `migrate`; an upgrade
+//! to an older schema (a downgrade) stays stopped until it is rolled back.
+//! `docs/deployment.md` documents how a migration is proposed, reviewed and
+//! executed.
 
 use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
@@ -42,13 +53,16 @@ use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 ///
 /// Bump it in the same change that alters a `DataKey` variant, a stored value
 /// shape or the meaning of a stored value, and add the matching step to
-/// [`migrate_step`]. Purely additive changes that old entries already satisfy
+/// `storage::migrate_step`. Purely additive changes that old entries already satisfy
 /// (a new key that defaults when absent) do not need a bump.
 ///
 /// | Version | Layout |
 /// | --- | --- |
 /// | `0` | v0.2.x and earlier: the v1 layout without a `SchemaVersion` entry |
-/// | `1` | `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)`, `SchemaVersion` |
+/// | `1` | `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)`, `ServiceStats(u64)`, `LeaseRevoked(u64)`, `ServiceAttestor(u64)`, `PendingUpgrade`, `ProviderServices(Address)`, `CancelRequest(u64)`, `SchemaVersion` |
+///
+/// Every key in `1` other than `SchemaVersion` that v0.2.x did not have reads
+/// as absent on legacy data and defaults safely, so `0 -> 1` rewrites nothing.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Version reported for an initialized registry that has no `SchemaVersion`
@@ -147,6 +161,9 @@ pub enum DataKey {
     ProviderServices(Address),
     /// Pending early-cancellation request by lease id (persistent storage).
     CancelRequest(u64),
+    /// Storage schema version the stored data conforms to (instance storage).
+    /// See [`SCHEMA_VERSION`].
+    SchemaVersion,
 }
 
 // ---------------------------------------------------------------------------

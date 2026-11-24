@@ -15,9 +15,12 @@
 # Upgrade an existing deployment in place (24h time lock):
 #   1. --upgrade          build, upload and propose (prints the execution ledger)
 #   2. wait at least 24h so consumers can settle or revoke before rules change
-#   3. --execute-upgrade  install the proposed Wasm (fails early on the contract)
+#   3. --execute-upgrade  install the proposed Wasm (fails early on the contract),
+#                         then run `migrate`, which lifts the stop a
+#                         schema-raising upgrade puts in place (a no-op when the
+#                         storage schema is unchanged, refused after a downgrade)
 #   or --cancel-upgrade   drop the proposal before it is executed
-#   4. stellar contract invoke -- version  (verify)
+#   4. stellar contract invoke -- version / schema_version  (verify)
 #
 # Prerequisites
 #   - Rust 1.84+ with `rustup target add wasm32v1-none`
@@ -322,15 +325,15 @@ if [ "$MODE" = "execute-upgrade" ]; then
   # fails with SchemaVersionUnsupported after a downgrade, in which case the
   # previous Wasm must be reinstalled instead.
   step "Migrating storage schema"
-  stellar contract invoke \
+  run_send stellar contract invoke \
     --id "$REGISTRY" \
     --source-account "$SOURCE_ACCOUNT" \
     --network "$NETWORK" \
     --send=yes \
     -- migrate --admin "$ADMIN" \
-    || die "migrate failed: the installed Wasm cannot read this registry's storage schema; reinstall the previous Wasm hash"
+    || die "migrate failed: the installed Wasm cannot read this registry's storage schema; propose the previous Wasm hash"
 
-  SCHEMA="$(stellar contract invoke \
+  SCHEMA="$(run_capture '<schema-version>' stellar contract invoke \
     --id "$REGISTRY" \
     --source-account "$SOURCE_ACCOUNT" \
     --network "$NETWORK" \
@@ -356,6 +359,7 @@ if [ "$MODE" = "execute-upgrade" ]; then
  KEYLEASE_CONTRACT_ID=$REGISTRY
  KEYLEASE_NETWORK=$NETWORK
  version()            = $VERSION
+ schema_version()     = $SCHEMA
 ============================================================================
  Next steps
    - Watch the upgrade event:

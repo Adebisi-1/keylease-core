@@ -12,17 +12,18 @@ use keylease_mock_token::{MockToken, MockTokenClient};
 use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
     LeaseCancellationWithdrawn, LeaseCancelled, LeaseCreated, LeaseDelegated, LeaseRevoked,
-    LeaseSettled, RegistryInitialized, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
-    UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
+    LeaseSettled, RegistryInitialized, SchemaMigrated, ServiceRateUpdated, ServiceRegistered,
+    ServiceStatusChanged, UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{
-    self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, MAX_ENTRY_TTL_LEDGERS,
+    self, DataKey, LEDGER_BUMP_EXTEND, LEDGER_BUMP_THRESHOLD, LEGACY_SCHEMA_VERSION,
+    MAX_ENTRY_TTL_LEDGERS,
 };
 use crate::test_wasm::UPGRADE_TEST_WASM;
-use crate::types::{Service, ServiceStats};
+use crate::types::{Service, ServiceStats, UsageAttestation};
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, MAX_LEASE_DEPOSIT,
-    MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE, MAX_RATE_PER_CALL, UPGRADE_DELAY_SECS,
+    MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE, MAX_RATE_PER_CALL, SCHEMA_VERSION, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -4212,7 +4213,7 @@ fn test_fresh_counters_start_at_zero_and_move_only_on_success() {
 /// Every published error code with the variant it names, in order. This is the
 /// table in `docs/contract-reference.md`; the two must change together, and only
 /// by appending.
-const ERROR_ABI: [(u32, Error); 28] = [
+const ERROR_ABI: [(u32, Error); 30] = [
     (1, Error::AlreadyInitialized),
     (2, Error::NotInitialized),
     (3, Error::Unauthorized),
@@ -4241,6 +4242,8 @@ const ERROR_ABI: [(u32, Error); 28] = [
     (26, Error::CancellationAlreadyRequested),
     (27, Error::LeaseExpired),
     (28, Error::RateTooHigh),
+    (29, Error::SchemaMigrationRequired),
+    (30, Error::SchemaVersionUnsupported),
 ];
 
 #[test]
@@ -4464,4 +4467,316 @@ fn test_paged_views_extend_no_ttl() {
         );
     }
     assert_eq!(instance_ttl(&env, &registry_id), instance_before);
+}
+
+// ---------------------------------------------------------------------------
+// Storage schema versioning
+// ---------------------------------------------------------------------------
+
+/// Overwrite the stored schema stamp, as an upgrade from a different schema
+/// would leave it from the new code's point of view.
+fn set_stored_schema(env: &Env, registry: &Address, version: Option<u32>) {
+    env.as_contract(registry, || match version {
+        Some(v) => storage::set_schema_version(env, v),
+        None => env
+            .storage()
+            .instance()
+            .remove(&storage::DataKey::SchemaVersion),
+    });
+}
+
+/// Assert that every schema-gated, state-changing entry point returns `err`.
+fn assert_state_changes_stopped(env: &Env, ctx: &Ctx, service_id: u64, lease_id: u64, err: Error) {
+    let r = &ctx.registry;
+    assert_eq!(
+        r.try_set_token(&ctx.admin, &Address::generate(env)),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_register_service(&ctx.provider, &RATE, &endpoint_hash(env)),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_set_service_active(&ctx.provider, &service_id, &false),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_create_lease(&ctx.consumer, &service_id, &1, &60),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_settle_lease(&ctx.provider, &lease_id, &1),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_revoke_expired_lease(&ctx.consumer, &lease_id),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_update_service(&ctx.provider, &service_id, &RATE, &endpoint_hash(env)),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_set_service_attestor(&ctx.provider, &service_id, &None),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_create_lease_for(&Address::generate(env), &ctx.consumer, &service_id, &1, &60),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_request_early_cancel(&ctx.consumer, &lease_id),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_withdraw_early_cancel(&ctx.consumer, &lease_id),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_reject_early_cancel(&ctx.provider, &lease_id),
+        Err(Ok(err))
+    );
+    assert_eq!(
+        r.try_approve_early_cancel(&ctx.provider, &lease_id, &1),
+        Err(Ok(err))
+    );
+    let attestation = UsageAttestation {
+        lease_id,
+        service_id,
+        verified_calls: 1,
+        valid_until: 0,
+        signature: BytesN::from_array(env, &[0u8; 64]),
+    };
+    assert_eq!(
+        r.try_settle_lease_attested(&ctx.provider, &lease_id, &1, &attestation),
+        Err(Ok(err))
+    );
+}
+
+/// The schema number is pinned as a literal, and the `storageSchemaVersion`
+/// metadata in `lib.rs` (which `contractmeta!` cannot derive from the constant)
+/// must move with it.
+#[test]
+fn test_schema_version_is_pinned_in_code_and_metadata() {
+    assert_eq!(SCHEMA_VERSION, 1);
+    let lib = include_str!("lib.rs");
+    assert!(
+        lib.contains(r#"contractmeta!(key = "storageSchemaVersion", val = "1");"#),
+        "storageSchemaVersion metadata drifted from SCHEMA_VERSION"
+    );
+}
+
+#[test]
+fn test_init_stamps_the_schema_version() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(ctx.registry.schema_version(), SCHEMA_VERSION);
+    assert_eq!(ctx.registry.code_schema_version(), SCHEMA_VERSION);
+}
+
+#[test]
+fn test_schema_version_requires_init() {
+    let env = Env::default();
+    let registry = KeyLeaseRegistryClient::new(&env, &env.register(KeyLeaseRegistry, ()));
+
+    assert_eq!(
+        registry.try_schema_version(),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn test_init_rejects_a_preexisting_schema_stamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry_id = env.register(KeyLeaseRegistry, ());
+    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
+
+    // State this contract did not write: a schema stamp but no admin.
+    set_stored_schema(&env, &registry_id, Some(SCHEMA_VERSION + 1));
+    assert_eq!(
+        registry.try_init(&Address::generate(&env)),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+}
+
+#[test]
+fn test_newer_stored_schema_is_rejected_everywhere() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    let escrow = ctx.token.balance(&ctx.registry_id());
+
+    // As seen by an older Wasm after a downgrade.
+    set_stored_schema(&env, &ctx.registry_id(), Some(SCHEMA_VERSION + 1));
+    env.ledger().set_timestamp(3_600 + GRACE + 1);
+
+    assert_state_changes_stopped(
+        &env,
+        &ctx,
+        service_id,
+        lease_id,
+        Error::SchemaVersionUnsupported,
+    );
+    // A downgrade cannot be "migrated" into place either.
+    assert_eq!(
+        ctx.registry.try_migrate(&ctx.admin),
+        Err(Ok(Error::SchemaVersionUnsupported))
+    );
+    assert_eq!(ctx.registry.schema_version(), SCHEMA_VERSION + 1);
+    // No value moved while stopped.
+    assert_eq!(ctx.token.balance(&ctx.registry_id()), escrow);
+}
+
+#[test]
+fn test_older_stored_schema_stops_until_migrated() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+
+    // A registry deployed before versioning, after upgrading to this Wasm.
+    set_stored_schema(&env, &ctx.registry_id(), None);
+    assert_eq!(ctx.registry.schema_version(), LEGACY_SCHEMA_VERSION);
+    env.ledger().set_timestamp(3_601);
+
+    assert_state_changes_stopped(
+        &env,
+        &ctx,
+        service_id,
+        lease_id,
+        Error::SchemaMigrationRequired,
+    );
+
+    assert_eq!(ctx.registry.migrate(&ctx.admin), SCHEMA_VERSION);
+    assert_single_event(
+        &env,
+        &ctx.registry_id(),
+        &SchemaMigrated {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin: ctx.admin.clone(),
+            from_version: LEGACY_SCHEMA_VERSION,
+            to_version: SCHEMA_VERSION,
+        },
+    );
+    assert_eq!(ctx.registry.schema_version(), SCHEMA_VERSION);
+
+    // Pre-existing data survived the migration and the registry runs again.
+    ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
+    assert_eq!(ctx.token.balance(&ctx.provider), 10 * RATE);
+    register_default_service(&env, &ctx);
+}
+
+#[test]
+fn test_migrate_is_admin_only() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    set_stored_schema(&env, &ctx.registry_id(), None);
+
+    assert_eq!(
+        ctx.registry.try_migrate(&Address::generate(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(ctx.registry.schema_version(), LEGACY_SCHEMA_VERSION);
+}
+
+#[test]
+fn test_migrate_requires_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = KeyLeaseRegistryClient::new(&env, &env.register(KeyLeaseRegistry, ()));
+
+    assert_eq!(
+        registry.try_migrate(&Address::generate(&env)),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn test_migrate_when_current_is_a_silent_no_op() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(ctx.registry.migrate(&ctx.admin), SCHEMA_VERSION);
+    assert!(
+        env.events()
+            .all()
+            .filter_by_contract(&ctx.registry_id())
+            .events()
+            .is_empty(),
+        "a no-op migrate must not publish"
+    );
+    // Still authorized, even as a no-op.
+    assert_eq!(
+        ctx.registry.try_migrate(&Address::generate(&env)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_migration_without_a_path_is_rejected() {
+    let env = Env::default();
+    // Every version below SCHEMA_VERSION has a step; anything else does not.
+    assert_eq!(storage::migrate_step(&env, LEGACY_SCHEMA_VERSION), Ok(()));
+    assert_eq!(
+        storage::migrate_step(&env, SCHEMA_VERSION),
+        Err(Error::SchemaVersionUnsupported)
+    );
+    assert_eq!(
+        storage::migrate_step(&env, u32::MAX),
+        Err(Error::SchemaVersionUnsupported)
+    );
+}
+
+/// The upgrade entry points must stay reachable while the registry is
+/// stopped, or a bad upgrade could never be rolled back. Their admin check
+/// still applies.
+#[test]
+fn test_upgrade_is_not_blocked_by_a_schema_mismatch() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let ctx = setup(&env);
+    set_stored_schema(&env, &ctx.registry_id(), Some(SCHEMA_VERSION + 1));
+    let wasm = BytesN::from_array(&env, &[9u8; 32]);
+
+    // An impostor gets the auth error, not the schema error...
+    assert_eq!(
+        ctx.registry
+            .try_propose_upgrade(&Address::generate(&env), &wasm),
+        Err(Ok(Error::Unauthorized))
+    );
+    // ...while the admin can propose, cancel and propose again...
+    ctx.registry.propose_upgrade(&ctx.admin, &wasm);
+    ctx.registry.cancel_upgrade(&ctx.admin);
+    ctx.registry.propose_upgrade(&ctx.admin, &wasm);
+    // ...and, once the delay has passed, get past every guard to the deployer,
+    // which rejects this fabricated hash with a host error rather than a
+    // contract error.
+    env.ledger().set_timestamp(1_000 + UPGRADE_DELAY_SECS);
+    assert!(matches!(
+        ctx.registry.try_execute_upgrade(&ctx.admin),
+        Err(Err(_))
+    ));
+}
+
+#[test]
+fn test_ttl_bumps_and_reads_work_while_stopped() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let service_id = register_default_service(&env, &ctx);
+    let lease_id = ctx
+        .registry
+        .create_lease(&ctx.consumer, &service_id, &10, &3_600);
+    set_stored_schema(&env, &ctx.registry_id(), None);
+
+    ctx.registry.bump_service(&service_id);
+    ctx.registry.bump_lease(&lease_id);
+    assert_eq!(ctx.registry.get_lease(&lease_id).lease_id, lease_id);
+    assert_eq!(ctx.registry.locked_balance(&lease_id), 10 * RATE);
 }
