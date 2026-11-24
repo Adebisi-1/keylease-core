@@ -1,4 +1,4 @@
-﻿title = "KeyLease gitleaks config"
+title = "KeyLease gitleaks config"
 
 [extend]
 # Use the built-in gitleaks rules and add repo-specific allowlists below.
