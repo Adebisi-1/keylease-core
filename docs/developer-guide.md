@@ -385,6 +385,7 @@ If you must read storage directly, `#[contracttype]` enums encode as an
 | `DataKey::Admin` | `Symbol("Admin")` |
 | `DataKey::Lease(7)` | `Vec[Symbol("Lease"), u64(7)]` |
 | `DataKey::Service(3)` | `Vec[Symbol("Service"), u64(3)]` |
+| `DataKey::Settlement(7)` | `Vec[Symbol("Settlement"), u64(7)]` |
 | `DataKey::CancelRequest(7)` | `Vec[Symbol("CancelRequest"), u64(7)]` |
 
 With `@stellar/stellar-sdk`:
@@ -401,9 +402,11 @@ xdr.ScVal.scvVec([
 
 `getContractData` returns a `scvMap` of the `Lease` struct fields. Decode it as
 `{ lease_id, service_id, consumer, allocated_calls, used_calls, expires_at,
-locked_deposit, settled }`. Full details are in the
-[contract reference](contract-reference.md#storage-layout), and the supported
-way to verify leases is described in [Integration](integration.md).
+locked_deposit, settled }`. A proposed settlement is a separate
+`Settlement(u64)` entry; prefer the `get_settlement` view over raw storage. Full
+details are in the [contract reference](contract-reference.md#storage-layout),
+and the supported way to verify leases is described in
+[Integration](integration.md).
 
 ## Deploying
 
@@ -568,9 +571,11 @@ terminal; a day-long lease is not a sandbox demo.
 
 ### 6. Settle it
 
-`settle_lease` runs when the lease has **expired**, or when the provider reports
-full consumption — whichever comes first. Reporting everything immediately is the
-fastest path through the happy case:
+`settle_lease` proposes a payout when the lease has **expired**, or when the
+provider reports full consumption — whichever comes first. It does not move funds:
+the consumer has a 24-hour challenge window, after which `finalize_settlement`
+releases them. Reporting everything immediately is the fastest path through the
+happy case:
 
 ```bash
 stellar contract invoke --id "$REGISTRY" --source-account kl-provider \
@@ -580,7 +585,8 @@ stellar contract invoke --id "$REGISTRY" --source-account kl-provider \
 ```
 
 Payout and refund must sum to the deposit, so 100 verified of 100 allocated pays
-the provider 10 XLM and refunds 0. Create a second lease and settle it
+the provider 10 XLM and refunds 0 once the challenge window closes and anyone
+calls `finalize_settlement --lease_id "$LEASE_ID"`. Create a second lease and settle it
 *partially* before it expires to see the guard refuse:
 
 ```bash
