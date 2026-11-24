@@ -10,7 +10,7 @@
 
 ## 1. Problem
 
-`upgrade` replaces the Wasm but keeps every stored entry. The code assumes the
+`execute_upgrade` replaces the Wasm but keeps every stored entry. The code assumes the
 `DataKey` variants and the `Service` / `Lease` shapes never change, but nothing
 records which layout a deployment holds, and nothing checks it after an upgrade.
 An upgrade that renames a variant or retypes a field silently orphans or
@@ -26,7 +26,9 @@ same effect in reverse.
 3. Older data reaches the new schema only through an explicit, admin-authorized
    and **bounded** `migrate`, applied atomically.
 4. Newer data is never migrated "down" and never written by older code.
-5. `upgrade` is always reachable by the admin, so a bad install can be reverted.
+5. The upgrade entry points (`propose_upgrade`, `cancel_upgrade`,
+   `execute_upgrade`) are always reachable by the admin, so a bad install can be
+   reverted. The 24h upgrade time lock still applies to that revert.
 6. Existing deployments are not stranded. Their data is schema `0`, and `0 → 1`
    only adds the stamp.
 7. Existing keys, event payloads and error codes are unchanged (additive only).
@@ -55,12 +57,13 @@ same effect in reverse.
   `register_service`, `set_service_active`, `create_lease`, `settle_lease` and
   `revoke_expired_lease`:
   - stored `==` code: run normally.
-  - stored `<` code: `SchemaMigrationRequired` (18).
-  - stored `>` code (a downgrade): `SchemaVersionUnsupported` (19).
+  - stored `<` code: `SchemaMigrationRequired` (29).
+  - stored `>` code (a downgrade): `SchemaVersionUnsupported` (30).
 
   This puts the registry into a **stopped** state from the upgrade transaction
   until `migrate` succeeds, without needing a separate pause flag.
-- **Not gated:** `upgrade` (so a rollback is always possible), `migrate`,
+- **Not gated:** the upgrade entry points (so a rollback is always possible),
+  `migrate`,
   `bump_service` / `bump_lease` (which change no stored value and keep entries
   alive during the stop) and every view.
 
@@ -87,12 +90,12 @@ How a migration is proposed, reviewed and executed is documented in
 In short: the PR that changes the layout bumps the constant and the metadata,
 adds the `migrate_step` arm, a stopped → migrate → running test and a design
 note. The reviewer checks the arm is bounded and verifies `storageSchemaVersion`
-on the uploaded Wasm. The operator runs `upgrade` and then `migrate` in the next
-transaction. `deploy-testnet.sh --upgrade` now does both.
+on the uploaded Wasm. The operator runs `execute_upgrade` and then `migrate` in
+the next transaction. `deploy-testnet.sh --execute-upgrade` now does both.
 
 ### Rejected alternatives
 
-- **Check the new Wasm inside `upgrade`.** Soroban gives the running contract no
+- **Check the new Wasm inside `execute_upgrade`.** Soroban gives the running contract no
   way to read another Wasm's metadata or code, so the old code cannot validate
   the new one. The check has to live in the new code.
 - **A separate admin `pause` flag.** This would duplicate the stop the schema
@@ -120,7 +123,7 @@ transaction. `deploy-testnet.sh --upgrade` now does both.
 | A third party triggers a migration | `migrate` requires the admin's auth and identity (`Unauthorized`). |
 | A migration with no defined path | `migrate_step` rejects it, and the whole transaction reverts. |
 | A migration runs out of budget halfway | Steps are bounded, and a failure reverts atomically with no partial stamp. |
-| Bad upgrade blocks its own fix | `upgrade` is not gated. |
+| Bad upgrade blocks its own fix | The upgrade entry points are not gated. |
 | Stopped registry lets entries expire | `bump_service` and `bump_lease` stay available. |
 | Foreign or corrupted state before `init` | `init` refuses a pre-existing stamp. |
 
@@ -136,12 +139,13 @@ In `contracts/registry/src/test.rs`, under *Storage schema versioning*:
 - `SCHEMA_VERSION` is pinned and matches the `storageSchemaVersion` metadata.
 - `init` stamps the version. `schema_version` before `init` is `NotInitialized`.
   `init` refuses a pre-existing stamp.
-- Newer stored schema: all six gated entry points return
+- Newer stored schema: all fourteen gated entry points return
   `SchemaVersionUnsupported`, `migrate` refuses, and escrow is unchanged.
-- Older (legacy) stored schema: all six return `SchemaMigrationRequired`.
+- Older (legacy) stored schema: all fourteen return `SchemaMigrationRequired`.
   `migrate` emits `schema_migrated` and stamps the version, then a pre-upgrade
   lease settles and new services register.
 - `migrate` is admin-only (even as a no-op), requires `init`, and is a silent
   no-op when the schema is current. An undefined step is rejected.
-- `upgrade` is not blocked by a mismatch, but still enforces admin.
+- `propose_upgrade`, `cancel_upgrade` and `execute_upgrade` are not blocked by a
+  mismatch, but still enforce admin.
 - TTL bumps and views keep working while stopped.
