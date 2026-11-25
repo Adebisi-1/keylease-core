@@ -1913,11 +1913,8 @@ fn mint_lease(
     // fail before mutating state.
     let token_addr = storage::get_token(env).ok_or(Error::TokenNotSet)?;
 
-    let expires_at = env
-        .ledger()
-        .timestamp()
-        .checked_add(duration_secs)
-        .ok_or(Error::Overflow)?;
+    let now = env.ledger().timestamp();
+    let expires_at = now.checked_add(duration_secs).ok_or(Error::Overflow)?;
 
     let lease_id = storage::next_lease_id(env)?;
     let lease = Lease {
@@ -1929,6 +1926,7 @@ fn mint_lease(
         expires_at,
         locked_deposit: required_deposit,
         settled: false,
+        created_at: now,
     };
 
     // checks-effects-interactions: the lease exists before the token is
