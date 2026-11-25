@@ -380,9 +380,10 @@ Initialize the registry and appoint `admin`.
 - **Caller / auth:** `admin` must authorize.
 - **Trigger:** once, immediately after deploy.
 - **Preconditions:** the registry must not already be initialized.
-- **State:** sets `Admin`; extends instance TTL.
+- **State:** sets `Admin` and `SchemaVersion = SCHEMA_VERSION`; extends instance TTL.
 - **Events:** `registry_initialized { admin }`.
-- **Errors:** `AlreadyInitialized`.
+- **Errors:** `AlreadyInitialized`, also returned when a `SchemaVersion`
+  entry already exists without an admin (state this contract did not write).
 - **Notes:** the admin can only call `set_token` and manage upgrades through the
   propose/execute/cancel flow below. It cannot move user funds.
 
@@ -458,8 +459,46 @@ Install the proposed Wasm through `env.deployer().update_current_contract_wasm`.
 - **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingUpgrade`,
   `UpgradeDelayNotElapsed`.
 - **Notes:** the contract id, storage and balances are preserved, so an upgrade
-  must never change the `DataKey` layout or the meaning of stored values. See
-  [Deployment](deployment.md#upgrading).
+  must never change the `DataKey` layout or the meaning of stored values without
+  bumping the storage schema. See [Deployment](deployment.md#upgrading).
+- **Schema:** not gated on the schema check, so it stays callable while the
+  registry is stopped and a bad upgrade can always be reverted. An upgrade to a
+  Wasm with a higher `storageSchemaVersion` stops every state-changing entry
+  point until `migrate` runs.
+
+### `migrate`
+
+```rust
+pub fn migrate(env: Env, admin: Address) -> Result<u32, Error>
+```
+
+Migrate stored data to the running Wasm's storage schema (`SCHEMA_VERSION`) and
+return the version now in force.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **Trigger:** immediately after every `execute_upgrade`.
+- **Effects:** applies each bounded `storage::migrate_step` from the stored
+  version up to `SCHEMA_VERSION`, writes the new `SchemaVersion` and extends
+  the instance TTL, all atomically. When the schema is already current, nothing
+  is written and no event is published.
+- **Events:** `schema_migrated { admin, from_version, to_version }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `SchemaVersionUnsupported`
+  (the stored schema is newer than this Wasm, or has no migration path).
+- **Notes:** see [Storage schema migrations](deployment.md#storage-schema-migrations)
+  for how a migration is proposed, reviewed and executed.
+
+### Schema gate
+
+Every state-changing entry point other than the ones listed below — `set_token`,
+`register_service`, `set_service_active`, `update_service`,
+`set_service_attestor`, `create_lease`, `create_lease_for`,
+`request_early_cancel`, `withdraw_early_cancel`, `reject_early_cancel`,
+`approve_early_cancel`, `settle_lease`, `settle_lease_attested` and
+`revoke_expired_lease` — first checks that the stored schema equals
+`SCHEMA_VERSION`. Otherwise it returns `SchemaMigrationRequired` (data older than
+the code) or `SchemaVersionUnsupported` (data newer than the code). `init`,
+`propose_upgrade`, `cancel_upgrade`, `execute_upgrade`, `migrate`,
+`bump_service`, `bump_lease` and every view are not gated.
 
 ---
 
@@ -1008,6 +1047,8 @@ performed one could not be used to price a read.
 | `get_token` | `(env) -> Result<Address, Error>` | escrow token, else `TokenNotSet` |
 | `get_pending_upgrade` | `(env) -> Option<PendingUpgrade>` | queued hash and execution ledger, if any |
 | `version` | `(env) -> String` | version embedded by `contractmeta!` |
+| `schema_version` | `(env) -> Result<u32, Error>` | storage schema of the stored data (`0` = pre-versioning), else `NotInitialized` |
+| `code_schema_version` | `(env) -> u32` | storage schema the running Wasm was built for |
 | `service_count` | `(env) -> u64` | total services ever registered |
 | `lease_count` | `(env) -> u64` | total leases ever created |
 | `get_service` | `(env, service_id: u64) -> Result<Service, Error>` | the `Service`, else `ServiceNotFound` |
@@ -1093,6 +1134,7 @@ because topics are positional and indexers filter on them.
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
+| `schema_migrated` | — | `schema_version`, `admin`, `from_version`, `to_version` |
 
 See [integration.md](./integration.md#event-schema-version) for how to branch on
 the version.
@@ -1208,6 +1250,7 @@ pub enum DataKey {
     ProviderServices(Address), // persistent: service ids, oldest first
     Settlement(u64),           // persistent: proposed split, keyed by lease id
     CancelRequest(u64),        // persistent: pending early-cancellation request
+    SchemaVersion,             // instance, u32: see SCHEMA_VERSION
 }
 ```
 
@@ -1380,6 +1423,8 @@ recording it there fails `cargo test`. Add a new code by appending it to
 | 35 | `LeaseNotTransferable` | lease already settled or revoked |
 | 36 | `InvalidConsumer` | transfer target is the current consumer |
 | 37 | `RateTooHigh` | published `rate_per_call` above `MAX_RATE_PER_CALL` |
+| 38 | `SchemaMigrationRequired` | stored schema older than this Wasm; admin must run `migrate` |
+| 39 | `SchemaVersionUnsupported` | stored schema newer than this Wasm, or no migration path |
 
 ## Invoking with the Stellar CLI
 

@@ -108,7 +108,8 @@ keylease-core/
 | `set_token(admin, token)` | `admin` | Configure the SEP-41 escrow token (native SAC or custom). Emits `escrow_token_set`. |
 | `propose_upgrade(admin, new_wasm_hash)` | `admin` | Queue a Wasm behind the 24h delay. Emits `upgrade_proposed`. |
 | `cancel_upgrade(admin)` | `admin` | Drop a pending proposal. Emits `upgrade_cancelled`. |
-| `execute_upgrade(admin)` | `admin` | Install the proposed Wasm after the delay. Emits `contract_upgraded`. |
+| `execute_upgrade(admin)` | `admin` | Install the proposed Wasm after the delay. Emits `contract_upgraded`. The upgrade calls work even while the registry is stopped by a schema mismatch, so an upgrade can always be rolled back. |
+| `migrate(admin) -> u32` | `admin` | Migrate stored data to the running Wasm's storage schema and lift the post-upgrade stop. No-op when current; refuses a downgrade. Emits `schema_migrated`. |
 | `register_service(provider, rate_per_call, endpoint_hash) -> u64` | `provider` | Publish a leasable service. `rate_per_call` must be positive and at most `MAX_RATE_PER_CALL`. Returns `service_id`. Emits `service_registered`. |
 | `set_service_active(provider, service_id, is_active)` | `provider` | Pause/resume new leases. Emits `service_status_changed`. |
 | `update_service(provider, service_id, rate_per_call, endpoint_hash) -> service_id` | `provider` | Update rate and endpoint hash for a service. Emits `service_rate_updated`. Only the owning provider may call this. Existing leases keep their original rate. |
@@ -130,6 +131,7 @@ keylease-core/
 | `service_stats(service_id)` | — | Cumulative settled leases, calls and payout for one service. Never extend a TTL. |
 | `service_count()`, `lease_count()` | — | Monotonic counters. |
 | `get_services(start, limit)`, `get_leases(start, limit)` | — | Bounded pages over the id space, oldest id first, `done` as the end marker. `limit` ≤ `MAX_PAGE_SIZE`. Never extend a TTL. |
+| `schema_version()`, `code_schema_version()` | — | Storage schema of the stored data and of the running Wasm. State-changing calls are stopped while they differ. |
 
 ### Events
 
@@ -162,6 +164,7 @@ consumer of the stream should branch on it.
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
+| `schema_migrated` | — | `schema_version`, `admin`, `from_version`, `to_version` |
 
 `lease_created` is emitted unchanged whether the consumer or a delegate minted
 the lease; `lease_delegated` is added on top and names who paid the transaction
