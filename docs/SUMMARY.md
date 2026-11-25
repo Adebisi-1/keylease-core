@@ -23,6 +23,7 @@
 - [Consumer guide](consumer-guide.md)
 - [Developer guide](developer-guide.md)
 - [Deployment](deployment.md)
+- [Mainnet runbook](mainnet-runbook.md)
 - [Troubleshooting](troubleshooting.md)
 - [Protocol FAQ](faq.md)
 

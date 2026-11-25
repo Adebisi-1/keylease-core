@@ -1423,6 +1423,8 @@ recording it there fails `cargo test`. Add a new code by appending it to
 | 35 | `LeaseNotTransferable` | lease already settled or revoked |
 | 36 | `InvalidConsumer` | transfer target is the current consumer |
 | 37 | `RateTooHigh` | published `rate_per_call` above `MAX_RATE_PER_CALL` |
+| 38 | `SchemaMigrationRequired` | stored schema older than this Wasm; admin must run `migrate` |
+| 39 | `SchemaVersionUnsupported` | stored schema newer than this Wasm, or no migration path |
 
 ## Invoking with the Stellar CLI
 

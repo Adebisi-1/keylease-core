@@ -59,7 +59,7 @@ use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 /// | Version | Layout |
 /// | --- | --- |
 /// | `0` | v0.2.x and earlier: the v1 layout without a `SchemaVersion` entry |
-/// | `1` | `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)`, `ServiceStats(u64)`, `LeaseRevoked(u64)`, `ServiceAttestor(u64)`, `PendingUpgrade`, `ProviderServices(Address)`, `CancelRequest(u64)`, `SchemaVersion` |
+/// | `1` | `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)`, `ServiceStats(u64)`, `LeaseRevoked(u64)`, `ServiceAttestor(u64)`, `PendingUpgrade`, `ProviderServices(Address)`, `CancelRequest(u64)`, `Settlement(u64)`, `SchemaVersion` |
 ///
 /// Every key in `1` other than `SchemaVersion` that v0.2.x did not have reads
 /// as absent on legacy data and defaults safely, so `0 -> 1` rewrites nothing.
@@ -163,6 +163,9 @@ pub enum DataKey {
     CancelRequest(u64),
     /// `Settlement` by lease id (persistent storage).
     Settlement(u64),
+    /// Storage schema version this registry's data was written under
+    /// (instance storage). See [`SCHEMA_VERSION`].
+    SchemaVersion,
 }
 
 // ---------------------------------------------------------------------------

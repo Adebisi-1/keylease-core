@@ -13,8 +13,8 @@ use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
     LeaseCancellationWithdrawn, LeaseCancelled, LeaseChallengeCancelled, LeaseChallengeResolved,
     LeaseChallenged, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled,
-    LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, ServiceRateUpdated,
-    ServiceRegistered, ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
+    LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, SchemaMigrated,
+    ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
     EVENT_SCHEMA_VERSION,
 };
 use crate::storage::{
@@ -26,7 +26,7 @@ use crate::types::{Service, ServiceStats, UsageAttestation};
 use crate::{
     Error, KeyLeaseRegistry, KeyLeaseRegistryClient, Lease, LeaseStatus, SettlementState,
     CHALLENGE_WINDOW_SECS, MAX_LEASE_DEPOSIT, MAX_LEASE_DURATION_SECS, MAX_PAGE_SIZE,
-    MAX_RATE_PER_CALL, UPGRADE_DELAY_SECS,
+    MAX_RATE_PER_CALL, SCHEMA_VERSION, UPGRADE_DELAY_SECS,
 };
 
 /// Per-call rate used across the tests.
@@ -4848,7 +4848,7 @@ fn test_fresh_counters_start_at_zero_and_move_only_on_success() {
 /// Every published error code with the variant it names, in order. This is the
 /// table in `docs/contract-reference.md`; the two must change together, and only
 /// by appending.
-const ERROR_ABI: [(u32, Error); 37] = [
+const ERROR_ABI: [(u32, Error); 39] = [
     (1, Error::AlreadyInitialized),
     (2, Error::NotInitialized),
     (3, Error::Unauthorized),
@@ -4886,6 +4886,8 @@ const ERROR_ABI: [(u32, Error); 37] = [
     (35, Error::LeaseNotTransferable),
     (36, Error::InvalidConsumer),
     (37, Error::RateTooHigh),
+    (38, Error::SchemaMigrationRequired),
+    (39, Error::SchemaVersionUnsupported),
 ];
 
 #[test]
@@ -5311,6 +5313,7 @@ fn test_older_stored_schema_stops_until_migrated() {
 
     // Pre-existing data survived the migration and the registry runs again.
     ctx.registry.settle_lease(&ctx.provider, &lease_id, &10);
+    finalize_after_challenge_window(&env, &ctx, &lease_id);
     assert_eq!(ctx.token.balance(&ctx.provider), 10 * RATE);
     register_default_service(&env, &ctx);
 }

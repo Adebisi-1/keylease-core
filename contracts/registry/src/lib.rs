@@ -106,9 +106,9 @@ pub use crate::events::{
     ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
     LeaseCancellationWithdrawn, LeaseCancelled, LeaseChallengeCancelled, LeaseChallengeResolved,
     LeaseChallenged, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled,
-    LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, ServiceAttestorSet,
-    ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged, UpgradeCancelled, UpgradeProposed,
-    EVENT_SCHEMA_VERSION,
+    LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, SchemaMigrated,
+    ServiceAttestorSet, ServiceRateUpdated, ServiceRegistered, ServiceStatusChanged,
+    UpgradeCancelled, UpgradeProposed, EVENT_SCHEMA_VERSION,
 };
 pub use crate::storage::SCHEMA_VERSION;
 pub use crate::types::{

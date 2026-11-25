@@ -1842,6 +1842,16 @@
           "doc": "Published `rate_per_call` exceeds `MAX_RATE_PER_CALL`. Appended after the\\nchallenge-window and transfer codes so every number already published\\nkeeps its meaning.",
           "name": "RateTooHigh",
           "value": 37
+        },
+        {
+          "doc": "Stored data predates the schema this Wasm was built for. The registry\\nis stopped until the admin runs `migrate`.",
+          "name": "SchemaMigrationRequired",
+          "value": 38
+        },
+        {
+          "doc": "Stored data was written by a newer schema than this Wasm understands\\n(a downgrade), or no migration path exists. Roll the upgrade back.",
+          "name": "SchemaVersionUnsupported",
+          "value": 39
         }
       ]
     }
