@@ -79,6 +79,26 @@ fn setup(env: &Env) -> Ctx<'_> {
     }
 }
 
+#[test]
+fn registry_views_report_missing_configuration_until_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry_id = env.register(KeyLeaseRegistry, ());
+    let registry = KeyLeaseRegistryClient::new(&env, &registry_id);
+
+    assert_eq!(registry.try_get_admin(), Err(Ok(Error::NotInitialized)));
+    assert_eq!(registry.try_get_token(), Err(Ok(Error::TokenNotSet)));
+
+    let admin = Address::generate(&env);
+    registry.init(&admin);
+    assert_eq!(registry.get_admin(), admin);
+    assert_eq!(registry.try_get_token(), Err(Ok(Error::TokenNotSet)));
+
+    let token_id = env.register(MockToken, ());
+    registry.set_token(&admin, &token_id);
+    assert_eq!(registry.get_token(), token_id);
+}
+
 /// Ready-to-use registry: initialized, token configured, consumer funded and
 /// one active service registered.
 ///
