@@ -151,6 +151,8 @@ violation.
 | Admin role handed to a mistyped or unreachable address | Two-step hand-over: nothing changes until the successor signs `accept_admin` |
 | Forgotten proposal accepted months later | Proposals expire after 7 days (`AdminTransferExpired`); the admin can cancel at any time |
 | Silent logic change on upgrade | 24h delay + admin-only execution, emits `upgrade_proposed`/`contract_upgraded`, `contractmeta!` exposes the version |
+| Upgrade installs code that misreads the stored layout | Storage schema stamp; state-changing calls stop (`SchemaMigrationRequired`) until an explicit, bounded `migrate` |
+| Downgrade to code that cannot read newer data | Stopped with `SchemaVersionUnsupported`; `migrate` refuses, only re-upgrading resumes |
 
 ## Running with a multisig admin
 

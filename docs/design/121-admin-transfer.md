@@ -82,8 +82,8 @@ New events (no topics, matching the other admin events; payloads carry
 `admin_transfer_accepted { previous_admin, new_admin }`. Adding events does not
 change any existing payload, so `EVENT_SCHEMA_VERSION` stays at `1`.
 
-New errors are appended: `NoPendingAdminTransfer = 38`,
-`AdminTransferExpired = 39`, `InvalidAdmin = 40` (proposing the current admin).
+New errors are appended: `NoPendingAdminTransfer = 40`,
+`AdminTransferExpired = 41`, `InvalidAdmin = 42` (proposing the current admin).
 
 ### Rejected alternatives
 

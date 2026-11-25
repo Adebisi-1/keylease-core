@@ -108,7 +108,8 @@ keylease-core/
 | `set_token(admin, token)` | `admin` | Configure the SEP-41 escrow token (native SAC or custom). Emits `escrow_token_set`. |
 | `propose_upgrade(admin, new_wasm_hash)` | `admin` | Queue a Wasm behind the 24h delay. Emits `upgrade_proposed`. |
 | `cancel_upgrade(admin)` | `admin` | Drop a pending proposal. Emits `upgrade_cancelled`. |
-| `execute_upgrade(admin)` | `admin` | Install the proposed Wasm after the delay. Emits `contract_upgraded`. |
+| `execute_upgrade(admin)` | `admin` | Install the proposed Wasm after the delay. Emits `contract_upgraded`. The upgrade calls work even while the registry is stopped by a schema mismatch, so an upgrade can always be rolled back. |
+| `migrate(admin) -> u32` | `admin` | Migrate stored data to the running Wasm's storage schema and lift the post-upgrade stop. No-op when current; refuses a downgrade. Emits `schema_migrated`. |
 | `propose_admin(admin, new_admin) -> u64` | `admin` | Start a two-step admin hand-over; returns `expires_at` (now + 7 days). Replaces any pending proposal. Emits `admin_transfer_proposed`. |
 | `cancel_admin_transfer(admin)` | `admin` | Withdraw the pending proposal, expired or not. Emits `admin_transfer_canceled`. |
 | `accept_admin(new_admin)` | `new_admin` | Complete the hand-over before `expires_at`; the previous admin loses every admin right. Emits `admin_transfer_accepted`. |
@@ -133,6 +134,7 @@ keylease-core/
 | `service_stats(service_id)` | — | Cumulative settled leases, calls and payout for one service. Never extend a TTL. |
 | `service_count()`, `lease_count()` | — | Monotonic counters. |
 | `get_services(start, limit)`, `get_leases(start, limit)` | — | Bounded pages over the id space, oldest id first, `done` as the end marker. `limit` ≤ `MAX_PAGE_SIZE`. Never extend a TTL. |
+| `schema_version()`, `code_schema_version()` | — | Storage schema of the stored data and of the running Wasm. State-changing calls are stopped while they differ. |
 
 ### Events
 
@@ -165,6 +167,7 @@ consumer of the stream should branch on it.
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
+| `schema_migrated` | — | `schema_version`, `admin`, `from_version`, `to_version` |
 | `admin_transfer_proposed` | — | `schema_version`, `admin`, `new_admin`, `expires_at` |
 | `admin_transfer_canceled` | — | `schema_version`, `admin`, `new_admin` |
 | `admin_transfer_accepted` | — | `schema_version`, `previous_admin`, `new_admin` |

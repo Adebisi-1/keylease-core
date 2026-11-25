@@ -328,6 +328,7 @@ spans a contract upgrade stays decodable (see
 | `lease_settled` | `lease_id` | `schema_version`, `provider`, `verified_calls`, `payout`, `refund` |
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
+| `schema_migrated` | — | `schema_version`, `admin`, `from_version`, `to_version` |
 | `admin_transfer_proposed` | — | `schema_version`, `admin`, `new_admin`, `expires_at` |
 | `admin_transfer_canceled` | — | `schema_version`, `admin`, `new_admin` |
 | `admin_transfer_accepted` | — | `schema_version`, `previous_admin`, `new_admin` |
@@ -498,6 +499,7 @@ These must hold for every reachable state. They are asserted in tests.
 | `Admin`, `Token` | instance | configuration; instance TTL is bumped on every state change |
 | `PendingAdmin` | instance | at most one admin hand-over awaiting acceptance; cleared on accept or cancel |
 | `ServiceCount`, `LeaseCount` | instance | monotonic id counters |
+| `SchemaVersion` | instance | storage schema the data conforms to; state-changing calls stop while it differs from the running Wasm's |
 | `Service(u64)` | persistent | TTL extended on save, on `create_lease` and by `bump_service`, never by a read |
 | `Lease(u64)` | persistent | TTL extended on save and by `bump_lease`, never by a read |
 | `ProviderServices(Address)` | persistent | service-id index per provider; extended by `save_service`, never by a read |
