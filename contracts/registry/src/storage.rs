@@ -41,7 +41,7 @@ use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 use crate::errors::Error;
 use crate::types::{
     CancelRequest, Lease, LeasePage, PendingAdminTransfer, PendingUpgrade, ProviderServicePage,
-    Service, ServicePage, ServiceStats,
+    Service, ServicePage, ServiceStats, Settlement,
 };
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
@@ -130,6 +130,8 @@ pub enum DataKey {
     ProviderServices(Address),
     /// Pending early-cancellation request by lease id (persistent storage).
     CancelRequest(u64),
+    /// `Settlement` by lease id (persistent storage).
+    Settlement(u64),
     /// Admin hand-over awaiting acceptance (instance storage).
     ///
     /// Kept in instance storage on purpose: it shares the configuration
@@ -501,6 +503,18 @@ pub fn get_lease(env: &Env, lease_id: u64) -> Result<Lease, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Settlements
+// ---------------------------------------------------------------------------
+
+pub fn save_settlement(env: &Env, settlement: &Settlement) {
+    let key = DataKey::Settlement(settlement.lease_id);
+    env.storage().persistent().set(&key, settlement);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+}
+
+// ---------------------------------------------------------------------------
 // Derived per-entity state: settlement stats and revocation markers
 // ---------------------------------------------------------------------------
 //
@@ -611,6 +625,19 @@ pub fn save_cancel_request(env: &Env, request: &CancelRequest) {
     env.storage()
         .persistent()
         .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+}
+
+pub fn get_settlement(env: &Env, lease_id: u64) -> Result<Settlement, Error> {
+    let key = DataKey::Settlement(lease_id);
+    let settlement = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::SettlementNotFound)?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    Ok(settlement)
 }
 
 pub fn get_cancel_request(env: &Env, lease_id: u64) -> Option<CancelRequest> {
