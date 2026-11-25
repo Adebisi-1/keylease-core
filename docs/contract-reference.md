@@ -1226,7 +1226,8 @@ pub struct Lease {
     pub consumer: Address,
     pub allocated_calls: u32,
     pub used_calls: u32,
-    pub expires_at: u64,
+    pub created_at: u64,       // ledger timestamp of create_lease
+    pub expires_at: u64,       // created_at + duration_secs
     pub locked_deposit: i128,
     pub settled: bool,
 }
@@ -1297,6 +1298,14 @@ breaks decoding of leases written by an older version. `Revoked` therefore
 derives from a separate `LeaseRevoked(lease_id)` marker rather than a
 `revoked: bool` on the struct, and `ServiceStats` lives under its own key for
 the same reason.
+
+### `created_at` and upgrade compatibility
+
+`created_at` was appended to `Lease` after the type had already been published,
+so a lease written by an earlier release is stored without it. `get_lease` reads
+such an entry through a legacy shape and reports `created_at = 0`, meaning the
+creation time is unknown; everything else about the lease is unchanged, so it
+can still be settled or revoked, and the next write stores the current shape.
 
 ## Storage layout
 
