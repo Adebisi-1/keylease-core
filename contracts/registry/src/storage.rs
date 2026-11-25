@@ -14,6 +14,7 @@
 //! | --- | --- | --- | --- |
 //! | `init`, `upgrade`, `register_service` | extend | — | — |
 //! | `migrate` (when it migrates) | extend | — | — |
+//! | `propose_admin`, `cancel_admin_transfer`, `accept_admin` | extend | — | — |
 //! | `set_token` | extend, unless the token is unchanged | — | — |
 //! | `set_service_active` | — | extend (save) | — |
 //! | `set_service_attestor` | — | attestor entry extends when set, is removed when cleared | — |
@@ -22,7 +23,7 @@
 //! | `settle_lease`, `revoke_expired_lease` | — | — | extend (save) |
 //! | [`crate::KeyLeaseRegistry::bump_service`] | — | extend | — |
 //! | [`crate::KeyLeaseRegistry::bump_lease`] | — | — | extend |
-//! | `get_service`, `get_lease`, `lease_status`, `remaining_calls`, `locked_balance`, `services_for_provider` | — | — | — |
+//! | `get_pending_admin`, `get_service`, `get_lease`, `lease_status`, `remaining_calls`, `locked_balance`, `services_for_provider` | — | — | — |
 //! | [`crate::KeyLeaseRegistry::get_services`], [`crate::KeyLeaseRegistry::get_leases`] | — | — | — |
 //!
 //! The last row is the read-only surface: it never extends anything, so a
@@ -59,7 +60,7 @@ use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 /// | Version | Layout |
 /// | --- | --- |
 /// | `0` | v0.2.x and earlier: the v1 layout without a `SchemaVersion` entry |
-/// | `1` | `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)`, `ServiceStats(u64)`, `LeaseRevoked(u64)`, `ServiceAttestor(u64)`, `PendingUpgrade`, `ProviderServices(Address)`, `CancelRequest(u64)`, `Settlement(u64)`, `SchemaVersion` |
+/// | `1` | `Admin`, `Token`, `ServiceCount`, `LeaseCount`, `Service(u64)`, `Lease(u64)`, `ServiceStats(u64)`, `LeaseRevoked(u64)`, `ServiceAttestor(u64)`, `PendingUpgrade`, `ProviderServices(Address)`, `CancelRequest(u64)`, `Settlement(u64)`, `SchemaVersion`, `PendingAdmin` |
 ///
 /// Every key in `1` other than `SchemaVersion` that v0.2.x did not have reads
 /// as absent on legacy data and defaults safely, so `0 -> 1` rewrites nothing.
@@ -71,8 +72,8 @@ pub const LEGACY_SCHEMA_VERSION: u32 = 0;
 
 use crate::errors::Error;
 use crate::types::{
-    CancelRequest, Lease, LeasePage, PendingUpgrade, ProviderServicePage, Service, ServicePage,
-    ServiceStats, Settlement,
+    CancelRequest, Lease, LeasePage, PendingAdminTransfer, PendingUpgrade, ProviderServicePage,
+    Service, ServicePage, ServiceStats, Settlement,
 };
 use crate::SETTLE_GRACE_PERIOD_SECS;
 
@@ -166,6 +167,12 @@ pub enum DataKey {
     /// Storage schema version this registry's data was written under
     /// (instance storage). See [`SCHEMA_VERSION`].
     SchemaVersion,
+    /// Admin hand-over awaiting acceptance (instance storage).
+    ///
+    /// Kept in instance storage on purpose: it shares the configuration
+    /// entry's TTL, which every admin call extends, and it is bounded to a
+    /// single value, so it adds no new rent policy of its own.
+    PendingAdmin,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +244,24 @@ pub fn migrate_step(_env: &Env, from: u32) -> Result<(), Error> {
         0 => Ok(()),
         _ => Err(Error::SchemaVersionUnsupported),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Admin rotation
+// ---------------------------------------------------------------------------
+
+pub fn set_pending_admin(env: &Env, pending: &PendingAdminTransfer) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAdmin, pending);
+}
+
+pub fn get_pending_admin(env: &Env) -> Option<PendingAdminTransfer> {
+    env.storage().instance().get(&DataKey::PendingAdmin)
+}
+
+pub fn clear_pending_admin(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingAdmin);
 }
 
 pub fn set_token(env: &Env, token: &Address) {

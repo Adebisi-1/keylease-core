@@ -79,6 +79,9 @@
 //!   duration plus the grace period whenever it is written, so escrow cannot
 //!   fall off the ledger. Reads never extend: `bump_lease` and `bump_service`
 //!   keep an entry alive on their own terms (see `storage`).
+//! * **Two-step admin rotation** — the admin role moves only when the current
+//!   admin proposes a successor and that successor authorizes acceptance, so a
+//!   typo or an unreachable address can never strand upgrade and token control.
 //! * **Wasm upgrades** — the admin proposes a new Wasm through the Soroban
 //!   deployer and may only execute it after a 24-hour on-ledger delay, giving
 //!   consumers time to exit; `contractmeta!` identifies the running version.
@@ -103,7 +106,8 @@ use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, St
 
 pub use crate::errors::Error;
 pub use crate::events::{
-    ContractUpgraded, EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
+    AdminTransferAccepted, AdminTransferCanceled, AdminTransferProposed, ContractUpgraded,
+    EscrowTokenSet, LeaseCancellationRejected, LeaseCancellationRequested,
     LeaseCancellationWithdrawn, LeaseCancelled, LeaseChallengeCancelled, LeaseChallengeResolved,
     LeaseChallenged, LeaseCreated, LeaseDelegated, LeaseRevoked, LeaseSettled,
     LeaseSettlementProposed, LeaseTransferred, RegistryInitialized, SchemaMigrated,
@@ -112,8 +116,9 @@ pub use crate::events::{
 };
 pub use crate::storage::SCHEMA_VERSION;
 pub use crate::types::{
-    CancelRequest, Lease, LeasePage, LeaseQuote, LeaseStatus, PendingUpgrade, ProviderServicePage,
-    Service, ServicePage, ServiceStats, Settlement, SettlementState, UsageAttestation,
+    CancelRequest, Lease, LeasePage, LeaseQuote, LeaseStatus, PendingAdminTransfer, PendingUpgrade,
+    ProviderServicePage, Service, ServicePage, ServiceStats, Settlement, SettlementState,
+    UsageAttestation,
 };
 
 // On-chain contract metadata, readable from the ledger without the source.
@@ -260,6 +265,14 @@ pub fn usage_attestation_message(
     Bytes::from_slice(env, &buf)
 }
 
+/// How long a proposed admin transfer stays acceptable.
+///
+/// Long enough for a multisig successor to collect signatures across time zones,
+/// short enough that a forgotten proposal does not sit around as a latent
+/// hand-over to an address whose key may since have leaked. After the window the
+/// proposal can only be cancelled or replaced, never accepted.
+pub const ADMIN_TRANSFER_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// The KeyLease registry contract: services, escrowed leases and settlement.
 #[contract]
 pub struct KeyLeaseRegistry;
@@ -276,6 +289,8 @@ impl KeyLeaseRegistry {
     /// configure the escrow token via [`KeyLeaseRegistry::set_token`] or manage upgrades via
     /// [`KeyLeaseRegistry::propose_upgrade`], [`KeyLeaseRegistry::execute_upgrade`] and
     /// [`KeyLeaseRegistry::cancel_upgrade`].
+    /// The role can later be handed over with [`KeyLeaseRegistry::propose_admin`]
+    /// and [`KeyLeaseRegistry::accept_admin`].
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         // A stamped schema without an admin can only come from foreign or
@@ -472,6 +487,132 @@ impl KeyLeaseRegistry {
         }
         .publish(&env);
         Ok(SCHEMA_VERSION)
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin rotation
+    // -----------------------------------------------------------------------
+
+    /// Propose `new_admin` as the next registry admin and return the ledger
+    /// timestamp at which the proposal expires.
+    ///
+    /// This is the first half of a two-step hand-over; nothing changes until
+    /// `new_admin` calls [`KeyLeaseRegistry::accept_admin`] before `expires_at`
+    /// (`now + ADMIN_TRANSFER_WINDOW_SECS`). Splitting the hand-over means the
+    /// current admin's authorization alone can never move the role, and the
+    /// successor's authorization alone can never claim it.
+    ///
+    /// - **Auth:** `admin`, which must be the stored admin.
+    /// - **Preconditions:** `new_admin` differs from the current admin.
+    /// - **Effects:** stores (or replaces) the single pending proposal and
+    ///   extends the instance TTL.
+    /// - **Events:** `admin_transfer_proposed`.
+    /// - **Errors:** `NotInitialized`, `Unauthorized`, `InvalidAdmin`, `Overflow`,
+    ///   `SchemaMigrationRequired`, `SchemaVersionUnsupported`.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<u64, Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        storage::check_schema(&env)?;
+        if new_admin == admin {
+            return Err(Error::InvalidAdmin);
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now
+            .checked_add(ADMIN_TRANSFER_WINDOW_SECS)
+            .ok_or(Error::Overflow)?;
+        storage::set_pending_admin(
+            &env,
+            &PendingAdminTransfer {
+                proposed_by: admin.clone(),
+                new_admin: new_admin.clone(),
+                proposed_at: now,
+                expires_at,
+            },
+        );
+        storage::extend_instance_ttl(&env);
+        AdminTransferProposed {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin,
+            new_admin,
+            expires_at,
+        }
+        .publish(&env);
+        Ok(expires_at)
+    }
+
+    /// Withdraw the pending admin transfer. Admin only.
+    ///
+    /// Works whether or not the proposal has expired, so a stale proposal can
+    /// always be cleared explicitly.
+    ///
+    /// - **Auth:** `admin`, which must be the stored admin.
+    /// - **Preconditions:** a proposal is pending.
+    /// - **Effects:** removes the proposal and extends the instance TTL.
+    /// - **Events:** `admin_transfer_canceled`.
+    /// - **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingAdminTransfer`,
+    ///   `SchemaMigrationRequired`, `SchemaVersionUnsupported`.
+    pub fn cancel_admin_transfer(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+        storage::check_schema(&env)?;
+        let pending = storage::get_pending_admin(&env).ok_or(Error::NoPendingAdminTransfer)?;
+
+        storage::clear_pending_admin(&env);
+        storage::extend_instance_ttl(&env);
+        AdminTransferCanceled {
+            schema_version: EVENT_SCHEMA_VERSION,
+            admin,
+            new_admin: pending.new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Accept a pending admin transfer and become the registry admin.
+    ///
+    /// The second half of the hand-over started by [`KeyLeaseRegistry::propose_admin`].
+    /// Together the two calls require authorization from both the outgoing and
+    /// the incoming admin, so no third party can take over the registry, and a
+    /// mistyped or unreachable successor simply never accepts.
+    ///
+    /// - **Auth:** `new_admin`, which must be the proposed address.
+    /// - **Preconditions:** a proposal is pending, it names `new_admin`, it was
+    ///   made by the admin still in office, and `now < expires_at`.
+    /// - **Effects:** stores `new_admin` as admin, clears the proposal and
+    ///   extends the instance TTL. The previous admin loses every admin right in
+    ///   the same transaction.
+    /// - **Events:** `admin_transfer_accepted`.
+    /// - **Errors:** `NotInitialized`, `NoPendingAdminTransfer`, `Unauthorized`,
+    ///   `AdminTransferExpired`, `SchemaMigrationRequired`, `SchemaVersionUnsupported`.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let current = storage::get_admin(&env).ok_or(Error::NotInitialized)?;
+        storage::check_schema(&env)?;
+        let pending = storage::get_pending_admin(&env).ok_or(Error::NoPendingAdminTransfer)?;
+
+        // Only the named successor may accept, and only a proposal made by the
+        // admin still in office counts. The second check cannot fail through
+        // this contract's own entry points (acceptance clears the proposal),
+        // but it keeps a proposal carried across an upgrade from outliving the
+        // admin that made it.
+        if pending.new_admin != new_admin || pending.proposed_by != current {
+            return Err(Error::Unauthorized);
+        }
+        if env.ledger().timestamp() >= pending.expires_at {
+            return Err(Error::AdminTransferExpired);
+        }
+
+        storage::set_admin(&env, &new_admin);
+        storage::clear_pending_admin(&env);
+        storage::extend_instance_ttl(&env);
+        AdminTransferAccepted {
+            schema_version: EVENT_SCHEMA_VERSION,
+            previous_admin: current,
+            new_admin,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1388,6 +1529,15 @@ impl KeyLeaseRegistry {
     /// Return the configured admin, or `NotInitialized` before `init`.
     pub fn get_admin(env: Env) -> Result<Address, Error> {
         storage::get_admin(&env).ok_or(Error::NotInitialized)
+    }
+
+    /// The pending admin transfer, if any. Pure read.
+    ///
+    /// An expired proposal is still returned (compare `expires_at` with the
+    /// ledger time) until the admin cancels or replaces it; it can no longer be
+    /// accepted.
+    pub fn get_pending_admin(env: Env) -> Option<PendingAdminTransfer> {
+        storage::get_pending_admin(&env)
     }
 
     /// Return the configured escrow token, or `TokenNotSet`.

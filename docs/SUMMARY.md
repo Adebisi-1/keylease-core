@@ -35,6 +35,7 @@
 - [Deployments](deployments.md)
 - Design notes
   - [Storage schema versioning (#123)](design/123-storage-schema-versioning.md)
+  - [Two-step admin transfer (#121)](design/121-admin-transfer.md)
   - [Provider staking and slashing (#137)](design/137-provider-staking.md)
   - [Revenue splits (#133)](design/133-revenue-splits.md)
   - [Transferable leases (#134)](design/transferable-leases.md)

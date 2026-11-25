@@ -384,8 +384,9 @@ Initialize the registry and appoint `admin`.
 - **Events:** `registry_initialized { admin }`.
 - **Errors:** `AlreadyInitialized`, also returned when a `SchemaVersion`
   entry already exists without an admin (state this contract did not write).
-- **Notes:** the admin can only call `set_token` and manage upgrades through the
-  propose/execute/cancel flow below. It cannot move user funds.
+- **Notes:** the admin can only call `set_token`, manage upgrades through the
+  propose/execute/cancel flow below and use the admin-rotation entry points. It
+  cannot move user funds.
 
 ### `set_token`
 
@@ -490,6 +491,7 @@ return the version now in force.
 ### Schema gate
 
 Every state-changing entry point other than the ones listed below — `set_token`,
+`propose_admin`, `cancel_admin_transfer`, `accept_admin`,
 `register_service`, `set_service_active`, `update_service`,
 `set_service_attestor`, `create_lease`, `create_lease_for`,
 `request_early_cancel`, `withdraw_early_cancel`, `reject_early_cancel`,
@@ -499,6 +501,56 @@ Every state-changing entry point other than the ones listed below — `set_token
 the code) or `SchemaVersionUnsupported` (data newer than the code). `init`,
 `propose_upgrade`, `cancel_upgrade`, `execute_upgrade`, `migrate`,
 `bump_service`, `bump_lease` and every view are not gated.
+
+### `propose_admin`
+
+```rust
+pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<u64, Error>
+```
+
+Start a two-step admin hand-over to `new_admin` and return `expires_at`.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **Preconditions:** `new_admin != admin`.
+- **State:** stores `PendingAdmin { proposed_by, new_admin, proposed_at,
+  expires_at }` with `expires_at = now + ADMIN_TRANSFER_WINDOW_SECS` (7 days),
+  replacing any earlier proposal; extends instance TTL. The admin does **not**
+  change yet.
+- **Events:** `admin_transfer_proposed { admin, new_admin, expires_at }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `InvalidAdmin`, `Overflow`.
+
+### `cancel_admin_transfer`
+
+```rust
+pub fn cancel_admin_transfer(env: Env, admin: Address) -> Result<(), Error>
+```
+
+Withdraw the pending proposal, whether or not it has expired.
+
+- **Caller / auth:** `admin`, and `admin` must match the stored admin.
+- **State:** removes `PendingAdmin`; extends instance TTL.
+- **Events:** `admin_transfer_canceled { admin, new_admin }`.
+- **Errors:** `NotInitialized`, `Unauthorized`, `NoPendingAdminTransfer`.
+
+### `accept_admin`
+
+```rust
+pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error>
+```
+
+Complete the hand-over and become the admin.
+
+- **Caller / auth:** `new_admin`, which must be the proposed address.
+- **Preconditions:** a proposal is pending, names `new_admin`, was made by the
+  admin still in office, and `now < expires_at`.
+- **State:** sets `Admin = new_admin`; removes `PendingAdmin`; extends instance
+  TTL. The previous admin loses every admin right in the same transaction.
+- **Events:** `admin_transfer_accepted { previous_admin, new_admin }`.
+- **Errors:** `NotInitialized`, `NoPendingAdminTransfer`, `Unauthorized`,
+  `AdminTransferExpired`.
+- **Notes:** `propose_admin` carries the outgoing admin's authorization and
+  `accept_admin` the incoming one's, so the hand-over as a whole needs both and
+  no third party can complete it.
 
 ---
 
@@ -1044,6 +1096,7 @@ performed one could not be used to price a read.
 | View | Signature | Returns |
 | --- | --- | --- |
 | `get_admin` | `(env) -> Result<Address, Error>` | stored admin, else `NotInitialized` |
+| `get_pending_admin` | `(env) -> Option<PendingAdminTransfer>` | pending hand-over, including an expired one, else `None` |
 | `get_token` | `(env) -> Result<Address, Error>` | escrow token, else `TokenNotSet` |
 | `get_pending_upgrade` | `(env) -> Option<PendingUpgrade>` | queued hash and execution ledger, if any |
 | `version` | `(env) -> String` | version embedded by `contractmeta!` |
@@ -1135,6 +1188,9 @@ because topics are positional and indexers filter on them.
 | `lease_revoked` | `lease_id` | `schema_version`, `consumer`, `refund` |
 | `contract_upgraded` | — | `schema_version`, `admin`, `new_wasm_hash` |
 | `schema_migrated` | — | `schema_version`, `admin`, `from_version`, `to_version` |
+| `admin_transfer_proposed` | — | `schema_version`, `admin`, `new_admin`, `expires_at` |
+| `admin_transfer_canceled` | — | `schema_version`, `admin`, `new_admin` |
+| `admin_transfer_accepted` | — | `schema_version`, `previous_admin`, `new_admin` |
 
 See [integration.md](./integration.md#event-schema-version) for how to branch on
 the version.
@@ -1226,6 +1282,13 @@ pub struct LeasePage {
     pub next_start: u64,
     pub done: bool,
 }
+
+pub struct PendingAdminTransfer {
+    pub proposed_by: Address,
+    pub new_admin: Address,
+    pub proposed_at: u64,
+    pub expires_at: u64,
+}
 }
 ```
 
@@ -1251,6 +1314,7 @@ pub enum DataKey {
     Settlement(u64),           // persistent: proposed split, keyed by lease id
     CancelRequest(u64),        // persistent: pending early-cancellation request
     SchemaVersion,             // instance, u32: see SCHEMA_VERSION
+    PendingAdmin,              // instance: proposed admin hand-over
 }
 ```
 
@@ -1425,6 +1489,9 @@ recording it there fails `cargo test`. Add a new code by appending it to
 | 37 | `RateTooHigh` | published `rate_per_call` above `MAX_RATE_PER_CALL` |
 | 38 | `SchemaMigrationRequired` | stored schema older than this Wasm; admin must run `migrate` |
 | 39 | `SchemaVersionUnsupported` | stored schema newer than this Wasm, or no migration path |
+| 40 | `NoPendingAdminTransfer` | `accept_admin` / `cancel_admin_transfer` with no proposal |
+| 41 | `AdminTransferExpired` | `accept_admin` at or after `expires_at` |
+| 42 | `InvalidAdmin` | `propose_admin` named the current admin |
 
 ## Invoking with the Stellar CLI
 
